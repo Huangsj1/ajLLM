@@ -1,0 +1,17 @@
+base: ../lm_train/openwebtext_baseline.yaml
+name: openwebtext_lr
+
+grid:
+  optimizer.max_lr:
+    - 1.0e-4
+    - 5.0e-4
+    - 1.0e-3
+    - 5.0e-3
+    - 1.0e-2
+    - 5.0e-2
+
+comparison:
+  metric: best_validation_loss
+  mode: min
+  generate_plot: true
+

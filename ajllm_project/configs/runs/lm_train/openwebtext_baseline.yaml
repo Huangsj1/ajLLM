@@ -1,7 +1,7 @@
 experiment: openwebtext_baseline
 dataset: openwebtext
 tokenizer: openwebtext_bpe_32k
-model: transformer_medium
+model: transformer_baseline
 
 data_splits:
   train: train
