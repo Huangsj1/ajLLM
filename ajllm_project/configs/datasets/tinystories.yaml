@@ -1,0 +1,5 @@
+name: tinystories
+description: TinyStories V2 GPT-4 corpus
+splits:
+  train: data/raw/tinystories/train.txt
+  validation: data/raw/tinystories/validation.txt

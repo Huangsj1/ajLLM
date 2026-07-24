@@ -1,0 +1,12 @@
+name: selected_run_generation
+run_directory: runs/training/EDIT_DATASET/EDIT_TOKENIZER/EDIT_MODEL/EDIT_EXPERIMENT/EDIT_RUN_ID
+checkpoint: best
+prompt_file: data/prompts/default.txt
+max_new_tokens: 150
+temperature: 0.8
+top_p: 0.95
+samples_per_prompt: 1
+eos_token: <|endoftext|>
+device: auto
+seed: 42
+

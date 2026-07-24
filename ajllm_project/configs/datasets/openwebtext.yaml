@@ -1,0 +1,6 @@
+name: openwebtext
+description: OpenWebText training and validation corpora
+splits:
+  train: data/raw/openwebtext/train.txt
+  validation: data/raw/openwebtext/validation.txt
+

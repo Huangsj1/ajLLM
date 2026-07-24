@@ -1,0 +1,6 @@
+name: debug
+description: Tiny local corpus used by tests and smoke runs
+splits:
+  train: tests/fixtures/corpora/debug_train.txt
+  validation: tests/fixtures/corpora/debug_validation.txt
+

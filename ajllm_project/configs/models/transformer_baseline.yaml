@@ -1,0 +1,18 @@
+name: transformer_baseline
+context_length: 256
+d_model: 512
+num_layers: 4
+num_heads: 16
+d_ff: 1344
+position_encoding:
+  type: rope
+  theta: 10000
+normalization:
+  type: rmsnorm
+  placement: pre
+feed_forward:
+  type: swiglu
+tie_embeddings: false
+report_vocab_size: 10000
+report_batch_size: 64
+report_training_tokens: 327680000

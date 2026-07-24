@@ -1,0 +1,8 @@
+name: debug_bpe_300
+vocab_size: 300
+special_tokens:
+  - <|endoftext|>
+pretokenization:
+  parallel: true
+  num_processes: 2
+  chunk_size_bytes: 256

@@ -1,0 +1,4 @@
+dataset: openwebtext
+tokenizer: openwebtext_bpe_32k
+split: train
+

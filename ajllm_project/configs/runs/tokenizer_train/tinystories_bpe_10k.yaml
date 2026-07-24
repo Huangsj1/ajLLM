@@ -1,0 +1,4 @@
+dataset: tinystories
+tokenizer: tinystories_bpe_10k
+split: train
+

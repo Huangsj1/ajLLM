@@ -1,0 +1,10 @@
+dataset: debug
+tokenizer: debug_bpe_300
+splits:
+  - train
+  - validation
+encoding:
+  parallel: true
+  num_processes: 2
+  chunk_size: 256
+  buffer_tokens: 65536

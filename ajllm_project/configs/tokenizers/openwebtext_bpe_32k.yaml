@@ -1,0 +1,8 @@
+name: openwebtext_bpe_32k
+vocab_size: 32000
+special_tokens:
+  - <|endoftext|>
+pretokenization:
+  parallel: true
+  num_processes: null
+  chunk_size_bytes: 8388608

@@ -1,0 +1,4 @@
+dataset: debug
+tokenizer: debug_bpe_300
+split: train
+

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "artifact_type": "tokenizer",
+  "created_at": "2026-07-24T20:10:50.725862+00:00",
+  "name": "tinystories_bpe_10k",
+  "dataset": "tinystories",
+  "source_split": "train",
+  "source_path": "D:\\LLMLearning\\ajLLM\\ajllm_project\\data\\raw\\tinystories\\train.txt",
+  "source_size_bytes": 2227753162,
+  "vocab_size": 10000,
+  "special_tokens": [
+    "<|endoftext|>"
+  ],
+  "merge_count": 9743,
+  "files": {
+    "vocab": "vocab.json",
+    "merges": "merges.txt"
+  },
+  "hashes": {
+    "vocab": "14043b381b2c7783031859cbe1cf69343c9e4e5af30ed0ecae596f50055ff037",
+    "merges": "b6c0ce3ddfcc48b8b2d5b67fe5a911de42e3b0e58010dcdc3ef67b83ad766c26"
+  },
+  "fingerprint": "4d9aeee42e68e408c65d1f952f9edf3df0e5e9da88362ad27aaff912a56813d6"
+}

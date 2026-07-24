@@ -1,0 +1,17 @@
+name: transformer_medium
+context_length: 512
+d_model: 768
+num_layers: 12
+num_heads: 12
+d_ff: 2048
+position_encoding:
+  type: rope
+  theta: 10000
+normalization:
+  type: rmsnorm
+  placement: pre
+feed_forward:
+  type: swiglu
+tie_embeddings: true
+report_vocab_size: 32000
+

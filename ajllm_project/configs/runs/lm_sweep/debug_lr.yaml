@@ -1,0 +1,13 @@
+base: ../lm_train/debug.yaml
+name: debug_lr
+
+grid:
+  optimizer.max_lr:
+    - 1.0e-4
+    - 6.0e-4
+
+comparison:
+  metric: validation_loss
+  mode: min
+  generate_plot: true
+

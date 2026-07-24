@@ -1,0 +1,8 @@
+name: tinystories_bpe_10k
+vocab_size: 10000
+special_tokens:
+  - <|endoftext|>
+pretokenization:
+  parallel: true
+  num_processes: null
+  chunk_size_bytes: 8388608

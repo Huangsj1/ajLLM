@@ -1,0 +1,10 @@
+dataset: tinystories
+tokenizer: tinystories_bpe_10k
+splits:
+  - train
+  - validation
+encoding:
+  parallel: true
+  num_processes: null
+  chunk_size: 16777216
+  buffer_tokens: 65536

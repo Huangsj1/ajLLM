@@ -1,0 +1,50 @@
+[project]
+name = "ajllm"
+version = "0.1.0"
+description = "A configurable byte-level BPE and Transformer language model toolkit"
+readme = "README.md"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.4",
+    "pyyaml>=6.0",
+    "regex>=2026.3.32",
+    "torch~=2.11.0",
+    "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0",
+    "ruff>=0.15.8",
+]
+
+[project.scripts]
+ajllm = "ajllm.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11,<0.12"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "ajllm"
+module-root = "src"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]

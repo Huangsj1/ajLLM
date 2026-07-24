@@ -1,0 +1,19 @@
+dataset:
+  name: tinystories
+  description: TinyStories V2 GPT-4 corpus
+  splits:
+    train: data/raw/tinystories/train.txt
+    validation: data/raw/tinystories/validation.txt
+tokenizer:
+  name: tinystories_bpe_10k
+  vocab_size: 10000
+  special_tokens:
+  - <|endoftext|>
+  pretokenization:
+    parallel: true
+    num_processes: null
+    chunk_size_bytes: 8388608
+split: train
+_meta:
+  source: D:\LLMLearning\ajLLM\ajllm_project\configs\runs\tokenizer_train\tinystories_bpe_10k.yaml
+  project_root: D:\LLMLearning\ajLLM\ajllm_project

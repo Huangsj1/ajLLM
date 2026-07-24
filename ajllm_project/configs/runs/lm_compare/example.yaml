@@ -1,0 +1,8 @@
+name: selected_runs
+metric: best_validation_loss
+mode: min
+generate_plot: true
+runs:
+  - runs/training/EDIT_FIRST_RUN
+  - runs/training/EDIT_SECOND_RUN
+
