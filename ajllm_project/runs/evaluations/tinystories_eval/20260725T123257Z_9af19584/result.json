@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "artifact_type": "evaluation",
+  "created_at": "2026-07-25T12:32:57.529519+00:00",
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\tinystories\\tinystories_bpe_10k\\transformer_baseline\\tinystories_baseline\\20260724T214456Z_649f35a3",
+  "split": "validation",
+  "loss": 1.3769949579238892,
+  "perplexity": 3.962974810124945,
+  "batches": 100
+}

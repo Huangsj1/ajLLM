@@ -1,0 +1,12 @@
+name: openwebtext_gen
+run_directory: runs/training/openwebtext/openwebtext_bpe_32k/transformer_baseline/openwebtext_baseline/20260725T124258Z_519c45b7
+checkpoint: best
+prompt_file: data/prompts/default.txt
+max_new_tokens: 300
+temperature: 0.8
+top_p: 0.95
+samples_per_prompt: 1
+eos_token: <|endoftext|>
+device: auto
+seed: 42
+

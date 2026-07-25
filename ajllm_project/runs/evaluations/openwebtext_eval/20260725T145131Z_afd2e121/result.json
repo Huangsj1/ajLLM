@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "artifact_type": "evaluation",
+  "created_at": "2026-07-25T14:51:31.278078+00:00",
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\openwebtext\\openwebtext_bpe_32k\\transformer_baseline\\openwebtext_baseline\\20260725T124258Z_519c45b7",
+  "split": "validation",
+  "loss": 4.137698533535004,
+  "perplexity": 62.658449059561164,
+  "batches": 100
+}

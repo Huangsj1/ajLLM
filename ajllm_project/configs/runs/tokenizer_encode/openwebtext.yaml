@@ -8,3 +8,5 @@ encoding:
   num_processes: null
   chunk_size: 16777216
   buffer_tokens: 65536
+  max_pretoken_bytes: 8192
+  long_pretoken_strategy: byte_fallback

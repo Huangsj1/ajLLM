@@ -1,0 +1,9 @@
+name: openwebtext_eval
+run_directory: runs/training/openwebtext/openwebtext_bpe_32k/transformer_baseline/openwebtext_baseline/20260725T124258Z_519c45b7
+checkpoint: best
+split: validation
+batches: 100
+batch_size: 32
+device: auto
+seed: 42
+

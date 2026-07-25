@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "artifact_type": "run_comparison",
+  "created_at": "2026-07-25T12:24:16.298352+00:00",
+  "name": "tinystories_lr",
+  "metric": "best_validation_loss",
+  "mode": "min",
+  "run_count": 6,
+  "best_run": {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\tinystories_lr\\20260724T233343Z_fe003864\\trials\\max_lr_0p001",
+    "status": "completed",
+    "steps": 20000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 5826.676725164056,
+    "best_validation_loss": 1.3710478496551515,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p001/checkpoints/final.pt",
+    "train_loss": 1.3678442752361297,
+    "train_perplexity": 3.926876300035597,
+    "validation_loss": 1.3736207973957062,
+    "validation_perplexity": 3.9496256307484923
+  }
+}

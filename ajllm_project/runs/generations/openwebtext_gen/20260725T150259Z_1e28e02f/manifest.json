@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "artifact_type": "generation",
+  "created_at": "2026-07-25T15:02:59.802511+00:00",
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\openwebtext\\openwebtext_bpe_32k\\transformer_baseline\\openwebtext_baseline\\20260725T124258Z_519c45b7",
+  "checkpoint": "best",
+  "parameters": {
+    "max_new_tokens": 300,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "samples_per_prompt": 1,
+    "seed": 42
+  }
+}

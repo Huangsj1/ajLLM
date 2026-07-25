@@ -5,12 +5,20 @@ __pycache__/
 .ruff_cache/
 .uv-cache/
 .test-tmp/
+.pytest_tmp/
 build/
 dist/
 *.egg-info/
 
 data/raw/**
 !data/raw/.gitkeep
-artifacts/encoded/**
+artifacts/encoded/openwebtext/openwebtext_bpe_32k/*.uint32
+artifacts/encoded/tinystories/tinystories_bpe_10k/*.uint32
 runs/**
+!runs/comparisons/
+!runs/comparisons/**
+!runs/evaluations/
+!runs/evaluations/**
+!runs/generations/
+!runs/generations/**
 !runs/.gitkeep

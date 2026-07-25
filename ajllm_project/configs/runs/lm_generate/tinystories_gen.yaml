@@ -1,0 +1,12 @@
+name: tinystories_gen
+run_directory: runs/training/tinystories/tinystories_bpe_10k/transformer_baseline/tinystories_baseline/20260724T214456Z_649f35a3
+checkpoint: best
+prompt_file: data/prompts/default.txt
+max_new_tokens: 300
+temperature: 0.8
+top_p: 0.95
+samples_per_prompt: 1
+eos_token: <|endoftext|>
+device: auto
+seed: 42
+

@@ -39,6 +39,7 @@ def run(config: LoadedConfig) -> dict[str, Any]:
     output_dir.mkdir(parents=True, exist_ok=True)
     encoded_files: dict[str, Any] = {}
     encoding = data.get("encoding", {})
+    configured_max_pretoken_bytes = encoding.get("max_pretoken_bytes", 8192)
 
     for split in requested_splits:
         if split not in dataset["splits"]:
@@ -52,6 +53,10 @@ def run(config: LoadedConfig) -> dict[str, Any]:
             parallel=bool(encoding.get("parallel", True)),
             num_processes=encoding.get("num_processes"),
             buffer_tokens=int(encoding.get("buffer_tokens", 65_536)),
+            max_pretoken_bytes=(
+                None if configured_max_pretoken_bytes is None else int(configured_max_pretoken_bytes)
+            ),
+            long_pretoken_strategy=str(encoding.get("long_pretoken_strategy", "byte_fallback")),
         )
         encoded_files[split] = {
             "path": output_path.name,
@@ -59,6 +64,7 @@ def run(config: LoadedConfig) -> dict[str, Any]:
             "size_bytes": output_path.stat().st_size,
             "sha256": sha256_file(output_path),
             "source_path": str(input_path),
+            "encoding_stats": dict(tokenizer.last_encoding_stats),
         }
 
     with (output_dir / "resolved_config.yaml").open("w", encoding="utf-8") as output_file:
@@ -70,6 +76,10 @@ def run(config: LoadedConfig) -> dict[str, Any]:
         "vocab_size": tokenizer_manifest["vocab_size"],
         "dtype": "uint32",
         "byte_order": "native",
+        "encoding": {
+            "max_pretoken_bytes": configured_max_pretoken_bytes,
+            "long_pretoken_strategy": encoding.get("long_pretoken_strategy", "byte_fallback"),
+        },
         "splits": encoded_files,
     }
     write_manifest(output_dir / "manifest.json", "encoded_dataset", manifest)

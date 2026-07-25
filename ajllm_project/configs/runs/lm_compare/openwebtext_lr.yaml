@@ -1,0 +1,11 @@
+name: openwebtext_lr
+metric: best_validation_loss
+mode: min
+generate_plot: true
+runs:
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p0001
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p0005
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p001
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p005
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p01
+  - runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p05

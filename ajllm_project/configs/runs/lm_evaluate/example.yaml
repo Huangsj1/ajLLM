@@ -1,9 +1,0 @@
-name: selected_run_validation
-run_directory: runs/training/EDIT_DATASET/EDIT_TOKENIZER/EDIT_MODEL/EDIT_EXPERIMENT/EDIT_RUN_ID
-checkpoint: best
-split: validation
-batches: 100
-batch_size: 64
-device: auto
-seed: 42
-

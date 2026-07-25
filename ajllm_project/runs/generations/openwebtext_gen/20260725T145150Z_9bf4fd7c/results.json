@@ -1,0 +1,33 @@
+{
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\openwebtext\\openwebtext_bpe_32k\\transformer_baseline\\openwebtext_baseline\\20260725T124258Z_519c45b7",
+  "checkpoint": "best",
+  "parameters": {
+    "max_new_tokens": 150,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "samples_per_prompt": 1,
+    "seed": 42
+  },
+  "results": [
+    {
+      "prompt": "Once upon a time",
+      "completions": [
+        {
+          "text": "Once upon a time, the whole thing is just to start.”\n\nLast year, Claibel’s new book, which marked the end of the six-page book, was published in the NYI News magazine. The book’s authors, B.C. Wells, and others, were both critical in their investigation of the U.S. government’s Cold War operation.\n\n“I have a question for this book,” Claibel said, “as far as I know, the answer is pretty good. To be sure, I will need to take some time off to meet the people who are already currently on the war. It’s a little bit wrong, but I will be giving people a look into it.”",
+          "token_count": 154,
+          "elapsed_seconds": 1.3420216999984405
+        }
+      ]
+    },
+    {
+      "prompt": "The little robot looked at the stars",
+      "completions": [
+        {
+          "text": "The little robot looked at the stars and found a little grasping about the depth of the'll-sans. In a very clear sign of this and a huge movie, the '49s and '50s were really big enough, and to be a human because it was so close to the moody atmosphere, but there were too many, many more.\n\nDietary versions of the characters and allowed them to go deeper into why they were. I didn't know much about the excitement around the film, but I was feeling the need to point out a particular situation.\n\nThe whole film, the 5-minute book, is a very comfortable place for me. It's probably that fun and shot, but it was a bit darker than the \"CEA",
+          "token_count": 157,
+          "elapsed_seconds": 0.8245217000003322
+        }
+      ]
+    }
+  ]
+}

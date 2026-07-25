@@ -1,3 +1,4 @@
+from array import array
 from pathlib import Path
 
 from ajllm.tokenization.bpe_trainer import train_bpe
@@ -80,3 +81,70 @@ def test_parallel_file_encoding_matches_serial_file_encoding(tmp_path: Path) -> 
 
     assert serial_count == parallel_count
     assert serial_output.read_bytes() == parallel_output.read_bytes()
+
+
+def test_long_pretoken_byte_fallback_preserves_text_and_reports_stats(tmp_path: Path) -> None:
+    corpus = tmp_path / "long_pretoken.txt"
+    corpus.write_text(("x" * 9_000) + "\nshort text\n", encoding="utf-8")
+    vocab, merges = train_bpe(corpus, vocab_size=280, parallel=False)
+    tokenizer = Tokenizer(vocab, merges)
+    output = tmp_path / "tokens.uint32"
+
+    count = tokenizer.encode_file_to_disk(
+        corpus,
+        output,
+        parallel=False,
+        max_pretoken_bytes=1_024,
+        long_pretoken_strategy="byte_fallback",
+    )
+
+    token_ids = array("I")
+    with output.open("rb") as output_file:
+        token_ids.fromfile(output_file, count)
+    assert tokenizer.decode(token_ids) == corpus.read_text(encoding="utf-8")
+    assert count == output.stat().st_size // 4
+    assert tokenizer.last_encoding_stats["fallback_pretoken_count"] == 1
+    assert tokenizer.last_encoding_stats["fallback_bytes"] == 9_000
+    assert tokenizer.last_encoding_stats["largest_pretoken_bytes"] == 9_000
+
+
+def test_parallel_long_pretoken_byte_fallback_matches_serial_output(tmp_path: Path) -> None:
+    corpus = tmp_path / "long_parallel.txt"
+    corpus.write_text(("y" * 8_960) + "\nsecond line\n", encoding="utf-8")
+    vocab, merges = train_bpe(corpus, vocab_size=280, parallel=False)
+    tokenizer = Tokenizer(vocab, merges)
+    serial_output = tmp_path / "serial.uint32"
+    parallel_output = tmp_path / "parallel.uint32"
+
+    tokenizer.encode_file_to_disk(
+        corpus,
+        serial_output,
+        parallel=False,
+        max_pretoken_bytes=64,
+        long_pretoken_strategy="byte_fallback",
+    )
+    tokenizer.encode_file_to_disk(
+        corpus,
+        parallel_output,
+        chunk_size=128,
+        parallel=True,
+        num_processes=2,
+        max_pretoken_bytes=64,
+        long_pretoken_strategy="byte_fallback",
+    )
+
+    assert serial_output.read_bytes() == parallel_output.read_bytes()
+
+
+def test_long_pretoken_error_strategy_is_explicit(tmp_path: Path) -> None:
+    corpus = tmp_path / "too_long.txt"
+    corpus.write_text("z" * 32, encoding="utf-8")
+    vocab, merges = train_bpe(corpus, vocab_size=260, parallel=False)
+    tokenizer = Tokenizer(vocab, merges)
+
+    try:
+        tokenizer.encode("z" * 32, max_pretoken_bytes=8, long_pretoken_strategy="error")
+    except ValueError as error:
+        assert "max_pretoken_bytes" in str(error)
+    else:
+        raise AssertionError("Expected long pre-token encoding to fail")

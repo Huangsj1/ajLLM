@@ -1,0 +1,80 @@
+[
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p001",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 8268.195769831538,
+    "best_validation_loss": 4.129307267665863,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p001/checkpoints/final.pt",
+    "train_loss": 4.146994786262512,
+    "train_perplexity": 63.24365372832337,
+    "validation_loss": 4.144235355854034,
+    "validation_perplexity": 63.069377828775195
+  },
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p0005",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 8294.482891067863,
+    "best_validation_loss": 4.185271053314209,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p0005/checkpoints/final.pt",
+    "train_loss": 4.203852560520172,
+    "train_perplexity": 66.94373968995163,
+    "validation_loss": 4.200077397823334,
+    "validation_perplexity": 66.69149261753864
+  },
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p005",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 8245.85894581303,
+    "best_validation_loss": 4.198297905921936,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p005/checkpoints/final.pt",
+    "train_loss": 4.21735800743103,
+    "train_perplexity": 67.85397756162128,
+    "validation_loss": 4.214215590953827,
+    "validation_perplexity": 67.6410867754325
+  },
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p01",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 8249.377611141652,
+    "best_validation_loss": 4.331947140693664,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p01/checkpoints/final.pt",
+    "train_loss": 4.349652915000916,
+    "train_perplexity": 77.45157597932513,
+    "validation_loss": 4.346685690879822,
+    "validation_perplexity": 77.2221004159425
+  },
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p0001",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 8312.588150300086,
+    "best_validation_loss": 4.600160989761353,
+    "checkpoint": "/root/autodl-tmp/ajLLM/ajllm_project/runs/sweeps/openwebtext_lr/20260725T105839Z_12c948d5/trials/max_lr_0p0001/checkpoints/final.pt",
+    "train_loss": 4.619592700004578,
+    "train_perplexity": 101.45270202817028,
+    "validation_loss": 4.613374786376953,
+    "validation_perplexity": 100.82383503611682
+  },
+  {
+    "run_directory": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T105839Z_12c948d5\\trials\\max_lr_0p05",
+    "status": "completed",
+    "steps": 40000,
+    "tokens_seen": 327680000,
+    "elapsed_seconds": 7515.803390799996,
+    "best_validation_loss": 4.8462566566467284,
+    "checkpoint": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\sweeps\\openwebtext_lr\\20260725T153925Z_5da9ca62\\trials\\max_lr_0p05\\checkpoints\\final.pt",
+    "train_loss": 4.869801769256592,
+    "train_perplexity": 130.29508584455968,
+    "validation_loss": 4.859924092292785,
+    "validation_perplexity": 129.01440854772906
+  }
+]

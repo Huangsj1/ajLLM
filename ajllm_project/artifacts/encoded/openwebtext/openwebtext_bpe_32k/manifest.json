@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "artifact_type": "encoded_dataset",
+  "created_at": "2026-07-25T10:49:30.447209+00:00",
+  "dataset": "openwebtext",
+  "tokenizer": "openwebtext_bpe_32k",
+  "tokenizer_fingerprint": "d817fb6cff9b55340926b7ac9610ad83ec7dde8fbf01eb7984de7615fcbdf725",
+  "vocab_size": 32000,
+  "dtype": "uint32",
+  "byte_order": "native",
+  "encoding": {
+    "max_pretoken_bytes": 8192,
+    "long_pretoken_strategy": "byte_fallback"
+  },
+  "splits": {
+    "train": {
+      "path": "train.uint32",
+      "token_count": 2727376513,
+      "size_bytes": 10909506052,
+      "sha256": "58e5d968f7bc7f3cbed2183d5b7e0e29cf021eeaf9985df8d030f0bfdbfa4ce7",
+      "source_path": "D:\\LLMLearning\\ajLLM\\ajllm_project\\data\\raw\\openwebtext\\train.txt",
+      "encoding_stats": {
+        "fallback_pretoken_count": 10,
+        "fallback_bytes": 264742,
+        "largest_pretoken_bytes": 126432
+      }
+    },
+    "validation": {
+      "path": "validation.uint32",
+      "token_count": 66401098,
+      "size_bytes": 265604392,
+      "sha256": "5c899aac535286de12cfaaf1dd2d6782f8c954dd1c7cae6ca4610b77d6d62cbc",
+      "source_path": "D:\\LLMLearning\\ajLLM\\ajllm_project\\data\\raw\\openwebtext\\validation.txt",
+      "encoding_stats": {
+        "fallback_pretoken_count": 0,
+        "fallback_bytes": 0,
+        "largest_pretoken_bytes": 900
+      }
+    }
+  }
+}

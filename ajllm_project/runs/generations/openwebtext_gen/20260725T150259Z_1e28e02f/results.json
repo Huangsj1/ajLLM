@@ -1,0 +1,33 @@
+{
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\openwebtext\\openwebtext_bpe_32k\\transformer_baseline\\openwebtext_baseline\\20260725T124258Z_519c45b7",
+  "checkpoint": "best",
+  "parameters": {
+    "max_new_tokens": 300,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "samples_per_prompt": 1,
+    "seed": 42
+  },
+  "results": [
+    {
+      "prompt": "Once upon a time",
+      "completions": [
+        {
+          "text": "Once upon a time, the whole thing is just to start.”\n\nLast year, Claibel’s new book, which marked the end of the six-page book, was published in the NYI News magazine. The book’s authors, B.C. Wells, and others, were both critical in their investigation of the U.S. government’s Cold War operation.\n\n“I have a question for this book,” Claibel said, “as far as I know, the answer is pretty good. To be sure, I will need to take some time off to meet the people who are already currently on the war. It’s a little bit wrong, but I will be giving people a look into it.”\n\nThe author,s equally interesting, was a book written by Simon Crank, a writer in the U.S. who was a book about the war and the war. She is the author of the book The Dare to paraphrase and now is the author of The Secret Wars: The First War, the books, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, the war, war, the war, the war, the war.\n\n“The War is a relationship, and so what it is about is that the war is absolutely nothing but a war and",
+          "token_count": 304,
+          "elapsed_seconds": 1.9633661000007123
+        }
+      ]
+    },
+    {
+      "prompt": "The little robot looked at the stars",
+      "completions": [
+        {
+          "text": "The little robot looked at the stars, and showed the surprise. Then she saw a really bright gray area with its own sight.\n\nThe thing is a real human space for you.\n\nIt’s a tease to say nothing of the same. It’s just a massive amount of fun.\n\nThe thing about a robot that just sounds real-life, but it’s actually just a little weird.\n\nThe robot is a human. It’s a real human, but it does not look terrible.\n\nThe robot came to the floor, and it’s so sad.\n\nThey were actually just a little over a year ago.\n\nOh, God.\n\nAnd what else could we get to see about the robot?\n\nAnd the robot?\n\nNo.\n\nIt just makes me laugh.\n\nI’m fat.\n\nNo.\n\nI’m fat.\n\nI’m fat.\n\nI’m fat.\n\nI’m fat.\n\nI’m fat.\n\nOh’s artificial intelligence?\n\nNo.\n\nThis was not what I’m fat.\n\nI’m fat.\n\nI’m fat.\n\nNo.\n\nI’m fat.\n\nI’m fat.\n\nI’m fat.\n\nThat’s my brain.\n\nYou don’t have to have to recognize that this is a",
+          "token_count": 307,
+          "elapsed_seconds": 1.6347154999966733
+        }
+      ]
+    }
+  ]
+}

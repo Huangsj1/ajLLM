@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "artifact_type": "tokenizer",
+  "created_at": "2026-07-24T22:30:54.626282+00:00",
+  "name": "openwebtext_bpe_32k",
+  "dataset": "openwebtext",
+  "source_split": "train",
+  "source_path": "/root/autodl-tmp/ajLLM/ajllm_project/data/raw/openwebtext/train.txt",
+  "source_size_bytes": 11920511059,
+  "vocab_size": 32000,
+  "special_tokens": [
+    "<|endoftext|>"
+  ],
+  "merge_count": 31743,
+  "files": {
+    "vocab": "vocab.json",
+    "merges": "merges.txt"
+  },
+  "hashes": {
+    "vocab": "ad7e19e324752e3661335e55d665e9a130b923692e9378aa8943b073cc16fdd4",
+    "merges": "ded641d1b41ee5bf42ef7693715e7544e48111193bcbcdccfb1de558059e1210"
+  },
+  "fingerprint": "d817fb6cff9b55340926b7ac9610ad83ec7dde8fbf01eb7984de7615fcbdf725"
+}

@@ -1,0 +1,33 @@
+{
+  "training_run": "D:\\LLMLearning\\ajLLM\\ajllm_project\\runs\\training\\tinystories\\tinystories_bpe_10k\\transformer_baseline\\tinystories_baseline\\20260724T214456Z_649f35a3",
+  "checkpoint": "best",
+  "parameters": {
+    "max_new_tokens": 150,
+    "temperature": 0.8,
+    "top_p": 0.95,
+    "samples_per_prompt": 1,
+    "seed": 42
+  },
+  "results": [
+    {
+      "prompt": "Once upon a time",
+      "completions": [
+        {
+          "text": "Once upon a time, there was a big, strong ant named Andy. Andy had a job to carry heavy things from one place to another. He had to carry big things. One day, he saw a big hill. The hill was very tall and Andy wanted to go up.\nAndy tried to carry the big thing with his strong legs. But the big thing was too heavy. He tried and tried, but the big thing was still too heavy. Andy felt sad. He wanted to go up the big thing so badly.\nJust then, a kind bird named Betty saw Andy. She knew that it was okay to carry big things. Betty told Andy that the big thing was not enough. Andy felt better and carried the big thing together. Together, they",
+          "token_count": 154,
+          "elapsed_seconds": 1.2632923999990453
+        }
+      ]
+    },
+    {
+      "prompt": "The little robot looked at the stars",
+      "completions": [
+        {
+          "text": "The little robot looked at the stars and said, \"Hello, I am a tiny robot. I can talk because I am a magic robot. I can help you with anything you want.\" The little robot was very happy and said, \"Yes, please help me.\"\nThe little robot gave the little robot a small toy. But, the little robot could not pick up the toy. The little robot said, \"I can help you, but you must promise to be careful.\" The little robot said, \"I promise, I will be careful.\" The little robot picked up the little robot and took it to the big tree.\nWhen the robot got to the top of the tree, the little robot showed the big tree how to hold the toy and how to be careful.",
+          "token_count": 157,
+          "elapsed_seconds": 0.8675324999985605
+        }
+      ]
+    }
+  ]
+}

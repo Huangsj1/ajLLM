@@ -78,7 +78,82 @@ uv run pytest
 
 All examples below are executed from the `ajllm_project` root.
 
-The included TinyStories files are already stored in `data/raw/tinystories/`. Other datasets can be placed under `data/raw/<dataset>/` and referenced from a dataset YAML file.
+## Dataset and Prebuilt Artifact Setup
+
+The dataset definitions expect the following local paths:
+
+```text
+data/raw/tinystories/train.txt
+data/raw/tinystories/validation.txt
+data/raw/openwebtext/train.txt
+data/raw/openwebtext/validation.txt
+```
+
+Download the TinyStories V2 GPT-4 text files with:
+
+```bash
+mkdir -p data/raw/tinystories
+wget -O data/raw/tinystories/train.txt \
+  https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-train.txt
+wget -O data/raw/tinystories/validation.txt \
+  https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt
+```
+
+Download and unpack the OpenWebText sample with:
+
+```bash
+mkdir -p data/raw/openwebtext
+wget -O data/raw/openwebtext/train.txt.gz \
+  https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_train.txt.gz
+gunzip -f data/raw/openwebtext/train.txt.gz
+wget -O data/raw/openwebtext/validation.txt.gz \
+  https://huggingface.co/datasets/stanford-cs336/owt-sample/resolve/main/owt_valid.txt.gz
+gunzip -f data/raw/openwebtext/validation.txt.gz
+```
+
+The raw text files are only required when training a tokenizer or re-encoding a dataset. For LM training, you can download the prebuilt tokenizer and encoded-token artifacts from the [Huangshj/cs336 dataset repository](https://huggingface.co/datasets/Huangshj/cs336/tree/main). The repository contains matching `tokenizers/` and `encoded/` directories, including vocabulary files, merge tables, `uint32` token files, and manifests.
+
+From the project root, use the Hugging Face CLI to place them directly under `artifacts/`:
+
+```bash
+hf download Huangshj/cs336 \
+  --repo-type dataset \
+  --include "tokenizers/**" "encoded/**" \
+  --local-dir artifacts
+```
+
+If the `hf` command is unavailable, install it with `uv tool install huggingface-hub`, or download the two directories from the repository page and copy them into `artifacts/` while preserving their directory structure.
+
+After downloading, the relevant artifact directories should look like:
+
+```text
+artifacts/tokenizers/tinystories_bpe_10k/
+  vocab.json  merges.txt  manifest.json
+artifacts/tokenizers/openwebtext_bpe_32k/
+  vocab.json  merges.txt  manifest.json
+artifacts/encoded/tinystories/tinystories_bpe_10k/
+  train.uint32  validation.uint32  manifest.json
+artifacts/encoded/openwebtext/openwebtext_bpe_32k/
+  train.uint32  validation.uint32  manifest.json
+```
+
+The tokenizer fingerprints in the encoded manifests must match the selected tokenizer manifests. The included LM configs already reference these names, so no tokenizer training or encoding is needed when the prebuilt artifacts are present.
+
+If you prefer to reproduce the artifacts, first download the raw text above, then run:
+
+```bash
+uv run ajllm tokenizer train \
+  --config configs/runs/tokenizer_train/tinystories_bpe_10k.yaml
+uv run ajllm tokenizer encode \
+  --config configs/runs/tokenizer_encode/tinystories.yaml
+
+uv run ajllm tokenizer train \
+  --config configs/runs/tokenizer_train/openwebtext_bpe_32k.yaml
+uv run ajllm tokenizer encode \
+  --config configs/runs/tokenizer_encode/openwebtext.yaml
+```
+
+The default OpenWebText encoding uses the lossless `byte_fallback` strategy for malformed, unusually long pre-tokens. Sections 1 and 2 describe the tokenizer training and encoding settings in detail.
 
 ## Configuration Model
 
@@ -185,6 +260,16 @@ uv run ajllm tokenizer encode \
 
 Encoding also supports process-based chunking. Its `encoding` section controls `parallel`, `num_processes`, `chunk_size`, and `buffer_tokens`. Worker outputs are concatenated in chunk order, so parallel encoding preserves the token-file order.
 
+Very long GPT-style pre-tokens can make the naive BPE merge loop quadratic (OpenWebText contains a few malformed repeated-byte spans). File encoding therefore defaults to a lossless byte fallback for pre-tokens longer than 8,192 UTF-8 bytes:
+
+```yaml
+encoding:
+  max_pretoken_bytes: 8192
+  long_pretoken_strategy: byte_fallback  # byte_fallback, bpe, or error
+```
+
+`byte_fallback` emits the original UTF-8 bytes as the base byte tokens, so decoding remains identical while avoiding the expensive merge loop. Each encoded split records `fallback_pretoken_count`, `fallback_bytes`, and `largest_pretoken_bytes` in `manifest.json`. Use `bpe` with `max_pretoken_bytes: null` only when you intentionally want the unbounded merge behavior.
+
 Output:
 
 ```text
@@ -279,33 +364,29 @@ The grid accepts any dotted configuration key, so it can also compare batch size
 
 ## 5. Evaluate Loss and Perplexity
 
-Edit `configs/runs/lm_evaluate/example.yaml` and set `run_directory` to a completed training run:
-
 ```bash
 uv run ajllm lm evaluate \
-  --config configs/runs/lm_evaluate/example.yaml
+  --config configs/runs/lm_evaluate/tinystories_eval.yaml
 ```
 
 `checkpoint` may be `best`, `latest`, `final`, or an explicit `.pt` path.
 
 ## 6. Compare Existing Runs
 
-List completed run directories in `configs/runs/lm_compare/example.yaml`:
+List completed run directories in `configs/runs/lm_compare/tinystories_lr.yaml`:
 
 ```bash
 uv run ajllm lm compare \
-  --config configs/runs/lm_compare/example.yaml
+  --config configs/runs/lm_compare/tinystories_lr.yaml
 ```
 
 The command writes ranked JSON/CSV results and combined learning curves.
 
 ## 7. Generate Text
 
-Edit the run directory in `configs/runs/lm_generate/example.yaml`:
-
 ```bash
 uv run ajllm lm generate \
-  --config configs/runs/lm_generate/example.yaml
+  --config configs/runs/lm_generate/tinystories_gen.yaml
 ```
 
 Generation recovers the model architecture and tokenizer from the training run. The generation config only controls the checkpoint, prompts, temperature, top-p, number of samples, device, and seed.

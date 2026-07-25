@@ -1,0 +1,11 @@
+name: tinystories_lr
+metric: best_validation_loss
+mode: min
+generate_plot: true
+runs:
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p0001
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p0005
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p001
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p005
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p01
+  - runs/sweeps/tinystories_lr/20260724T233343Z_fe003864/trials/max_lr_0p05

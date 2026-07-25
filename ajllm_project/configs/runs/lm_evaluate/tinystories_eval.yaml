@@ -1,0 +1,9 @@
+name: tinystories_eval
+run_directory: runs/training/tinystories/tinystories_bpe_10k/transformer_baseline/tinystories_baseline/20260724T214456Z_649f35a3
+checkpoint: best
+split: validation
+batches: 100
+batch_size: 64
+device: auto
+seed: 42
+
