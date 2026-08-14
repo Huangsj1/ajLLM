@@ -11,6 +11,7 @@ dependencies = [
     "regex>=2026.3.32",
     "torch~=2.11.0",
     "tqdm>=4.67",
+    "einops>=0.8.0",
 ]
 
 [project.optional-dependencies]

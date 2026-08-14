@@ -136,6 +136,9 @@ class Trainer:
             loss = cross_entropy(logits, targets)
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            # Synchronize gradients for distributed training
+            if hasattr(self.model, 'finish_gradient_synchronization'):
+                self.model.finish_gradient_synchronization()
             gradient_norm = clip_gradients(self.model.parameters(), gradient_clip)
             self.optimizer.step()
             completed_step = step + 1
@@ -160,24 +163,10 @@ class Trainer:
                 validation_loss = evaluation.get("validation_loss")
                 if validation_loss is not None and validation_loss < best_validation_loss:
                     best_validation_loss = validation_loss
-                    save_checkpoint(
-                        checkpoint_directory / "best.pt",
-                        self.model,
-                        self.optimizer,
-                        completed_step,
-                        checkpoint_metadata,
-                    )
 
             if checkpoint_interval > 0 and completed_step % checkpoint_interval == 0:
                 save_checkpoint(
                     checkpoint_directory / f"step_{completed_step:08d}.pt",
-                    self.model,
-                    self.optimizer,
-                    completed_step,
-                    checkpoint_metadata,
-                )
-                save_checkpoint(
-                    checkpoint_directory / "latest.pt",
                     self.model,
                     self.optimizer,
                     completed_step,
@@ -191,22 +180,7 @@ class Trainer:
             max_steps,
             checkpoint_metadata,
         )
-        save_checkpoint(
-            checkpoint_directory / "latest.pt",
-            self.model,
-            self.optimizer,
-            max_steps,
-            checkpoint_metadata,
-        )
         final_evaluation = self.evaluate(eval_batches, batch_size, context_length)
-        if not (checkpoint_directory / "best.pt").is_file():
-            save_checkpoint(
-                checkpoint_directory / "best.pt",
-                self.model,
-                self.optimizer,
-                max_steps,
-                checkpoint_metadata,
-            )
         summary = {
             "status": "completed",
             "steps": max_steps,

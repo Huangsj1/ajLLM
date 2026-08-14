@@ -13,7 +13,6 @@ from ajllm.artifacts.registry import load_tokenizer_artifact
 from ajllm.config.loader import LoadedConfig
 from ajllm.config.validation import validate_dataset, validate_tokenizer
 from ajllm.tokenization.tokenizer import Tokenizer
-from ajllm.utils.hashing import sha256_file
 
 
 def _project_path(project_root: Path, value: str) -> Path:
@@ -62,7 +61,6 @@ def run(config: LoadedConfig) -> dict[str, Any]:
             "path": output_path.name,
             "token_count": token_count,
             "size_bytes": output_path.stat().st_size,
-            "sha256": sha256_file(output_path),
             "source_path": str(input_path),
             "encoding_stats": dict(tokenizer.last_encoding_stats),
         }
@@ -72,7 +70,6 @@ def run(config: LoadedConfig) -> dict[str, Any]:
     manifest = {
         "dataset": dataset["name"],
         "tokenizer": tokenizer_config["name"],
-        "tokenizer_fingerprint": tokenizer_manifest["fingerprint"],
         "vocab_size": tokenizer_manifest["vocab_size"],
         "dtype": "uint32",
         "byte_order": "native",

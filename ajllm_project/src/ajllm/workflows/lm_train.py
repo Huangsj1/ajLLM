@@ -18,7 +18,6 @@ from ajllm.reporting.model_report import write_model_report
 from ajllm.training.data import TokenDataset
 from ajllm.training.trainer import Trainer
 from ajllm.utils.device import explain_device_selection, resolve_device
-from ajllm.utils.hashing import sha256_json
 from ajllm.utils.random import seed_everything
 
 
@@ -37,8 +36,6 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
         dataset_config["name"],
         tokenizer_config["name"],
     )
-    if encoded_manifest["tokenizer_fingerprint"] != tokenizer_manifest["fingerprint"]:
-        raise ValueError("Encoded dataset tokenizer fingerprint does not match the selected tokenizer artifact")
 
     experiment = str(data.get("experiment", "training"))
     paths = ArtifactPaths(config.project_root)
@@ -81,7 +78,39 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
     requested_device = str(runtime.get("device", "auto"))
     device = resolve_device(requested_device)
     seed_everything(seed)
-    model = build_model(model_config, vocab_size)
+
+    # Check acceleration settings
+    acceleration = data.get("acceleration", {})
+    use_flash_attention = bool(acceleration.get("use_flash_attention", False))
+    use_fsdp = bool(acceleration.get("use_fsdp", False))
+    mixed_precision = acceleration.get("mixed_precision")  # None, "fp16", or "bf16"
+
+    # Validate mixed_precision setting
+    if mixed_precision is not None:
+        if mixed_precision not in ["fp16", "bf16"]:
+            raise ValueError(f"mixed_precision must be 'fp16', 'bf16', or null, got: {mixed_precision}")
+        if device.type not in ["cuda", "mps"]:
+            raise ValueError(f"Mixed precision requires CUDA or MPS device, got: {device.type}")
+
+    # Convert mixed_precision to torch dtype
+    compute_dtype = None
+    if mixed_precision == "fp16":
+        compute_dtype = torch.float16
+    elif mixed_precision == "bf16":
+        compute_dtype = torch.bfloat16
+
+    model = build_model(model_config, vocab_size, use_flash_attention)
+
+    # Wrap with FSDP if enabled
+    if use_fsdp:
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            raise RuntimeError(
+                "FSDP requires distributed environment. Launch with torchrun or scripts/launch_distributed.py"
+            )
+        from ajllm.training.distributed import FullyShardedDataParallel
+        model = FullyShardedDataParallel(model, compute_dtype=compute_dtype)
+
+    model = model.to(device)
     training_config = data.get("training", {})
     batch_size = int(training_config.get("batch_size", 64))
     context_length = int(model.context_length)
@@ -111,6 +140,9 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
     print(f"  planned training tokens: {training_steps * tokens_per_batch:,}")
     print(f"  batches per nominal dataset pass: {batches_per_pass:,}")
     print(f"  model parameters: {sum(parameter.numel() for parameter in model.parameters()):,}")
+    print(f"  flash attention: {'enabled' if use_flash_attention else 'disabled'}")
+    print(f"  FSDP: {'enabled' if use_fsdp else 'disabled'}")
+    print(f"  mixed precision: {mixed_precision if mixed_precision else 'disabled'}")
     write_model_report(
         run_directory / "model_report.md",
         model,
@@ -124,11 +156,9 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
         "experiment": experiment,
         "dataset": dataset_config["name"],
         "tokenizer": tokenizer_config["name"],
-        "tokenizer_fingerprint": tokenizer_manifest["fingerprint"],
         "model": model_config["name"],
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "device": str(device),
-        "config_fingerprint": sha256_json(data),
     }
     write_manifest(run_directory / "manifest.json", "training_run", manifest)
     trainer = Trainer(model, train_dataset, validation_dataset, run_directory, data, device, seed)

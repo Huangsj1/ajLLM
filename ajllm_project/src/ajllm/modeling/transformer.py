@@ -24,6 +24,7 @@ class TransformerBlock(nn.Module):
         normalization: str,
         norm_placement: str,
         feed_forward: str,
+        use_flash_attention: bool = False,
     ) -> None:
         super().__init__()
         if norm_placement not in {"pre", "post"}:
@@ -37,6 +38,7 @@ class TransformerBlock(nn.Module):
             context_length,
             position_encoding,
             rope_theta,
+            use_flash_attention,
         )
         self.feed_forward = build_feed_forward(feed_forward, d_model, d_ff)
 
@@ -65,6 +67,7 @@ class TransformerLM(nn.Module):
         norm_placement: str = "pre",
         feed_forward: str = "swiglu",
         tie_embeddings: bool = False,
+        use_flash_attention: bool = False,
     ) -> None:
         super().__init__()
         if position_encoding not in {"rope", "none", "learned"}:
@@ -95,6 +98,7 @@ class TransformerLM(nn.Module):
                     normalization,
                     norm_placement,
                     feed_forward,
+                    use_flash_attention,
                 )
                 for _ in range(num_layers)
             ]

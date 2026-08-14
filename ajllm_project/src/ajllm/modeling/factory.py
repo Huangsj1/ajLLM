@@ -8,7 +8,7 @@ from ajllm.config.validation import validate_model
 from ajllm.modeling.transformer import TransformerLM
 
 
-def build_model(config: dict[str, Any], vocab_size: int) -> TransformerLM:
+def build_model(config: dict[str, Any], vocab_size: int, use_flash_attention: bool = False) -> TransformerLM:
     """Build a model instance from a resolved model configuration."""
 
     validate_model(config)
@@ -31,4 +31,5 @@ def build_model(config: dict[str, Any], vocab_size: int) -> TransformerLM:
         norm_placement=str(normalization.get("placement", "pre")),
         feed_forward=feed_forward_type,
         tie_embeddings=bool(config.get("tie_embeddings", False)),
+        use_flash_attention=use_flash_attention,
     )
