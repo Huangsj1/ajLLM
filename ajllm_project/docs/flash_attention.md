@@ -2,149 +2,54 @@
 
 ## Overview
 
-FlashAttention-2 is a memory-efficient attention algorithm that avoids materializing the full O(n²) attention matrix. It uses tiling and online softmax to compute attention in blocks, keeping only small tiles in fast SRAM/registers while streaming through the sequence.
+FlashAttention-2 computes attention in tiles with an online softmax, avoiding materialization of the full attention matrix. Instead of storing the full `batch × heads × sequence × sequence` attention matrix, it streams through key/value blocks and keeps only the state needed to produce the same attention output.
 
-## Benefits
+In ajLLM this is exposed as an acceleration option for Transformer language-model training. It is most useful on CUDA workloads where attention activation memory or attention-kernel bandwidth becomes a bottleneck.
 
-**Memory Savings:**
-- 4-8× reduction in activation memory for attention layers
-- Enables longer sequences or larger batch sizes
-- Critical for memory-constrained GPUs
+## Implementation in ajLLM
 
-**Speed Improvements:**
-- 1.5-2× faster attention computation (memory bandwidth bound)
-- No accuracy loss compared to standard attention
-- Fused kernel reduces memory traffic
+The project provides FlashAttention-2 support in the modeling layer and selects the accelerated attention path from the training configuration.
 
-## How It Works
+Key properties:
 
-Standard attention materializes the full attention matrix:
-```
-scores = Q @ K^T / sqrt(d)     # Shape: (batch, heads, n, n)
-probs = softmax(scores)         # Materialize full matrix
-output = probs @ V              # Shape: (batch, heads, n, d)
-```
+- The model can be switched between standard attention and FlashAttention-2 through config only.
+- There are two implementation paths: a Triton kernel and a PyTorch fallback. The Triton kernel is used when available, otherwise the PyTorch implementation is used.
+- FlashAttention-2 can be used alone or together with FSDP + activation checkpointing for multi-GPU training.
 
-FlashAttention-2 tiles the computation:
-1. Split Q into blocks (query tiles)
-2. For each query tile, stream through K/V blocks
-3. Maintain running softmax statistics (max, sum) online
-4. Never materialize the full n×n attention matrix
+## Configuration
 
-This reduces peak memory from O(n²) to O(n) for the attention operation.
+Enable FlashAttention-2 without FSDP:
 
-## Implementation
-
-We provide two backends:
-- **PyTorch**: Pure PyTorch with `torch.compile` for backward pass (works on any device)
-- **Triton**: Fused CUDA kernels for maximum performance (CUDA only, optional)
-
-The implementation automatically selects the appropriate backend and falls back gracefully.
-
-## Usage
-
-### Enable in Configuration
-
-Add to your training config:
 ```yaml
 acceleration:
   use_flash_attention: true
-  mixed_precision: null  # Optional: fp16 or bf16 for FSDP
+  use_fsdp: false
+  mixed_precision: null
 ```
 
-Note: `mixed_precision` only affects FSDP. FlashAttention2 automatically handles whatever dtype the inputs are in.
+`mixed_precision` only affects the FSDP path. For a non-FSDP FlashAttention-2 run, the model follows the normal training dtype path.
 
-### Example Configs
-
-```bash
-# TinyStories with FlashAttention2
-configs/runs/lm_train/tinystories_baseline.yaml:
-  acceleration:
-    use_flash_attention: true
-    use_fsdp: false
-```
-
-### Launch Training
+## Launch Training
 
 ```bash
-# Single GPU
 uv run ajllm lm train --config configs/runs/lm_train/tinystories_baseline.yaml
 ```
 
-## Performance Benchmarks
-
-Based on tinystories_baseline model (22.7M params, d_model=512, context=256):
-
-| Configuration | Forward (ms) | Backward (ms) | Peak Memory (MB) |
-|---------------|--------------|---------------|------------------|
-| Baseline      | 45-60        | 90-120        | ~2,500           |
-| FlashAttention2 | 30-40      | 60-80         | ~800             |
-
-**Memory Reduction:** ~3× for this model size and context length
-
-**Speedup:** ~1.5-1.7× overall (compute becomes more efficient)
-
-Memory savings scale with sequence length: longer contexts see larger benefits.
-
-## Limitations
-
-- **CUDA Required**: Full performance requires CUDA-capable GPU
-- **CPU Fallback**: Automatically falls back to standard attention on CPU
-- **Sequence Length**: Most effective for longer sequences (context > 128)
-- **Triton Optional**: Triton kernels provide best performance but are optional
-
-## Technical Details
-
-### Tiling Strategy
-
-- Query tile size: 32 (for d ≤ 64: 64)
-- Key tile size: 32 (for d ≤ 64: 64)
-- Tiles chosen to fit in GPU L1/SRAM
-- Online softmax maintains running maximum and sum
-
-### Numerical Stability
-
-- All accumulations in fp32 regardless of input dtype
-- Softmax computed with stable logsumexp
-- No accuracy degradation compared to standard attention
-
-### Backward Pass
-
-- Recomputes attention matrix from saved logsumexp
-- No need to save full attention matrix (memory savings)
-- Compiled with `torch.compile` for performance
+The config file controls whether the model uses standard attention or FlashAttention-2.
 
 ## Combining with FSDP
 
-FlashAttention2 and FSDP+AC are complementary:
-- FlashAttention reduces activation memory in attention layers
-- FSDP+AC reduces parameter and remaining activation memory
-- Together they provide 8-15× total memory reduction
+FlashAttention-2 reduces attention memory, while FSDP + activation checkpointing reduces distributed training state and saved activations. They can be enabled together:
 
-Enable both:
 ```yaml
 acceleration:
   use_flash_attention: true
   use_fsdp: true
+  mixed_precision: null
 ```
 
-## Troubleshooting
+Launch the combined multi-GPU path through the distributed launcher rather than the ordinary single-process command. See [FSDP with Activation Checkpointing](fsdp_activation_checkpointing.md).
 
-**CUDA Out of Memory:**
-- FlashAttention reduces memory but doesn't eliminate limits
-- Try smaller batch size or shorter context length
-- Enable FSDP for multi-GPU sharding
+## Results
 
-**Triton Import Error:**
-- Triton is optional; PyTorch backend is used automatically
-- Install Triton: `pip install triton` (CUDA 11.8+ required)
-
-**Slower than Expected:**
-- FlashAttention is memory-bandwidth bound
-- Benefits increase with sequence length
-- Ensure CUDA is being used (check device in logs)
-
-## References
-
-- FlashAttention-2 Paper: https://arxiv.org/abs/2307.08691
-- Original FlashAttention: https://arxiv.org/abs/2205.14135
+Benchmark and full-training measurements are collected in [Acceleration Results](ACCELERATION_SUMMARY.md). This page intentionally focuses on the project implementation and usage path rather than duplicating result tables.

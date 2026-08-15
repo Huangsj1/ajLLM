@@ -1,0 +1,212 @@
+[
+  {
+    "config": "baseline",
+    "device": "cuda:0",
+    "world_size": 1,
+    "rank": 0,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 146.950151049532,
+      "std_ms": 0.5278166971850018,
+      "peak_memory_mb": 5412.8662109375
+    },
+    "backward": {
+      "mean_ms": 326.70506660360843,
+      "std_ms": 1.3542303612130449,
+      "peak_memory_mb": 5804.3974609375
+    },
+    "optimizer": {
+      "mean_ms": 9.644813765771687,
+      "std_ms": 0.07582280557719881,
+      "peak_memory_mb": 845.74462890625
+    },
+    "total": {
+      "mean_ms": 483.9948676759377,
+      "std_ms": 0.9090592024426225,
+      "peak_memory_mb": 5804.3974609375
+    },
+    "parameter_count": 27021824
+  },
+  {
+    "config": "flash_attention",
+    "device": "cuda:0",
+    "world_size": 1,
+    "rank": 0,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 110.31641701702029,
+      "std_ms": 1.5167010035007267,
+      "peak_memory_mb": 3428.0224609375
+    },
+    "backward": {
+      "mean_ms": 250.65756095573306,
+      "std_ms": 2.615106072199315,
+      "peak_memory_mb": 3819.5537109375
+    },
+    "optimizer": {
+      "mean_ms": 9.539900999516249,
+      "std_ms": 0.0670567913004312,
+      "peak_memory_mb": 848.55712890625
+    },
+    "total": {
+      "mean_ms": 371.13259225152433,
+      "std_ms": 3.076223063764152,
+      "peak_memory_mb": 3819.5537109375
+    },
+    "parameter_count": 27021824
+  },
+  {
+    "config": "fsdp_ac",
+    "device": "cuda:0",
+    "world_size": 2,
+    "rank": 0,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 46.456571319140494,
+      "std_ms": 0.18815477791737456,
+      "peak_memory_mb": 1516.6396484375
+    },
+    "backward": {
+      "mean_ms": 124.5083468966186,
+      "std_ms": 0.09868032750865117,
+      "peak_memory_mb": 1790.0537109375
+    },
+    "optimizer": {
+      "mean_ms": 4.990111407823861,
+      "std_ms": 0.038809023052954805,
+      "peak_memory_mb": 354.02587890625
+    },
+    "total": {
+      "mean_ms": 176.5332288807258,
+      "std_ms": 0.2367007044472031,
+      "peak_memory_mb": 1790.0537109375
+    },
+    "parameter_count": 13513216
+  },
+  {
+    "config": "fsdp_ac",
+    "device": "cuda:1",
+    "world_size": 2,
+    "rank": 1,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 46.65482654236257,
+      "std_ms": 0.056339054797557006,
+      "peak_memory_mb": 1516.6396484375
+    },
+    "backward": {
+      "mean_ms": 124.32862364221364,
+      "std_ms": 0.09367303027907867,
+      "peak_memory_mb": 1790.0537109375
+    },
+    "optimizer": {
+      "mean_ms": 4.978719213977456,
+      "std_ms": 0.08011695406353238,
+      "peak_memory_mb": 354.02587890625
+    },
+    "total": {
+      "mean_ms": 176.5337117947638,
+      "std_ms": 0.15256210089438307,
+      "peak_memory_mb": 1790.0537109375
+    },
+    "parameter_count": 13513216
+  },
+  {
+    "config": "flash_attention_fsdp_ac",
+    "device": "cuda:0",
+    "world_size": 2,
+    "rank": 0,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 37.32869310770184,
+      "std_ms": 0.3439574623186868,
+      "peak_memory_mb": 1020.3896484375
+    },
+    "backward": {
+      "mean_ms": 106.62061956245452,
+      "std_ms": 0.14666861718992988,
+      "peak_memory_mb": 1293.8037109375
+    },
+    "optimizer": {
+      "mean_ms": 5.039329431019723,
+      "std_ms": 0.037060268242770686,
+      "peak_memory_mb": 354.02587890625
+    },
+    "total": {
+      "mean_ms": 149.57517245784402,
+      "std_ms": 0.3873440571478769,
+      "peak_memory_mb": 1293.8037109375
+    },
+    "parameter_count": 13513216
+  },
+  {
+    "config": "flash_attention_fsdp_ac",
+    "device": "cuda:1",
+    "world_size": 2,
+    "rank": 1,
+    "vocab_size": 10000,
+    "d_model": 512,
+    "num_layers": 4,
+    "num_heads": 16,
+    "batch_size": 32,
+    "context_length": 256,
+    "steps": 10,
+    "warmup_steps": 3,
+    "forward": {
+      "mean_ms": 37.45639999397099,
+      "std_ms": 0.24570723422898236,
+      "peak_memory_mb": 1020.3896484375
+    },
+    "backward": {
+      "mean_ms": 106.44646871369332,
+      "std_ms": 0.1699254515379337,
+      "peak_memory_mb": 1293.8037109375
+    },
+    "optimizer": {
+      "mean_ms": 5.041051981970668,
+      "std_ms": 0.043401786965794276,
+      "peak_memory_mb": 354.02587890625
+    },
+    "total": {
+      "mean_ms": 149.57070804666728,
+      "std_ms": 0.4330973727662897,
+      "peak_memory_mb": 1293.8037109375
+    },
+    "parameter_count": 13513216
+  }
+]

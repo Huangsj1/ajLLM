@@ -57,6 +57,7 @@ ajllm_project/
 │   ├── evaluations/        # Evaluation results
 │   ├── comparisons/        # Multi-run comparisons
 │   └── generations/        # Generated text and parameters
+├── results/                # Optional user-specified output for plots, reports, and artifacts
 ├── docs/
 └── tests/
     ├── unit/
@@ -204,6 +205,27 @@ train/validation token counts, batch size, context length, tokens per batch, con
 steps, and an approximate number of batches in one full dataset pass. The training loop uses
 random windows rather than epoch-based iteration, so `training batches (steps)` is the exact
 number of optimizer updates.
+
+## Distributed Training and Acceleration
+
+For supported CUDA workloads, enable FlashAttention-2 to reduce attention memory. With two or more GPUs, FSDP with activation checkpointing (AC) shards training state and reduces per-GPU memory use. The combined configuration was the fastest observed option in the measured TinyStories runs.
+
+```yaml
+acceleration:
+  use_flash_attention: true
+  use_fsdp: true
+  mixed_precision: bf16  # Use null for fp32; verify bf16 support and validation metrics.
+```
+
+Launch a two-GPU training run with:
+
+```bash
+uv run python -m ajllm.workflows.lm_train_distributed \
+  --config configs/runs/lm_train/tinystories_baseline.yaml \
+  --nproc-per-node 2
+```
+
+For FSDP training, `training.batch_size` is currently per rank; with two ranks, the effective global batch is approximately twice that value. See [acceleration results](docs/ACCELERATION_SUMMARY.md), [FlashAttention-2](docs/flash_attention.md), and [FSDP with activation checkpointing](docs/fsdp_activation_checkpointing.md) for measured results, configuration details, and interpretation caveats.
 
 ## 1. Train a Tokenizer
 
