@@ -122,12 +122,14 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
 
     model = build_model(model_config, vocab_size, use_flash_attention)
 
+    # Move model to device before FSDP wrapping (FSDP broadcasts tensors during init)
+    model = model.to(device)
+
     # Wrap with FSDP if enabled (distributed environment already initialized above)
     if use_fsdp:
         from ajllm.training.distributed import FullyShardedDataParallel
         model = FullyShardedDataParallel(model, compute_dtype=compute_dtype)
 
-    model = model.to(device)
     training_config = data.get("training", {})
     batch_size = int(training_config.get("batch_size", 64))
     context_length = int(model.context_length)
