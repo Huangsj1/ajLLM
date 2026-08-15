@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,26 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
     use_fsdp = bool(acceleration.get("use_fsdp", False))
     mixed_precision = acceleration.get("mixed_precision")  # None, "fp16", or "bf16"
 
+    # Initialize distributed environment if FSDP is enabled
+    if use_fsdp:
+        if not torch.distributed.is_available():
+            raise RuntimeError("FSDP requires PyTorch with distributed support")
+
+        # Check if we're in a torchrun environment
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            # Initialize process group if not already done
+            if not torch.distributed.is_initialized():
+                torch.distributed.init_process_group(backend="nccl" if device.type == "cuda" else "gloo")
+                # Set device to local rank
+                if device.type == "cuda":
+                    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+                    torch.cuda.set_device(local_rank)
+                    device = torch.device("cuda", local_rank)
+        else:
+            raise RuntimeError(
+                "FSDP requires distributed environment. Launch with torchrun or lm_train_distributed.py"
+            )
+
     # Validate mixed_precision setting
     if mixed_precision is not None:
         if mixed_precision not in ["fp16", "bf16"]:
@@ -101,12 +122,8 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
 
     model = build_model(model_config, vocab_size, use_flash_attention)
 
-    # Wrap with FSDP if enabled
+    # Wrap with FSDP if enabled (distributed environment already initialized above)
     if use_fsdp:
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            raise RuntimeError(
-                "FSDP requires distributed environment. Launch with torchrun or scripts/launch_distributed.py"
-            )
         from ajllm.training.distributed import FullyShardedDataParallel
         model = FullyShardedDataParallel(model, compute_dtype=compute_dtype)
 

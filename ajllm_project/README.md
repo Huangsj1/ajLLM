@@ -118,8 +118,9 @@ From the project root, use the Hugging Face CLI to place them directly under `ar
 ```bash
 hf download Huangshj/cs336 \
   --repo-type dataset \
-  --include "tokenizers/**" "encoded/**" \
-  --local-dir artifacts
+  --include "tokenizers/*" \
+  --include "encoded/*" \
+  --local-dir .
 ```
 
 If the `hf` command is unavailable, install it with `uv tool install huggingface-hub`, or download the two directories from the repository page and copy them into `artifacts/` while preserving their directory structure.

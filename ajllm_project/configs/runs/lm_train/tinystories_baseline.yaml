@@ -8,7 +8,7 @@ data_splits:
   validation: validation
 
 training:
-  batch_size: 64
+  batch_size: 32
   total_tokens: 327680000
   gradient_clip: 1.0
 
