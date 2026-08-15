@@ -132,7 +132,9 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
 
     training_config = data.get("training", {})
     batch_size = int(training_config.get("batch_size", 64))
-    context_length = int(model.context_length)
+    # Access context_length through .module if wrapped with FSDP
+    base_model = model.module if use_fsdp else model
+    context_length = int(base_model.context_length)
     tokens_per_batch = batch_size * context_length
     if "max_steps" in training_config:
         training_steps = int(training_config["max_steps"])
