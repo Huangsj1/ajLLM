@@ -5,12 +5,12 @@ This script wraps torchrun to simplify launching multi-GPU training jobs.
 
 Examples:
     # 2 GPUs on single node
-    python scripts/launch_distributed.py \\
+    python -m ajllm.workflows.lm_train_distributed \\
         --config configs/runs/lm_train/tinystories_baseline.yaml \\
         --nproc-per-node 2
 
     # 4 GPUs on single node with custom port
-    python scripts/launch_distributed.py \\
+    python -m ajllm.workflows.lm_train_distributed \\
         --config configs/runs/lm_train/openwebtext_baseline.yaml \\
         --nproc-per-node 4 \\
         --master-port 29500

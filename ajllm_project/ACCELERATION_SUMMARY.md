@@ -54,12 +54,12 @@ This document summarizes the FlashAttention2 and FSDP+AC integration completed o
 - `src/ajllm/training/trainer.py` - Added gradient synchronization call
 
 **Scripts:**
-- `scripts/launch_distributed.py` - Distributed training launcher with torchrun
+- `src/ajllm/workflows/lm_train_distributed.py` - Distributed training launcher with torchrun
 
 ### Phase 4: Benchmarking ✓
 
 **New Files:**
-- `scripts/benchmark_acceleration.py` - Comprehensive benchmark script
+- `src/ajllm/workflows/benchmark_distributed.py` - Comprehensive benchmark script
   - Tests 4 configurations: baseline, flash_attention, fsdp_ac, flash_attention_fsdp_ac
   - Measures forward/backward/optimizer time and peak memory
   - Outputs JSON and CSV results
@@ -129,7 +129,7 @@ uv run ajllm lm train --config configs/runs/lm_train/tinystories_baseline.yaml
 ### Multi-GPU with FSDP+AC
 
 ```bash
-uv run python scripts/launch_distributed.py \
+uv run python -m ajllm.workflows.lm_train_distributed \
     --config configs/runs/lm_train/tinystories_baseline.yaml \
     --nproc-per-node 2
 ```
@@ -145,10 +145,10 @@ uv run torchrun --nproc-per-node=2 -m ajllm lm train \
 
 ```bash
 # Single GPU
-uv run python scripts/benchmark_acceleration.py --device cuda --steps 10
+uv run python -m ajllm.workflows.benchmark_distributed --device cuda --steps 10
 
 # Multi-GPU
-uv run python scripts/benchmark_acceleration.py --device cuda --world-size 2 --steps 10
+uv run python -m ajllm.workflows.benchmark_distributed --device cuda --world-size 2 --steps 10
 ```
 
 ## Testing Status
@@ -184,21 +184,21 @@ Based on tinystories_baseline (22.7M params, batch=64, context=256):
 
 2. Run single-GPU benchmark:
    ```bash
-   uv run python scripts/benchmark_acceleration.py --device cuda --steps 5 --warmup 2
+   uv run python -m ajllm.workflows.benchmark_distributed --device cuda --steps 5 --warmup 2
    ```
 
 ### For Server Testing (2× 4090)
 
 1. Test FSDP+AC:
    ```bash
-   uv run python scripts/launch_distributed.py \
+   uv run python -m ajllm.workflows.lm_train_distributed \
        --config configs/runs/lm_train/tinystories_baseline.yaml \
        --nproc-per-node 2
    ```
 
 2. Run full benchmark suite:
    ```bash
-   uv run python scripts/benchmark_acceleration.py \
+   uv run python -m ajllm.workflows.benchmark_distributed \
        --device cuda \
        --world-size 2 \
        --steps 10 \
@@ -209,11 +209,12 @@ Based on tinystories_baseline (22.7M params, batch=64, context=256):
 
 ## File Checklist
 
-### New Files (9)
+### New Files (10)
 - [x] `src/ajllm/modeling/flash_attention.py`
 - [x] `src/ajllm/training/distributed.py`
-- [x] `scripts/launch_distributed.py`
-- [x] `scripts/benchmark_acceleration.py`
+- [x] `src/ajllm/__main__.py`
+- [x] `src/ajllm/workflows/lm_train_distributed.py`
+- [x] `src/ajllm/workflows/benchmark_distributed.py`
 - [x] `docs/flash_attention.md`
 - [x] `docs/fsdp_activation_checkpointing.md`
 - [x] `ACCELERATION_SUMMARY.md` (this file)

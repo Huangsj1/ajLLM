@@ -5,13 +5,14 @@ Measures forward/backward/optimizer time, peak memory, and throughput for each c
 
 Examples:
     # Quick local test (single GPU)
-    python scripts/benchmark_acceleration.py --device cuda --steps 3 --warmup 1
+    python -m ajllm.workflows.benchmark_distributed --device cuda --steps 3 --warmup 1
 
     # Full benchmark on 2 GPUs
-    python scripts/benchmark_acceleration.py --device cuda --world-size 2 --steps 10
+    NCCL_P2P_DISABLE=1 NCCL_IB_DISABLE=1 \
+    python -m ajllm.workflows.benchmark_distributed --device cuda --world-size 2 --steps 10
 
     # Only test specific configurations
-    python scripts/benchmark_acceleration.py --configs baseline flash_attention
+    python -m ajllm.workflows.benchmark_distributed --configs baseline flash_attention
 """
 
 import argparse
@@ -79,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model", type=int, default=512)
     parser.add_argument("--num-layers", type=int, default=4)
     parser.add_argument("--num-heads", type=int, default=16)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32)       # 32 for 12GB GPU, 64 for 24GB GPU
     parser.add_argument("--context-length", type=int, default=256)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=2)
