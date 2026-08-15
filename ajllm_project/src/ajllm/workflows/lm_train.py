@@ -164,14 +164,17 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
     print(f"  flash attention: {'enabled' if use_flash_attention else 'disabled'}")
     print(f"  FSDP: {'enabled' if use_fsdp else 'disabled'}")
     print(f"  mixed precision: {mixed_precision if mixed_precision else 'disabled'}")
-    write_model_report(
-        run_directory / "model_report.md",
-        model,
-        model_config,
-        vocab_size,
-        batch_size,
-        training_config,
-    )
+
+    # Only rank 0 writes reports in distributed training
+    if not use_fsdp or torch.distributed.get_rank() == 0:
+        write_model_report(
+            run_directory / "model_report.md",
+            base_model,  # Pass unwrapped model
+            model_config,
+            vocab_size,
+            batch_size,
+            training_config,
+        )
 
     manifest = {
         "experiment": experiment,
@@ -181,7 +184,10 @@ def run(config: LoadedConfig, run_directory: Path | None = None) -> dict[str, An
         "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "device": str(device),
     }
-    write_manifest(run_directory / "manifest.json", "training_run", manifest)
+
+    # Only rank 0 writes manifest in distributed training
+    if not use_fsdp or torch.distributed.get_rank() == 0:
+        write_manifest(run_directory / "manifest.json", "training_run", manifest)
     trainer = Trainer(model, train_dataset, validation_dataset, run_directory, data, device, seed)
     summary = trainer.train(
         {

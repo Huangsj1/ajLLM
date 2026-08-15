@@ -20,6 +20,13 @@ from ajllm.training.optimizers import AdamW
 from ajllm.training.schedulers import warmup_cosine_learning_rate
 
 
+def _is_main_process() -> bool:
+    """Check if this is the main process (rank 0 in distributed or single process)."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
 def clip_gradients(parameters, maximum_norm: float, epsilon: float = 1e-6) -> float:
     parameters = [parameter for parameter in parameters if parameter.grad is not None]
     if not parameters:
@@ -92,7 +99,9 @@ class Trainer:
         training = self.config.get("training", {})
         logging = self.config.get("logging", {})
         batch_size = int(training.get("batch_size", 64))
-        context_length = int(self.model.context_length)
+        # Access context_length through .module if wrapped with FSDP
+        base_model = self.model.module if hasattr(self.model, 'module') else self.model
+        context_length = int(base_model.context_length)
         tokens_per_step = batch_size * context_length
         if "max_steps" in training:
             max_steps = int(training["max_steps"])
@@ -145,41 +154,46 @@ class Trainer:
             progress.set_postfix(loss=f"{loss.item():.4f}", lr=f"{learning_rate:.2e}")
 
             if completed_step % log_interval == 0 or completed_step == 1:
-                elapsed = max(time.perf_counter() - training_started, 1e-9)
-                self.logger.log(
-                    completed_step,
-                    "train",
-                    {
-                        "loss": float(loss.item()),
-                        "learning_rate": learning_rate,
-                        "gradient_norm": gradient_norm,
-                        "tokens_per_second": completed_step * tokens_per_step / elapsed,
-                    },
-                )
+                if _is_main_process():
+                    elapsed = max(time.perf_counter() - training_started, 1e-9)
+                    self.logger.log(
+                        completed_step,
+                        "train",
+                        {
+                            "loss": float(loss.item()),
+                            "learning_rate": learning_rate,
+                            "gradient_norm": gradient_norm,
+                            "tokens_per_second": completed_step * tokens_per_step / elapsed,
+                        },
+                    )
 
             if eval_interval > 0 and (completed_step % eval_interval == 0 or completed_step == max_steps):
                 evaluation = self.evaluate(eval_batches, batch_size, context_length)
-                self.logger.log(completed_step, "evaluation", evaluation)
+                if _is_main_process():
+                    self.logger.log(completed_step, "evaluation", evaluation)
                 validation_loss = evaluation.get("validation_loss")
                 if validation_loss is not None and validation_loss < best_validation_loss:
                     best_validation_loss = validation_loss
 
             if checkpoint_interval > 0 and completed_step % checkpoint_interval == 0:
-                save_checkpoint(
-                    checkpoint_directory / f"step_{completed_step:08d}.pt",
-                    self.model,
-                    self.optimizer,
-                    completed_step,
-                    checkpoint_metadata,
-                )
+                if _is_main_process():
+                    save_checkpoint(
+                        checkpoint_directory / f"step_{completed_step:08d}.pt",
+                        self.model,
+                        self.optimizer,
+                        completed_step,
+                        checkpoint_metadata,
+                    )
 
-        final_path = save_checkpoint(
-            checkpoint_directory / "final.pt",
-            self.model,
-            self.optimizer,
-            max_steps,
-            checkpoint_metadata,
-        )
+        final_path = None
+        if _is_main_process():
+            final_path = save_checkpoint(
+                checkpoint_directory / "final.pt",
+                self.model,
+                self.optimizer,
+                max_steps,
+                checkpoint_metadata,
+            )
         final_evaluation = self.evaluate(eval_batches, batch_size, context_length)
         summary = {
             "status": "completed",
@@ -187,9 +201,10 @@ class Trainer:
             "tokens_seen": max_steps * tokens_per_step,
             "elapsed_seconds": time.perf_counter() - training_started,
             "best_validation_loss": None if math.isinf(best_validation_loss) else best_validation_loss,
-            "checkpoint": str(final_path),
+            "checkpoint": str(final_path) if final_path else None,
             **final_evaluation,
         }
-        with (self.run_directory / "summary.json").open("w", encoding="utf-8") as output_file:
-            json.dump(summary, output_file, indent=2)
+        if _is_main_process():
+            with (self.run_directory / "summary.json").open("w", encoding="utf-8") as output_file:
+                json.dump(summary, output_file, indent=2)
         return summary
