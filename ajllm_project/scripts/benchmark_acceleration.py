@@ -161,12 +161,15 @@ def _make_model(args: argparse.Namespace, device: torch.device, config: str) -> 
         use_flash_attention=use_flash,
     )
 
+    # Move model to device before FSDP wrapping (FSDP broadcasts tensors during init)
+    model = model.to(device)
+
     if use_fsdp:
         from ajllm.training.distributed import FullyShardedDataParallel
         compute_dtype = torch.float16 if device.type == "cuda" else None
         model = FullyShardedDataParallel(model, compute_dtype=compute_dtype)
 
-    return model.to(device)
+    return model
 
 
 def _stats(samples: list[float], peaks: list[float]) -> PhaseStats:
