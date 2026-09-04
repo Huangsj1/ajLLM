@@ -1,6 +1,6 @@
-"""Configurable Transformer language model components."""
+"""Model construction API."""
 
-from ajllm.modeling.factory import build_model
-from ajllm.modeling.transformer import TransformerLM
+from ajllm.modeling.factory import build_model, create_model_from_config, load_model_config
+from ajllm.modeling.transformer import ModelConfig, TransformerLM
 
-__all__ = ["TransformerLM", "build_model"]
+__all__ = ["ModelConfig", "TransformerLM", "build_model", "create_model_from_config", "load_model_config"]

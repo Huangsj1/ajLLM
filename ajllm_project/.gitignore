@@ -1,24 +1,69 @@
-.venv/
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
-.ruff_cache/
-.uv-cache/
-.test-tmp/
-.pytest_tmp/
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
 dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
+*.egg
 
-data/raw/**
-!data/raw/.gitkeep
-artifacts/encoded/openwebtext/openwebtext_bpe_32k/*.uint32
-artifacts/encoded/tinystories/tinystories_bpe_10k/*.uint32
-runs/**
-!runs/comparisons/
-!runs/comparisons/**
-!runs/evaluations/
-!runs/evaluations/**
-!runs/generations/
-!runs/generations/**
-!runs/.gitkeep
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Training outputs
+output/
+runs/
+artifacts/
+*.pt
+*.pth
+*.ckpt
+
+# Logs
+*.log
+
+# Data (keep .gitkeep files)
+data/*.jsonl
+data/*.txt
+data/raw/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Keep empty directories
+!**/.gitkeep
+
+
+.ruff_cache/
+
+minimind/

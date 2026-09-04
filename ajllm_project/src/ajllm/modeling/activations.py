@@ -1,4 +1,4 @@
-"""Feed-forward activations and gated networks."""
+"""Feed-forward building blocks used by both dense and MoE blocks."""
 
 from __future__ import annotations
 
@@ -9,37 +9,18 @@ from ajllm.modeling.layers import Linear
 
 
 def silu(inputs: torch.Tensor) -> torch.Tensor:
+    """Elementwise SiLU written from its defining equation."""
     return inputs * torch.sigmoid(inputs)
 
 
 class SwiGLU(nn.Module):
-    """SwiGLU(x) = W2(SiLU(W1x) * W3x)."""
+    """Bias-free SwiGLU: ``down(silu(gate) * up)``."""
 
     def __init__(self, d_model: int, d_ff: int) -> None:
         super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-        self.w3 = Linear(d_model, d_ff)
+        self.gate_proj = Linear(d_model, d_ff)
+        self.up_proj = Linear(d_model, d_ff)
+        self.down_proj = Linear(d_ff, d_model)
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.w2(silu(self.w1(inputs)) * self.w3(inputs))
-
-
-class SiLUFeedForward(nn.Module):
-    """Two-projection feed-forward network with SiLU activation."""
-
-    def __init__(self, d_model: int, d_ff: int) -> None:
-        super().__init__()
-        self.w1 = Linear(d_model, d_ff)
-        self.w2 = Linear(d_ff, d_model)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return self.w2(silu(self.w1(inputs)))
-
-
-def build_feed_forward(kind: str, d_model: int, d_ff: int) -> nn.Module:
-    if kind == "swiglu":
-        return SwiGLU(d_model, d_ff)
-    if kind == "silu":
-        return SiLUFeedForward(d_model, d_ff)
-    raise ValueError(f"Unsupported feed-forward type: {kind}")
+        return self.down_proj(silu(self.gate_proj(inputs)) * self.up_proj(inputs))

@@ -11,14 +11,10 @@ import math
 import torch
 from einops import rearrange
 
-try:
-    import triton
-    import triton.language as tl
-    TRITON_AVAILABLE = True
-except ImportError:
-    triton = None
-    tl = None
-    TRITON_AVAILABLE = False
+import triton
+import triton.language as tl
+
+TRITON_AVAILABLE = True
 
 MASK_BIAS = -1e6  # Large negative for masked positions
 
@@ -173,7 +169,10 @@ class FlashAttention2PyTorch(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False):
         out, lse = flash_forward_pytorch(
-            Q, K, V, is_causal,
+            Q,
+            K,
+            V,
+            is_causal,
             q_tile_size=FlashAttention2PyTorch.Q_TILE_SIZE,
             k_tile_size=FlashAttention2PyTorch.K_TILE_SIZE,
         )
@@ -193,13 +192,28 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def flash_fwd_kernel(
-        Q_ptr, K_ptr, V_ptr, O_ptr, L_ptr,
-        stride_qb, stride_qq, stride_qd,
-        stride_kb, stride_kk, stride_kd,
-        stride_vb, stride_vk, stride_vd,
-        stride_ob, stride_oq, stride_od,
-        stride_lb, stride_lq,
-        N_QUERIES, N_KEYS, scale,
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        O_ptr,
+        L_ptr,
+        stride_qb,
+        stride_qq,
+        stride_qd,
+        stride_kb,
+        stride_kk,
+        stride_kd,
+        stride_vb,
+        stride_vk,
+        stride_vd,
+        stride_ob,
+        stride_oq,
+        stride_od,
+        stride_lb,
+        stride_lq,
+        N_QUERIES,
+        N_KEYS,
+        scale,
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
@@ -299,16 +313,39 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def flash_bwd_dkdv_kernel(
-        Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, Delta_ptr, dK_ptr, dV_ptr,
-        stride_qb, stride_qq, stride_qd,
-        stride_kb, stride_kk, stride_kd,
-        stride_vb, stride_vk, stride_vd,
-        stride_dob, stride_doq, stride_dod,
-        stride_lb, stride_lq,
-        stride_db, stride_dq_,
-        stride_dkb, stride_dkk, stride_dkd,
-        stride_dvb, stride_dvk, stride_dvd,
-        N_QUERIES, N_KEYS, scale,
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        dO_ptr,
+        L_ptr,
+        Delta_ptr,
+        dK_ptr,
+        dV_ptr,
+        stride_qb,
+        stride_qq,
+        stride_qd,
+        stride_kb,
+        stride_kk,
+        stride_kd,
+        stride_vb,
+        stride_vk,
+        stride_vd,
+        stride_dob,
+        stride_doq,
+        stride_dod,
+        stride_lb,
+        stride_lq,
+        stride_db,
+        stride_dq_,
+        stride_dkb,
+        stride_dkk,
+        stride_dkd,
+        stride_dvb,
+        stride_dvk,
+        stride_dvd,
+        N_QUERIES,
+        N_KEYS,
+        scale,
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
@@ -426,15 +463,35 @@ if TRITON_AVAILABLE:
 
     @triton.jit
     def flash_bwd_dq_kernel(
-        Q_ptr, K_ptr, V_ptr, dO_ptr, L_ptr, Delta_ptr, dQ_ptr,
-        stride_qb, stride_qq, stride_qd,
-        stride_kb, stride_kk, stride_kd,
-        stride_vb, stride_vk, stride_vd,
-        stride_dob, stride_doq, stride_dod,
-        stride_lb, stride_lq,
-        stride_db, stride_dq_,
-        stride_dqb, stride_dqq, stride_dqd,
-        N_QUERIES, N_KEYS, scale,
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        dO_ptr,
+        L_ptr,
+        Delta_ptr,
+        dQ_ptr,
+        stride_qb,
+        stride_qq,
+        stride_qd,
+        stride_kb,
+        stride_kk,
+        stride_kd,
+        stride_vb,
+        stride_vk,
+        stride_vd,
+        stride_dob,
+        stride_doq,
+        stride_dod,
+        stride_lb,
+        stride_lq,
+        stride_db,
+        stride_dq_,
+        stride_dqb,
+        stride_dqq,
+        stride_dqd,
+        N_QUERIES,
+        N_KEYS,
+        scale,
         D: tl.constexpr,
         Q_TILE_SIZE: tl.constexpr,
         K_TILE_SIZE: tl.constexpr,
@@ -546,7 +603,9 @@ if TRITON_AVAILABLE:
         if not (Q.shape[-1] == K.shape[-1] == V.shape[-1]):
             raise ValueError("Q, K, V must share the same head dimension")
 
-    def _resolve_tile_sizes(n_queries: int, n_keys: int, d: int, q_tile: int | None, k_tile: int | None) -> tuple[int, int]:
+    def _resolve_tile_sizes(
+        n_queries: int, n_keys: int, d: int, q_tile: int | None, k_tile: int | None
+    ) -> tuple[int, int]:
         """Pick tile sizes that divide sequence lengths and are >= 16."""
         default_q, default_k = _tile_sizes_for(d)
         q_tile = q_tile or default_q
@@ -575,21 +634,41 @@ if TRITON_AVAILABLE:
             v = _flatten_batch(V).contiguous()
             batch = q.shape[0]
 
-            q_tile, k_tile = _resolve_tile_sizes(n_queries, n_keys, d, FlashAttention2Triton.Q_TILE_SIZE, FlashAttention2Triton.K_TILE_SIZE)
+            q_tile, k_tile = _resolve_tile_sizes(
+                n_queries, n_keys, d, FlashAttention2Triton.Q_TILE_SIZE, FlashAttention2Triton.K_TILE_SIZE
+            )
 
             out = torch.empty_like(q)
             lse = torch.empty((batch, n_queries), device=q.device, dtype=torch.float32)
 
             grid = (triton.cdiv(n_queries, q_tile), batch)
             flash_fwd_kernel[grid](
-                q, k, v, out, lse,
-                q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                out.stride(0), out.stride(1), out.stride(2),
-                lse.stride(0), lse.stride(1),
-                N_QUERIES=n_queries, N_KEYS=n_keys, scale=1.0 / math.sqrt(d),
-                D=d, Q_TILE_SIZE=q_tile, K_TILE_SIZE=k_tile, is_causal=is_causal,
+                q,
+                k,
+                v,
+                out,
+                lse,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                out.stride(0),
+                out.stride(1),
+                out.stride(2),
+                lse.stride(0),
+                lse.stride(1),
+                N_QUERIES=n_queries,
+                N_KEYS=n_keys,
+                scale=1.0 / math.sqrt(d),
+                D=d,
+                Q_TILE_SIZE=q_tile,
+                K_TILE_SIZE=k_tile,
+                is_causal=is_causal,
             )
 
             out = out.reshape(*batch_shape, n_queries, d)
@@ -615,7 +694,9 @@ if TRITON_AVAILABLE:
             lse_flat = lse.reshape(-1, n_queries).contiguous()
             batch = q.shape[0]
 
-            q_tile, k_tile = _resolve_tile_sizes(n_queries, n_keys, d, FlashAttention2Triton.Q_TILE_SIZE, FlashAttention2Triton.K_TILE_SIZE)
+            q_tile, k_tile = _resolve_tile_sizes(
+                n_queries, n_keys, d, FlashAttention2Triton.Q_TILE_SIZE, FlashAttention2Triton.K_TILE_SIZE
+            )
             if n_queries % q_tile != 0:
                 raise ValueError(f"Q_TILE_SIZE={q_tile} must divide n_queries={n_queries}")
 
@@ -628,31 +709,80 @@ if TRITON_AVAILABLE:
 
             # Pass 1: dK and dV
             flash_bwd_dkdv_kernel[(triton.cdiv(n_keys, k_tile), batch)](
-                q, k, v, do, lse_flat, delta, dk, dv,
-                q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                do.stride(0), do.stride(1), do.stride(2),
-                lse_flat.stride(0), lse_flat.stride(1),
-                delta.stride(0), delta.stride(1),
-                dk.stride(0), dk.stride(1), dk.stride(2),
-                dv.stride(0), dv.stride(1), dv.stride(2),
-                N_QUERIES=n_queries, N_KEYS=n_keys, scale=scale,
-                D=d, Q_TILE_SIZE=q_tile, K_TILE_SIZE=k_tile, is_causal=ctx.is_causal,
+                q,
+                k,
+                v,
+                do,
+                lse_flat,
+                delta,
+                dk,
+                dv,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                do.stride(0),
+                do.stride(1),
+                do.stride(2),
+                lse_flat.stride(0),
+                lse_flat.stride(1),
+                delta.stride(0),
+                delta.stride(1),
+                dk.stride(0),
+                dk.stride(1),
+                dk.stride(2),
+                dv.stride(0),
+                dv.stride(1),
+                dv.stride(2),
+                N_QUERIES=n_queries,
+                N_KEYS=n_keys,
+                scale=scale,
+                D=d,
+                Q_TILE_SIZE=q_tile,
+                K_TILE_SIZE=k_tile,
+                is_causal=ctx.is_causal,
             )
 
             # Pass 2: dQ
             flash_bwd_dq_kernel[(triton.cdiv(n_queries, q_tile), batch)](
-                q, k, v, do, lse_flat, delta, dq,
-                q.stride(0), q.stride(1), q.stride(2),
-                k.stride(0), k.stride(1), k.stride(2),
-                v.stride(0), v.stride(1), v.stride(2),
-                do.stride(0), do.stride(1), do.stride(2),
-                lse_flat.stride(0), lse_flat.stride(1),
-                delta.stride(0), delta.stride(1),
-                dq.stride(0), dq.stride(1), dq.stride(2),
-                N_QUERIES=n_queries, N_KEYS=n_keys, scale=scale,
-                D=d, Q_TILE_SIZE=q_tile, K_TILE_SIZE=k_tile, is_causal=ctx.is_causal,
+                q,
+                k,
+                v,
+                do,
+                lse_flat,
+                delta,
+                dq,
+                q.stride(0),
+                q.stride(1),
+                q.stride(2),
+                k.stride(0),
+                k.stride(1),
+                k.stride(2),
+                v.stride(0),
+                v.stride(1),
+                v.stride(2),
+                do.stride(0),
+                do.stride(1),
+                do.stride(2),
+                lse_flat.stride(0),
+                lse_flat.stride(1),
+                delta.stride(0),
+                delta.stride(1),
+                dq.stride(0),
+                dq.stride(1),
+                dq.stride(2),
+                N_QUERIES=n_queries,
+                N_KEYS=n_keys,
+                scale=scale,
+                D=d,
+                Q_TILE_SIZE=q_tile,
+                K_TILE_SIZE=k_tile,
+                is_causal=ctx.is_causal,
             )
 
             return (

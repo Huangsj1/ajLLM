@@ -1,0 +1,40 @@
+# MoE comparison run. Data and optimizer settings intentionally match Dense.
+model_config: configs/model_moe.yaml
+data_path: data/pretrain_t2t_mini.jsonl
+validation_data_path: null
+tokenizer:
+  path: assets/tokenizers/minimind
+
+epochs: 1  # One epoch visits every JSONL record once.
+max_steps: 10000  # Set, for example, 100 for a short smoke run; null completes every epoch.
+batch_size: 16  # This GPU's MoE memory limit is close to 12 GiB.
+gradient_accumulation_steps: 1  # Do not raise on the current GPU.
+eval_batch_size: 16
+
+num_workers: 0
+
+max_seq_len: 512
+
+learning_rate: 5.0e-4
+min_lr: 5.0e-5
+warmup_steps: 2000
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+mixed_precision: bf16
+
+log_interval: 100
+eval_interval: 1000
+eval_batches: null
+save_interval: 50000
+output_dir: output/pretrain/moe
+resume_from: null
+
+device: auto
+seed: 42
+use_fsdp: false
+fsdp_config:
+  sharding_strategy: FULL_SHARD
+  cpu_offload: false
+  use_activation_checkpointing: true

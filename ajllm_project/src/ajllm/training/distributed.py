@@ -8,14 +8,37 @@ trades compute for memory by recomputing activations during backward pass.
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-
 # ========== Helper Functions ==========
+
+
+def initialize_distributed() -> tuple[torch.device, int, int]:
+    """Initialize a torchrun process group, or return the local device."""
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world_size == 1:
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu"), 0, 1
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    if backend == "nccl":
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+    else:
+        device = torch.device("cpu")
+    dist.init_process_group(backend=backend)
+    return device, dist.get_rank(), dist.get_world_size()
+
+
+def destroy_distributed() -> None:
+    """Release the process group created by :func:`initialize_distributed`."""
+    if _dist_is_ready():
+        dist.destroy_process_group()
+
 
 def _dist_is_ready() -> bool:
     """Check if distributed process group is initialized."""
@@ -49,6 +72,7 @@ def _all_reduce_average_(tensor: torch.Tensor) -> None:
 
 # ========== Shard Management ==========
 
+
 @dataclass
 class _ShardInfo:
     """Metadata for a sharded parameter.
@@ -56,18 +80,20 @@ class _ShardInfo:
     The full parameter is replaced by a flat 1-D shard containing only
     this rank's slice. We need shape info to reconstruct the full tensor.
     """
-    full_name: str          # Original parameter name
-    attr_name: str          # Attribute name on module (e.g., "weight")
-    module: nn.Module       # Owner module
+
+    full_name: str  # Original parameter name
+    attr_name: str  # Attribute name on module (e.g., "weight")
+    module: nn.Module  # Owner module
     shard_param: nn.Parameter  # Flat 1-D shard (this rank's slice)
-    shape: torch.Size       # Original full shape
-    numel: int              # Full element count (before padding)
-    shard_numel: int        # Elements per rank (after padding for even split)
+    shape: torch.Size  # Original full shape
+    numel: int  # Full element count (before padding)
+    shard_numel: int  # Elements per rank (after padding for even split)
 
 
 @dataclass
 class _AsyncAllGather:
     """One in-flight all-gather operation."""
+
     input_shard: torch.Tensor
     full_flat: torch.Tensor
     work: dist.Work | None
@@ -126,6 +152,7 @@ def _reduce_scatter_average(full_grad: torch.Tensor, shard_numel: int) -> torch.
 
 # ========== Autograd Functions ==========
 
+
 class _AllGatherWeight(torch.autograd.Function):
     """All-gather forward, reduce-scatter backward (synchronous fallback)."""
 
@@ -161,10 +188,11 @@ class _PrefetchedAllGatherWeight(torch.autograd.Function):
 
 # ========== Main FSDP Module ==========
 
+
 class FullyShardedDataParallel(nn.Module):
     """FSDP with Activation Checkpointing enabled by default.
 
-    Shards Linear and Embedding layers across GPUs. Each rank stores only 1/world_size
+    Shards bias-free Linear layers across GPUs. Each rank stores only 1/world_size
     of each weight. Full weights are reconstructed via all-gather during forward,
     then dropped after the layer completes. Gradients are reduced via reduce-scatter
     during backward so each rank only keeps its shard's gradient.
@@ -212,8 +240,11 @@ class FullyShardedDataParallel(nn.Module):
     def _is_sharded_module(self, module: nn.Module) -> bool:
         """Check if module should be sharded (Linear or Embedding)."""
         # Import locally to avoid circular dependency
-        from ajllm.modeling.layers import Linear, Embedding
-        return isinstance(module, (Linear, Embedding))
+        from ajllm.modeling.layers import Linear
+
+        # Embeddings remain replicated: the tied LM head reads their weight
+        # directly after the embedding module has completed its forward pass.
+        return isinstance(module, Linear)
 
     def _shard_parameters(self) -> None:
         """Replace full parameters with rank-local shards."""
@@ -280,6 +311,7 @@ class FullyShardedDataParallel(nn.Module):
                         return of(mod_ref, *args, **kwargs)
                     finally:
                         mod_ref.weight = None
+
                 return _recompute
 
             recompute_fn = _make_recompute_fn(
@@ -289,6 +321,7 @@ class FullyShardedDataParallel(nn.Module):
             def _make_forward_method(rfn):
                 def _forward(self_unused, *args, **kwargs):
                     return checkpoint(rfn, *args, use_reentrant=False, **kwargs)
+
                 return _forward
 
             mod.forward = _make_forward_method(recompute_fn).__get__(mod, type(mod))
@@ -332,6 +365,7 @@ class FullyShardedDataParallel(nn.Module):
 
     def _register_gather_hooks(self) -> None:
         """Register pre/post hooks to gather and release weights."""
+
         def pre_hook(module: nn.Module, _inputs):
             index = self._module_to_shard_index[id(module)]
             module.weight = self._take_prefetched_weight(index)
@@ -365,8 +399,8 @@ class FullyShardedDataParallel(nn.Module):
             param.grad.data = param.grad.data.float()
             _all_reduce_average_(param.grad.data)
 
-    def gather_full_params(self) -> dict[str, torch.Tensor]:
-        """Gather full parameters from all shards (for checkpointing)."""
+    def full_state_dict(self) -> dict[str, torch.Tensor]:
+        """Materialize unwrapped parameter names from local shards for a checkpoint."""
         full_params: dict[str, torch.Tensor] = {}
         with torch.no_grad():
             for info in self._shards:
@@ -377,3 +411,18 @@ class FullyShardedDataParallel(nn.Module):
                     continue
                 full_params[name] = param.detach().clone()
         return full_params
+
+    @torch.no_grad()
+    def load_full_state_dict(self, state_dict: dict[str, torch.Tensor]) -> None:
+        """Slice an unwrapped checkpoint state back into local parameter shards."""
+        rank = _rank()
+        for info in self._shards:
+            full = state_dict[info.full_name].to(info.shard_param.device, dtype=info.shard_param.dtype).reshape(-1)
+            padded = torch.zeros(info.shard_numel * _world_size(), device=full.device, dtype=full.dtype)
+            padded[: info.numel].copy_(full)
+            info.shard_param.copy_(padded[rank * info.shard_numel : (rank + 1) * info.shard_numel])
+        for name, parameter in self.module.named_parameters():
+            if name.endswith("weight_shard"):
+                continue
+            if name in state_dict:
+                parameter.copy_(state_dict[name].to(parameter.device, dtype=parameter.dtype))

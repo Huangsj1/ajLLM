@@ -1,0 +1,31 @@
+# Default 62M dense decoder. This is the recommended first pre-training model.
+
+name: dense
+model_type: dense  # dense or moe
+
+# Model architecture
+d_model: 768
+num_layers: 8
+num_heads: 12
+num_kv_heads: 4  # GQA: 4 KV heads for 12 query heads (3:1)
+context_length: 512  # Training context length
+max_position_embeddings: 32768  # Maximum supported length
+
+# Feed-forward network
+d_ff: 2432  # ceil(768 * π / 64) * 64 ≈ 2432
+
+# Position encoding
+rope_theta: 1000000.0  # 1e6 for long context support
+
+# Normalization
+qk_norm: true  # Apply RMSNorm to Q and K in attention
+rms_norm_eps: 1.0e-6
+
+# Regularization
+dropout: 0.0  # No dropout by default
+
+# Embeddings
+tie_embeddings: true  # Share input/output embeddings
+
+# Acceleration
+use_flash_attention: true
