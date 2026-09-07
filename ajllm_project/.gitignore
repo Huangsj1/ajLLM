@@ -68,3 +68,6 @@ htmlcov/
 
 
 .ruff_cache/
+
+# Local MiniMind project checkout (do not ignore tokenizer assets below assets/)
+/minimind/
