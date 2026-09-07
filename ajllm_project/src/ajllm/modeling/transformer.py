@@ -31,11 +31,12 @@ class ModelConfig:
     dropout: float = 0.0
     qk_norm: bool = True
     tie_embeddings: bool = True
-    use_flash_attention: bool = True
     model_type: str = "dense"
     num_experts: int = 4
     num_experts_per_token: int = 1
     router_aux_loss_coef: float = 5e-4
+    use_flash_attention: bool = True
+    use_cuda_kernels: bool = True
 
     def __post_init__(self) -> None:
         if self.vocab_size <= 0 or self.context_length <= 0 or self.num_layers <= 0:
@@ -60,7 +61,7 @@ class TransformerBlock(nn.Module):
 
     def __init__(self, config: ModelConfig) -> None:
         super().__init__()
-        self.attn_norm = RMSNorm(config.d_model, config.rms_norm_eps)
+        self.attn_norm = RMSNorm(config.d_model, config.rms_norm_eps, use_cuda_kernels=config.use_cuda_kernels)
         self.attention = GroupedQueryAttention(
             d_model=config.d_model,
             num_heads=config.num_heads,
@@ -68,10 +69,11 @@ class TransformerBlock(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
             qk_norm=config.qk_norm,
-            use_flash_attention=config.use_flash_attention,
             dropout=config.dropout,
+            use_flash_attention=config.use_flash_attention,
+            use_cuda_kernels=config.use_cuda_kernels,
         )
-        self.ffn_norm = RMSNorm(config.d_model, config.rms_norm_eps)
+        self.ffn_norm = RMSNorm(config.d_model, config.rms_norm_eps, use_cuda_kernels=config.use_cuda_kernels)
         self.feed_forward: nn.Module
         if config.model_type == "moe":
             self.feed_forward = MoELayer(
@@ -80,9 +82,10 @@ class TransformerBlock(nn.Module):
                 config.num_experts,
                 config.num_experts_per_token,
                 config.router_aux_loss_coef,
+                use_cuda_kernels=config.use_cuda_kernels,
             )
         else:
-            self.feed_forward = SwiGLU(config.d_model, config.intermediate_size)
+            self.feed_forward = SwiGLU(config.d_model, config.intermediate_size, config.use_cuda_kernels)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, hidden_states: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
@@ -98,7 +101,7 @@ class TransformerLM(nn.Module):
         self.config = config
         self.token_embeddings = Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList(TransformerBlock(config) for _ in range(config.num_layers))
-        self.final_norm = RMSNorm(config.d_model, config.rms_norm_eps)
+        self.final_norm = RMSNorm(config.d_model, config.rms_norm_eps, use_cuda_kernels=config.use_cuda_kernels)
         self.lm_head = None if config.tie_embeddings else Linear(config.d_model, config.vocab_size)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:

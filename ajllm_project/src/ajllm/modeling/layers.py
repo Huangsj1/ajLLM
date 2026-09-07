@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ajllm.modeling.cuda_kernels import rms_norm
+
 
 class Linear(nn.Module):
     """Bias-free linear projection."""
@@ -55,13 +57,16 @@ class RMSNorm(nn.Module):
         epsilon: float = 1e-5,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
+        use_cuda_kernels: bool = True,
     ) -> None:
         super().__init__()
         self.epsilon = epsilon
+        self.use_cuda_kernels = use_cuda_kernels
         self.weight = nn.Parameter(torch.ones(d_model, device=device, dtype=dtype))
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        input_dtype = inputs.dtype
+        if self.use_cuda_kernels:
+            return rms_norm(inputs, self.weight, self.epsilon)
         float_inputs = inputs.float()
-        rms = torch.sqrt(torch.mean(float_inputs.square(), dim=-1, keepdim=True) + self.epsilon)
-        return ((float_inputs / rms) * self.weight.float()).to(input_dtype)
+        inverse_rms = torch.rsqrt(float_inputs.square().mean(dim=-1, keepdim=True) + self.epsilon)
+        return (float_inputs * inverse_rms * self.weight.float()).to(inputs.dtype)

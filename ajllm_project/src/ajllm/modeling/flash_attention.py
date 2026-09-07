@@ -1,7 +1,7 @@
-"""FlashAttention-2 implementation with PyTorch and optional Triton kernels.
+"""This project's tiled PyTorch and Triton FlashAttention-2 implementations.
 
 This module provides memory-efficient attention through tiling, avoiding the O(n²)
-attention matrix materialization. Falls back to standard attention on CPU.
+attention matrix materialization. The decoder calls the Triton implementation.
 """
 
 from __future__ import annotations
@@ -13,8 +13,6 @@ from einops import rearrange
 
 import triton
 import triton.language as tl
-
-TRITON_AVAILABLE = True
 
 MASK_BIAS = -1e6  # Large negative for masked positions
 
@@ -188,7 +186,7 @@ class FlashAttention2PyTorch(torch.autograd.Function):
 
 
 # Triton kernels (optional, CUDA only)
-if TRITON_AVAILABLE:
+if True:
 
     @triton.jit
     def flash_fwd_kernel(
@@ -596,8 +594,6 @@ if TRITON_AVAILABLE:
         tl.store(dQ_block_ptr, (dq_acc * scale).to(dQ_block_ptr.type.element_ty), boundary_check=(0, 1))
 
     def _check_triton_inputs(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> None:
-        if not TRITON_AVAILABLE:
-            raise RuntimeError("Triton is not available")
         if not (Q.is_cuda and K.is_cuda and V.is_cuda):
             raise ValueError("Triton FlashAttention requires CUDA tensors")
         if not (Q.shape[-1] == K.shape[-1] == V.shape[-1]):
@@ -606,7 +602,7 @@ if TRITON_AVAILABLE:
     def _resolve_tile_sizes(
         n_queries: int, n_keys: int, d: int, q_tile: int | None, k_tile: int | None
     ) -> tuple[int, int]:
-        """Pick tile sizes that divide sequence lengths and are >= 16."""
+        """Pick the pre-training tile sizes, which require sequences of at least 16."""
         default_q, default_k = _tile_sizes_for(d)
         q_tile = q_tile or default_q
         k_tile = k_tile or default_k
@@ -793,10 +789,6 @@ if TRITON_AVAILABLE:
             )
 
     flash_attention_triton = FlashAttention2Triton.apply
-else:
-    flash_attention_triton = None
-
-
 # Main entry point
 flash_attention_pytorch = FlashAttention2PyTorch.apply
 
@@ -806,20 +798,15 @@ def flash_attention(
     K: torch.Tensor,
     V: torch.Tensor,
     is_causal: bool = False,
-    use_triton: bool = False,
 ) -> torch.Tensor:
-    """FlashAttention-2 entry point with automatic backend selection.
+    """FlashAttention-2 Triton entry point.
 
     Args:
         Q: Query tensor (..., n_queries, d)
         K: Key tensor (..., n_keys, d)
         V: Value tensor (..., n_keys, d)
         is_causal: Whether to apply causal masking
-        use_triton: Use Triton kernels if available (CUDA only)
-
     Returns:
         Output tensor (..., n_queries, d)
     """
-    if use_triton and TRITON_AVAILABLE and Q.is_cuda:
-        return flash_attention_triton(Q, K, V, is_causal)
-    return flash_attention_pytorch(Q, K, V, is_causal)
+    return flash_attention_triton(Q, K, V, is_causal)

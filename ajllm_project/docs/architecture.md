@@ -89,13 +89,47 @@ Dense FFNs use the canonical `activations.py` implementation:
 FFN(x) = down_proj(SiLU(gate_proj(x)) * up_proj(x))
 ```
 
-MoE reuses this exact SwiGLU implementation. A bias-free router selects Top-K experts, batches selected tokens per expert, then `index_add_` restores weighted results. Training adds load balance loss:
+The default four-expert Top-1 MoE stores each projection as one grouped weight:
+
+```text
+gate_up weight: [experts, 2 * d_ff, d_model]
+down weight:    [experts, d_model, d_ff]
+```
+
+For every Top-1 forward it sorts token IDs by `argmax(router_logits)`, dispatches
+them into one compressed `[total_tokens, d_model]` matrix, and records expert
+boundaries in `offsets[experts + 1]`. It never allocates a maximum-capacity
+expert dimension. Two custom Variable-M grouped GEMMs run the whole expert MLP:
+
+```text
+compact [T, D] × gate_up [E, 2I, D] -> [T, 2I]
+split view -> SwiGLU(gate [T, I], up [T, I]) -> [T, I]
+compact [T, I] × down [E, D, I] -> [T, D]
+```
+
+Each GEMM tile reads its expert ID and first compact row from a schedule built
+from `offsets`, then selects that expert's weight. With `BLOCK_M=64`, only the
+last tile of each expert masks at most 63 nonexistent rows; those rows are never
+stored. An empty expert emits no M tile. Balanced, skewed, and collapsed routing
+therefore use the same CUDA path without an imbalance fallback.
+
+Triton gather/scatter kernels restore original token order after expert
+calculation. Top-1's normalized selected probability is always one, so it does
+not multiply expert output by a routing weight. During training only,
+`torch.softmax(router_logits)` remains for the load-balancing gradient; it is
+not used for expert output. Training adds load balance loss:
 
 ```text
 num_experts × coefficient × sum(mean_router_probability × expert_load)
 ```
 
-Dispatch loops over experts rather than individual tokens. It is readable, not a fused MoE kernel; more experts can lower throughput.
+The Triton autograd function implements `dInput` with Variable-M tiles and
+`dWeight` by reducing only the owning expert's true token interval.
+`VariableGroupedLinear` subclasses the project's `Linear`, so custom FSDP uses
+its existing all-gather and gradient reduce-scatter hooks. Disabling CUDA
+kernels, running on CPU, or a Triton launch failure uses explicit unpadded Torch
+equations. Top-K greater than one retains the weighted `index_add_` reference
+until expert-parallel routing is added.
 
 ## Parameter accounting
 
@@ -119,10 +153,14 @@ expert weights reside in memory.
 | Location | Responsibility |
 | --- | --- |
 | `modeling/layers.py` | bias-free Linear/Embedding and RMSNorm |
+| `modeling/cuda_kernels.py` | Triton normalization/activation/loss/training kernels and Top-1 MoE token movement |
 | `modeling/attention.py` | RoPE, GQA and SDPA |
-| `modeling/activations.py` | canonical SwiGLU |
-| `modeling/moe.py` | router and expert dispatch |
+| `modeling/activations.py` | canonical SwiGLU and Variable-M expert projections |
+| `modeling/moe.py` | Top-1 compressed dispatch/offsets and Top-K reference path |
 | `modeling/transformer.py` | config, block and causal LM |
 | `modeling/factory.py` | YAML-to-model construction |
+
+See [CUDA kernel guide](cuda_kernels.md) for dispatch controls, per-kernel block
+and lane mapping, numerical checks, and the optimization roadmap.
 
 Generation/KV cache should be a future inference module. RoPE scaling needs an explicit config and training evidence. Fused kernels, expert parallelism and tensor/pipeline parallelism should be optional layers over this baseline.

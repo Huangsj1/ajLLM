@@ -17,7 +17,7 @@ uv run python -m ajllm.workflows.pretrain --config configs/pretrain_dense.yaml
 uv run python -m ajllm.workflows.pretrain --config configs/pretrain_moe.yaml
 ```
 
-Use `device: auto` for CUDA when available or `device: cpu` for a small smoke run. `batch_size` is per process. Effective batch size is `batch_size × gradient_accumulation_steps × world_size`.
+Use `device: cuda`; this pre-training path targets the project's CUDA + Triton environment. `batch_size` is per process. Effective batch size is `batch_size × gradient_accumulation_steps × world_size`.
 Training is epoch-based: every epoch traverses the current rank's complete
 dataloader once. The cosine schedule derives its total update count as
 `epochs × ceil(batches_per_epoch / gradient_accumulation_steps)`. An optional
@@ -27,8 +27,14 @@ AdamW uses defaults `betas=(0.9, 0.95)` and `weight_decay=0.1`. The project uses
 its own AdamW update equations, stable log-sum-exp cross entropy, SiLU, and
 global-gradient clipping rather than PyTorch's ready-made optimizer/loss/activation
 helpers. The learning rate warms up linearly then cosine-decays to `min_lr`.
-`bf16` uses CUDA autocast, and `fp16` additionally uses GradScaler. CUDA autocast
-is disabled on CPU.
+`bf16` uses CUDA autocast, and `fp16` additionally uses GradScaler.
+
+Model YAML controls the implementation explicitly: `use_flash_attention: true`
+selects the project's Triton FlashAttention, and `use_cuda_kernels: true`
+selects Triton RMSNorm, RoPE, SwiGLU, Cross Entropy, MoE, AdamW, and gradient
+norm kernels. Set either switch to `false` to use the corresponding explicit
+Torch equations. Backend details and CUDA-vs-Torch correctness tests are in
+[CUDA kernel guide](cuda_kernels.md).
 
 Rank 0 writes `metrics.jsonl`, `resolved_config.yaml`, and `summary.json` into `output_dir`.
 A new run truncates that directory's old `metrics.jsonl` before its first metric;
@@ -182,7 +188,7 @@ Normal training writes `step_00005000.pt.optim`. All ranks cooperatively all-gat
 
 ## Recommended progression
 
-1. Run the CPU tests, which include a one-step workflow smoke test.
+1. Run the CUDA tests, which include a one-step workflow smoke test.
 2. Run a brief dense job on a subset of the new corpus and inspect metrics/checkpoints.
 3. Scale sequence and batch size; use accumulation to preserve effective batch size.
 4. Enable FSDP after the one-GPU loss curve is healthy, starting with two GPUs.

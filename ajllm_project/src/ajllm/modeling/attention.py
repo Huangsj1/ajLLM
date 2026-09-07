@@ -2,19 +2,17 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import torch
-import torch.nn.functional as F
 from torch import nn
 
+from ajllm.modeling.cuda_kernels import rope
 from ajllm.modeling.layers import Linear, RMSNorm
 
 
 class RotaryPositionalEmbedding(nn.Module):
     """RoPE cache, indexed by the requested absolute positions."""
 
-    def __init__(self, theta: float, head_dimension: int, max_sequence_length: int) -> None:
+    def __init__(self, theta: float, head_dimension: int, max_sequence_length: int, use_cuda_kernels: bool) -> None:
         super().__init__()
         if head_dimension % 2 != 0:
             raise ValueError("RoPE requires an even attention head dimension")
@@ -24,15 +22,14 @@ class RotaryPositionalEmbedding(nn.Module):
         angles = positions * frequencies
         self.register_buffer("cosine", torch.cos(angles), persistent=False)
         self.register_buffer("sine", torch.sin(angles), persistent=False)
+        self.use_cuda_kernels = use_cuda_kernels
 
     def forward(self, inputs: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
-        cosine = self.cosine[positions]
-        sine = self.sine[positions]
-        cosine, sine = cosine.to(inputs.dtype), sine.to(inputs.dtype)
-        even = inputs[..., ::2]
-        odd = inputs[..., 1::2]
-        rotated = torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1)
-        return rotated.flatten(-2)
+        if self.use_cuda_kernels:
+            return rope(inputs, self.cosine, self.sine, positions)
+        cosine, sine = self.cosine[positions].to(inputs.dtype), self.sine[positions].to(inputs.dtype)
+        even, odd = inputs[..., ::2], inputs[..., 1::2]
+        return torch.stack((even * cosine - odd * sine, even * sine + odd * cosine), dim=-1).flatten(-2)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -58,8 +55,9 @@ class GroupedQueryAttention(nn.Module):
         max_position_embeddings: int,
         rope_theta: float = 10_000.0,
         qk_norm: bool = True,
-        use_flash_attention: bool = True,
         dropout: float = 0.0,
+        use_flash_attention: bool = True,
+        use_cuda_kernels: bool = True,
     ) -> None:
         super().__init__()
         if d_model % num_heads != 0:
@@ -72,9 +70,8 @@ class GroupedQueryAttention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = d_model // num_heads
         self.num_kv_groups = num_heads // num_kv_heads
-        self.use_flash_attention = use_flash_attention
-        self._custom_flash_failed = False
         self.dropout = dropout
+        self.use_flash_attention = use_flash_attention
 
         # Q/K/V projections
         self.q_proj = Linear(d_model, num_heads * self.head_dim)
@@ -85,11 +82,13 @@ class GroupedQueryAttention(nn.Module):
         # Q/K RMSNorm (applied per head)
         self.qk_norm = qk_norm
         if qk_norm:
-            self.q_norm = RMSNorm(self.head_dim)
-            self.k_norm = RMSNorm(self.head_dim)
+            self.q_norm = RMSNorm(self.head_dim, use_cuda_kernels=use_cuda_kernels)
+            self.k_norm = RMSNorm(self.head_dim, use_cuda_kernels=use_cuda_kernels)
 
         # RoPE
-        self.rope = RotaryPositionalEmbedding(rope_theta, self.head_dim, max_position_embeddings)
+        self.rope = RotaryPositionalEmbedding(
+            rope_theta, self.head_dim, max_position_embeddings, use_cuda_kernels
+        )
 
     def forward(self, inputs: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Forward pass with GQA."""
@@ -112,37 +111,24 @@ class GroupedQueryAttention(nn.Module):
         keys = repeat_kv(keys, self.num_kv_groups)
         values = repeat_kv(values, self.num_kv_groups)
 
-        if self.use_flash_attention and not self._custom_flash_failed:
-            try:
-                # Prefer this project's Torch/Triton FlashAttention code.
-                # Triton's block-pointer path requires a power-of-two head
-                # width. The default 64-wide configuration uses it on CUDA.
-                from ajllm.modeling.flash_attention import flash_attention
+        from ajllm.modeling.flash_attention import flash_attention, flash_attention_pytorch
 
-                use_triton = inputs.is_cuda and self.head_dim > 0 and (self.head_dim & (self.head_dim - 1)) == 0
-                attended = flash_attention(queries, keys, values, is_causal=True, use_triton=use_triton)
-            except Exception:
-                # A custom backend must never make basic pre-training fail.
-                # Do not retry a known-broken kernel on every subsequent step.
-                self._custom_flash_failed = True
-                attended = self._sdpa_fallback(queries, keys, values)
+        sequence = queries.shape[-2]
+        # The tiled FlashAttention kernel uses Tensor Core-compatible sequence
+        # tiles. Generation may start from a prompt shorter than one tile, so
+        # append causal-invisible zero rows and discard them after attention.
+        padded_sequence = max(16, 1 << (sequence - 1).bit_length())
+        if self.use_flash_attention and padded_sequence != sequence:
+            padding_shape = (*queries.shape[:-2], padded_sequence - sequence, queries.shape[-1])
+            zero_queries = queries.new_zeros(padding_shape)
+            zero_keys = keys.new_zeros(padding_shape)
+            zero_values = values.new_zeros(padding_shape)
+            queries = torch.cat((queries, zero_queries), dim=-2)
+            keys = torch.cat((keys, zero_keys), dim=-2)
+            values = torch.cat((values, zero_values), dim=-2)
+        if self.use_flash_attention:
+            attended = flash_attention(queries, keys, values, True)[..., :sequence, :]
         else:
-            attended = self._sdpa_fallback(queries, keys, values)
+            attended = flash_attention_pytorch(queries, keys, values, True)
         output = attended.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         return self.output_proj(output)
-
-    def _sdpa_fallback(self, queries: torch.Tensor, keys: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
-        """Use SDPA only when custom FlashAttention is disabled or fails."""
-        context = nullcontext()
-        if queries.is_cuda:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
-
-            context = sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH])
-        with context:
-            return F.scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
-            )

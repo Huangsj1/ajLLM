@@ -25,6 +25,9 @@ wheels/
 venv/
 ENV/
 
+# Tokenizer
+assets/tokenizer/
+
 # Training outputs
 output/
 runs/

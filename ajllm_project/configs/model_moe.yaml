@@ -34,3 +34,4 @@ tie_embeddings: true
 
 # Acceleration
 use_flash_attention: true
+use_cuda_kernels: true  # Triton RMSNorm, RoPE, SwiGLU, fused Cross Entropy, and MoE kernels.

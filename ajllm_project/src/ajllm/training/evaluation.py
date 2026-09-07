@@ -39,8 +39,8 @@ def evaluate_causal_lm(
         labels = batch["labels"].to(device)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled):
             logits = model(input_ids)
-            lm_loss = cross_entropy(logits, labels)
             base_model = model.module if isinstance(model, FullyShardedDataParallel) else model
+            lm_loss = cross_entropy(logits, labels, base_model.config.use_cuda_kernels)
             auxiliary_loss = base_model.auxiliary_loss()
         token_count = (labels != -100).sum()
         totals[0] += lm_loss.detach().double() * token_count

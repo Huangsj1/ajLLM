@@ -1,4 +1,4 @@
-"""CPU tests for the canonical model and one complete optimizer step."""
+"""CUDA tests for the canonical model and one complete optimizer step."""
 
 from __future__ import annotations
 
@@ -6,9 +6,10 @@ from pathlib import Path
 
 import torch
 import yaml
+import pytest
 
 from ajllm.modeling import ModelConfig, TransformerLM, load_model_config
-from ajllm.modeling.flash_attention import flash_attention
+from ajllm.modeling.flash_attention import flash_attention_pytorch
 from ajllm.tokenization import MiniMindTokenizer
 from ajllm.training.checkpoint import load_checkpoint, save_checkpoint
 from ajllm.training.distributed import FullyShardedDataParallel
@@ -22,6 +23,7 @@ from ajllm.workflows.generate import generate
 from ajllm.workflows.pretrain import run
 
 TOKENIZER_PATH = Path(__file__).resolve().parents[1] / "assets" / "tokenizers" / "minimind"
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="the decoder requires CUDA + Triton")
 
 
 def _config(model_type: str = "dense") -> ModelConfig:
@@ -29,28 +31,28 @@ def _config(model_type: str = "dense") -> ModelConfig:
         vocab_size=64,
         context_length=16,
         max_position_embeddings=64,
-        d_model=32,
+        d_model=64,
         num_layers=2,
         num_heads=4,
         num_kv_heads=2,
-        d_ff=64,
+        d_ff=128,
         model_type=model_type,
         num_experts=2,
     )
 
 
 def test_dense_forward_and_tied_weights() -> None:
-    model = TransformerLM(_config())
-    logits = model(torch.randint(0, 64, (3, 12)))
-    assert logits.shape == (3, 12, 64)
+    model = TransformerLM(_config()).cuda()
+    logits = model(torch.randint(0, 64, (3, 16), device="cuda"))
+    assert logits.shape == (3, 16, 64)
     assert model.parameter_count() == sum(parameter.numel() for parameter in model.parameters())
 
 
 def test_custom_torch_flash_attention_supports_non_power_of_two_head_width() -> None:
-    queries = torch.randn(1, 2, 4, 96, requires_grad=True)
-    keys = torch.randn(1, 2, 4, 96, requires_grad=True)
-    values = torch.randn(1, 2, 4, 96, requires_grad=True)
-    output = flash_attention(queries, keys, values, is_causal=True, use_triton=False)
+    queries = torch.randn(1, 2, 4, 96, device="cuda", requires_grad=True)
+    keys = torch.randn(1, 2, 4, 96, device="cuda", requires_grad=True)
+    values = torch.randn(1, 2, 4, 96, device="cuda", requires_grad=True)
+    output = flash_attention_pytorch(queries, keys, values, True)
     output.sum().backward()
     assert output.shape == queries.shape
     assert queries.grad is not None
@@ -99,19 +101,59 @@ def test_minimind_tokenizer_has_the_expected_pretraining_contract() -> None:
 
 
 def test_moe_routes_and_produces_auxiliary_loss() -> None:
-    model = TransformerLM(_config("moe")).train()
-    logits = model(torch.randint(0, 64, (2, 10)))
+    model = TransformerLM(_config("moe")).cuda().train()
+    logits = model(torch.randint(0, 64, (2, 16), device="cuda"))
     auxiliary_loss = model.auxiliary_loss()
-    assert logits.shape == (2, 10, 64)
+    assert logits.shape == (2, 16, 64)
     assert auxiliary_loss.ndim == 0
     assert torch.isfinite(auxiliary_loss)
 
 
+def test_grouped_moe_top1_matches_per_expert_swiglu_equations() -> None:
+    """Variable-M experts must preserve each independent SwiGLU equation."""
+    torch.manual_seed(1)
+    model = TransformerLM(_config("moe")).cuda().train()
+    experts = model.layers[0].feed_forward.grouped_experts
+    assert experts is not None
+    inputs = torch.randn(7, 64, device="cuda", requires_grad=True)
+    offsets = torch.tensor([0, 2, 7], device="cuda")
+    from ajllm.modeling.cuda_kernels import build_variable_m_schedule
+
+    tile_experts, tile_rows = build_variable_m_schedule(offsets)
+    outputs = experts(inputs, offsets, tile_experts, tile_rows)
+    reference_inputs = inputs.detach().clone().requires_grad_()
+    reference_rows = []
+    for expert_index in range(2):
+        start, end = offsets[expert_index], offsets[expert_index + 1]
+        gate_up = reference_inputs[start:end] @ experts.gate_up_proj.weight[expert_index].transpose(0, 1)
+        gate, up = gate_up.chunk(2, dim=-1)
+        hidden = gate * torch.sigmoid(gate) * up
+        reference_rows.append(hidden @ experts.down_proj.weight[expert_index].transpose(0, 1))
+    reference = torch.cat(reference_rows)
+    gradient = torch.randn_like(outputs)
+    outputs.backward(gradient)
+    input_gradient = inputs.grad.clone()
+    reference.backward(gradient)
+    torch.testing.assert_close(outputs, reference, rtol=5e-3, atol=4e-5)
+    torch.testing.assert_close(input_gradient, reference_inputs.grad, rtol=5e-3, atol=2e-5)
+
+
+def test_fsdp_wrapper_keeps_grouped_moe_experts_usable() -> None:
+    """VariableGroupedLinear retains the custom FSDP gather/reduce-scatter contract."""
+    model = FullyShardedDataParallel(TransformerLM(_config("moe")).cuda(), activation_checkpointing=True)
+    logits = model(torch.randint(0, 64, (2, 16), device="cuda"))
+    loss = cross_entropy(logits, torch.randint(0, 64, (2, 16), device="cuda")) + model.module.auxiliary_loss()
+    loss.backward()
+    model.finish_gradient_synchronization()
+    assert model.module.layers[0].feed_forward.grouped_experts.gate_up_proj.weight_shard.grad is not None
+
+
 def test_single_training_step_updates_parameters() -> None:
     torch.manual_seed(0)
-    model = TransformerLM(_config()).train()
+    model = TransformerLM(_config()).cuda().train()
     optimizer = AdamW(model.parameters(), learning_rate=1e-3)
-    input_ids, labels = torch.randint(0, 64, (2, 12)), torch.randint(0, 64, (2, 12))
+    input_ids = torch.randint(0, 64, (2, 16), device="cuda")
+    labels = torch.randint(0, 64, (2, 16), device="cuda")
     before = model.token_embeddings.weight.detach().clone()
     loss = cross_entropy(model(input_ids), labels)
     loss.backward()
@@ -121,34 +163,34 @@ def test_single_training_step_updates_parameters() -> None:
 
 
 def test_fsdp_wrapper_keeps_tied_embedding_usable() -> None:
-    model = FullyShardedDataParallel(TransformerLM(_config()), activation_checkpointing=True)
-    logits = model(torch.randint(0, 64, (2, 8)))
-    loss = cross_entropy(logits, torch.randint(0, 64, (2, 8)))
+    model = FullyShardedDataParallel(TransformerLM(_config()).cuda(), activation_checkpointing=True)
+    logits = model(torch.randint(0, 64, (2, 16), device="cuda"))
+    loss = cross_entropy(logits, torch.randint(0, 64, (2, 16), device="cuda"))
     loss.backward()
     model.finish_gradient_synchronization()
     full_state = model.full_state_dict()
-    assert logits.shape == (2, 8, 64)
+    assert logits.shape == (2, 16, 64)
     assert "token_embeddings.weight" in full_state
     assert "layers.0.attention.q_proj.weight" in full_state
 
 
 def test_fsdp_checkpoint_round_trip(tmp_path) -> None:
-    model = FullyShardedDataParallel(TransformerLM(_config()), activation_checkpointing=False)
+    model = FullyShardedDataParallel(TransformerLM(_config()).cuda(), activation_checkpointing=False)
     optimizer = AdamW(model.parameters(), learning_rate=1e-3)
-    input_ids = torch.randint(0, 64, (2, 8))
-    loss = cross_entropy(model(input_ids), torch.randint(0, 64, (2, 8)))
+    input_ids = torch.randint(0, 64, (2, 16), device="cuda")
+    loss = cross_entropy(model(input_ids), torch.randint(0, 64, (2, 16), device="cuda"))
     loss.backward()
     model.finish_gradient_synchronization()
     optimizer.step()
     path = save_checkpoint(tmp_path / "checkpoint.pt", model, optimizer, 3, {"test": True})
     expected_logits = model(input_ids).detach()
-    restored = FullyShardedDataParallel(TransformerLM(_config()), activation_checkpointing=False)
+    restored = FullyShardedDataParallel(TransformerLM(_config()).cuda(), activation_checkpointing=False)
     restored_optimizer = AdamW(restored.parameters(), learning_rate=1e-3)
     assert load_checkpoint(path, restored, restored_optimizer)["step"] == 3
     assert torch.allclose(expected_logits, restored(input_ids))
 
 
-def test_cpu_pretraining_workflow_smoke_test(tmp_path) -> None:
+def test_cuda_pretraining_workflow_smoke_test(tmp_path) -> None:
     data_path = tmp_path / "data.jsonl"
     data_path.write_text('{"text": "hello world"}\n', encoding="utf-8")
     model_path = tmp_path / "model.yaml"
@@ -156,13 +198,13 @@ def test_cpu_pretraining_workflow_smoke_test(tmp_path) -> None:
         yaml.safe_dump(
             {
                 "model_type": "dense",
-                "context_length": 8,
+                "context_length": 16,
                 "max_position_embeddings": 32,
-                "d_model": 32,
+                "d_model": 64,
                 "num_layers": 1,
                 "num_heads": 4,
                 "num_kv_heads": 2,
-                "d_ff": 64,
+                "d_ff": 128,
             }
         ),
         encoding="utf-8",
@@ -176,14 +218,14 @@ def test_cpu_pretraining_workflow_smoke_test(tmp_path) -> None:
                 "data_path": str(data_path),
                 "validation_data_path": str(data_path),
                 "tokenizer": {"path": str(TOKENIZER_PATH)},
-                "max_seq_len": 8,
+                "max_seq_len": 16,
                 "batch_size": 1,
                 "epochs": 3,
                 "max_steps": 2,
                 "learning_rate": 1e-3,
                 "min_lr": 1e-4,
                 "output_dir": str(output_dir),
-                "device": "cpu",
+                "device": "cuda",
                 "mixed_precision": None,
                 "log_interval": 1,
                 "eval_interval": 1,
@@ -198,12 +240,12 @@ def test_cpu_pretraining_workflow_smoke_test(tmp_path) -> None:
     checkpoint_path = output_dir / "step_00000002.pt"
     assert checkpoint_path.is_file()
     assert '"event": "evaluation"' in (output_dir / "metrics.jsonl").read_text(encoding="utf-8")
-    evaluation = evaluate_checkpoint(checkpoint_path, data_path, TOKENIZER_PATH, batch_size=1, device="cpu")
+    evaluation = evaluate_checkpoint(checkpoint_path, data_path, TOKENIZER_PATH, batch_size=1, device="cuda")
     assert evaluation["evaluated_tokens"] > 0
     figure_path = plot_metric([output_dir], tmp_path / "loss.png")
     assert figure_path.is_file()
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    generated_model = TransformerLM(ModelConfig(**checkpoint["metadata"]["model_config"]))
+    generated_model = TransformerLM(ModelConfig(**checkpoint["metadata"]["model_config"])).cuda()
     generated_model.load_state_dict(checkpoint["model_state_dict"])
     tokenizer = MiniMindTokenizer.from_pretrained(TOKENIZER_PATH)
-    assert isinstance(generate(generated_model, tokenizer, "hello", 1, 0.0, 0, 1.0, torch.device("cpu")), str)
+    assert isinstance(generate(generated_model, tokenizer, "hello", 1, 0.0, 0, 1.0, torch.device("cuda")), str)

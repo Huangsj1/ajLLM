@@ -13,6 +13,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
+from ajllm.modeling.cuda_kernels import squared_norm_partials
 from ajllm.training.checkpoint import load_checkpoint, save_checkpoint
 from ajllm.training.distributed import FullyShardedDataParallel
 from ajllm.training.evaluation import evaluate_causal_lm
@@ -60,12 +61,22 @@ def _mean_across_ranks(value: torch.Tensor) -> torch.Tensor:
     return value
 
 
-def clip_gradients(parameters, maximum_norm: float, epsilon: float = 1e-6) -> float:
+def clip_gradients(parameters, maximum_norm: float, use_cuda_kernels: bool = True, epsilon: float = 1e-6) -> float:
     """Clip global gradient norm with primitive tensor operations."""
     parameters = [parameter for parameter in parameters if parameter.grad is not None]
     if not parameters:
         return 0.0
-    squared_norm = sum(torch.sum(parameter.grad.detach().float().square()) for parameter in parameters)
+    gradients = [parameter.grad.detach() for parameter in parameters]
+    # Per-tensor Triton reductions avoid materializing gradient.square(); one
+    # Torch reduction combines the small partial arrays across parameters.
+    if use_cuda_kernels:
+        partials = [squared_norm_partials(gradient) for gradient in gradients]
+        squared_norm = torch.sum(torch.cat(partials))
+    else:
+        squared_norm = torch.sum(torch.stack([torch.sum(gradient.float() * gradient.float()) for gradient in gradients]))
+    if dist.is_available() and dist.is_initialized():
+        # FSDP parameters are local shards; clipping must use the cross-rank norm.
+        dist.all_reduce(squared_norm, op=dist.ReduceOp.SUM)
     norm = torch.sqrt(squared_norm)
     norm_value = float(norm.item())
     if norm_value > maximum_norm:
@@ -91,12 +102,16 @@ class Pretrainer:
         self.model, self.dataloader, self.device = model, dataloader, device
         self.config, self.output_dir, self.metadata = config, Path(output_dir), metadata
         self.validation_dataloader = validation_dataloader
+        base_model = model.module if isinstance(model, FullyShardedDataParallel) else model
+        self.use_cuda_kernels = base_model.config.use_cuda_kernels
         self.optimizer = AdamW(
             model.parameters(),
             learning_rate=config.learning_rate,
             betas=(config.beta1, config.beta2),
             weight_decay=config.weight_decay,
+            use_cuda_kernels=self.use_cuda_kernels,
         )
+        # FP16 uses loss scaling to avoid gradient underflow; BF16 usually does not need it.
         self.scaler = torch.amp.GradScaler("cuda", enabled=config.mixed_precision == "fp16" and device.type == "cuda")
         self.logger = (
             RunLogger(self.output_dir, append_existing=bool(config.resume_from)) if is_main_process() else None
@@ -159,7 +174,7 @@ class Pretrainer:
                     accumulation_count += 1
                     input_ids, labels = batch["input_ids"].to(self.device), batch["labels"].to(self.device)
                     with self._autocast():
-                        lm_loss = cross_entropy(self.model(input_ids), labels)
+                        lm_loss = cross_entropy(self.model(input_ids), labels, self.use_cuda_kernels)
                         auxiliary_loss = self._auxiliary_loss()
                         total_loss = lm_loss + auxiliary_loss
                         loss = total_loss / self.config.gradient_accumulation_steps
@@ -177,7 +192,7 @@ class Pretrainer:
                 self.scaler.unscale_(self.optimizer)
                 if isinstance(self.model, FullyShardedDataParallel):
                     self.model.finish_gradient_synchronization()
-                grad_norm = clip_gradients(self.model.parameters(), self.config.grad_clip)
+                grad_norm = clip_gradients(self.model.parameters(), self.config.grad_clip, self.use_cuda_kernels)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 completed += 1

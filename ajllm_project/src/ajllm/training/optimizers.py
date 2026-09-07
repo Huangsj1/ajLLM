@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import torch
 
+from ajllm.modeling.cuda_kernels import adamw_update_
+
 
 class AdamW(torch.optim.Optimizer):
     """Adam with decoupled weight decay."""
@@ -15,6 +17,7 @@ class AdamW(torch.optim.Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         epsilon: float = 1e-8,
         weight_decay: float = 0.0,
+        use_cuda_kernels: bool = True,
     ) -> None:
         beta1, beta2 = betas
         if learning_rate < 0:
@@ -28,6 +31,7 @@ class AdamW(torch.optim.Optimizer):
             "weight_decay": weight_decay,
         }
         super().__init__(parameters, defaults)
+        self.use_cuda_kernels = use_cuda_kernels
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -47,9 +51,15 @@ class AdamW(torch.optim.Optimizer):
                 step = state["step"]
                 first_moment = state["first_moment"]
                 second_moment = state["second_moment"]
-                first_moment.mul_(beta1).add_(gradient, alpha=1 - beta1)
-                second_moment.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
                 adjusted_learning_rate = group["lr"] * (1 - beta2**step) ** 0.5 / (1 - beta1**step)
-                parameter.addcdiv_(first_moment, second_moment.sqrt().add_(group["eps"]), value=-adjusted_learning_rate)
-                parameter.mul_(1 - group["lr"] * group["weight_decay"])
+                if self.use_cuda_kernels:
+                    adamw_update_(
+                        parameter, gradient, first_moment, second_moment, beta1, beta2,
+                        adjusted_learning_rate, group["eps"], group["lr"], group["weight_decay"],
+                    )
+                else:
+                    first_moment.mul_(beta1).add_(gradient, alpha=1 - beta1)
+                    second_moment.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
+                    parameter.addcdiv_(first_moment, second_moment.sqrt().add_(group["eps"]), value=-adjusted_learning_rate)
+                    parameter.mul_(1 - group["lr"] * group["weight_decay"])
         return loss

@@ -7,9 +7,9 @@ tokenizer:
 
 epochs: 1  # One epoch visits every JSONL record once.
 max_steps: 10000  # Set, for example, 100 for a short smoke run; null completes every epoch.
-batch_size: 16  # This GPU's MoE memory limit is close to 12 GiB.
+batch_size: 32  # This GPU's MoE memory limit is close to 12 GiB.
 gradient_accumulation_steps: 1  # Do not raise on the current GPU.
-eval_batch_size: 16
+eval_batch_size: 32
 
 num_workers: 0
 
