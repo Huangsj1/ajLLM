@@ -42,4 +42,4 @@ Train the MoE comparison with `configs/pretrain_moe.yaml`. Both runs emit isolat
 JSONL metrics; `workflows.compare`, `workflows.evaluate`, and `workflows.generate`
 provide loss plots, checkpoint evaluation, and prompt generation.
 
-See [architecture](docs/architecture.md) for the model design and [training](docs/training.md) for the exact training/FSDP behavior and limits.
+See [architecture](docs/architecture.md) for the model design, [training](docs/training.md) for the data and baseline training path, and [parallel training](docs/parallel_training.md) for FSDP, TP and EP launches, limits and validation.

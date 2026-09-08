@@ -14,7 +14,18 @@ from torch.utils.data import DataLoader, DistributedSampler
 from ajllm.datasets import PretrainDataset
 from ajllm.modeling import build_model, load_model_config
 from ajllm.tokenization import MiniMindTokenizer
-from ajllm.training.distributed import FullyShardedDataParallel, destroy_distributed, initialize_distributed
+from ajllm.training.parallel import (
+    ExpertParallel,
+    FullyShardedDataParallel,
+    ParallelContext,
+    TensorExpertParallel,
+    TensorParallel,
+    destroy_distributed,
+    expert_parallelize,
+    initialize_distributed,
+    tensor_expert_parallelize,
+    tensor_parallelize,
+)
 from ajllm.training.pretrainer import PretrainConfig, Pretrainer, is_main_process
 
 
@@ -40,16 +51,29 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
             device = torch.device("cpu")
         elif config.get("device") == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("config requests CUDA but CUDA is unavailable")
-        if world_size > 1 and not config.get("use_fsdp", False):
+        parallel_config = config.get("parallel", {})
+        if not isinstance(parallel_config, dict):
+            raise ValueError("parallel must be a mapping when provided")
+        tp_size = int(parallel_config.get("tp_size", 1))
+        ep_size = int(parallel_config.get("ep_size", 1))
+        if tp_size < 1 or ep_size < 1:
+            raise ValueError("parallel.tp_size and parallel.ep_size must be positive")
+        if not config.get("use_fsdp", False) and tp_size * ep_size != world_size:
+            raise ValueError("parallel.tp_size * parallel.ep_size must equal WORLD_SIZE")
+        if world_size > 1 and not config.get("use_fsdp", False) and tp_size == ep_size == 1:
             raise ValueError(
-                "torchrun requires use_fsdp: true; DDP is intentionally not part of this pre-training scope"
+                "torchrun requires use_fsdp: true, parallel.tp_size > 1, or parallel.ep_size > 1"
             )
+        if config.get("use_fsdp", False) and (tp_size > 1 or ep_size > 1):
+            raise ValueError("combining FSDP with TP/EP will be enabled after the independent combination test suites")
         output_dir = Path(config["output_dir"])
         if is_main_process():
             output_dir.mkdir(parents=True, exist_ok=True)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
-        seed = int(config.get("seed", 42)) + rank
+        # TP replicas share a data/RNG stream; EP replicas process distinct data.
+        data_rank = rank // tp_size
+        seed = int(config.get("seed", 42)) + data_rank
         random.seed(seed)
         torch.manual_seed(seed)
         if device.type == "cuda":
@@ -80,11 +104,12 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
             if config.get("validation_data_path")
             else None
         )
+        data_replicas = ep_size
         sampler = (
             DistributedSampler(
-                dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=int(config.get("seed", 42))
+                dataset, num_replicas=data_replicas, rank=data_rank, shuffle=True, seed=int(config.get("seed", 42))
             )
-            if world_size > 1
+            if data_replicas > 1 or tp_size > 1
             else None
         )
         dataloader = DataLoader(
@@ -96,8 +121,8 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
             pin_memory=device.type == "cuda",
         )
         validation_sampler = (
-            DistributedSampler(validation_dataset, num_replicas=world_size, rank=rank, shuffle=False)
-            if validation_dataset is not None and world_size > 1
+            DistributedSampler(validation_dataset, num_replicas=data_replicas, rank=data_rank, shuffle=False)
+            if validation_dataset is not None and (data_replicas > 1 or tp_size > 1)
             else None
         )
         validation_dataloader = (
@@ -125,9 +150,29 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
             model = FullyShardedDataParallel(
                 model, compute_dtype, bool(fsdp_config.get("use_activation_checkpointing", True))
             )
+        elif tp_size > 1 and ep_size > 1:
+            context = ParallelContext.from_distributed(tp_size=tp_size, ep_size=ep_size)
+            model = tensor_expert_parallelize(
+                model,
+                context,
+                expert_backend=str(parallel_config.get("expert_backend", "torch")),
+            )
+        elif tp_size > 1:
+            model = tensor_parallelize(model)
+        elif ep_size > 1:
+            model = expert_parallelize(model, expert_backend=str(parallel_config.get("expert_backend", "torch")))
         if is_main_process():
-            base_model = model.module if isinstance(model, FullyShardedDataParallel) else model
-            print(f"parameters: {base_model.parameter_count():,}")
+            base_model = (
+                model.module
+                if isinstance(model, (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel))
+                else model
+            )
+            parameter_count = (
+                model.parameter_count()
+                if isinstance(model, (TensorParallel, ExpertParallel, TensorExpertParallel))
+                else base_model.parameter_count()
+            )
+            print(f"parameters: {parameter_count:,}")
             print(
                 f"dataset records: {len(dataset):,}; epochs: {config['epochs']}; "
                 f"device: {device}; world size: {world_size}"

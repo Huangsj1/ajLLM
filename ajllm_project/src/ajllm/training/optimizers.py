@@ -60,6 +60,7 @@ class AdamW(torch.optim.Optimizer):
                 else:
                     first_moment.mul_(beta1).add_(gradient, alpha=1 - beta1)
                     second_moment.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
-                    parameter.addcdiv_(first_moment, second_moment.sqrt().add_(group["eps"]), value=-adjusted_learning_rate)
+                    denominator = second_moment.sqrt().add_(group["eps"])
+                    parameter.addcdiv_(first_moment, denominator, value=-adjusted_learning_rate)
                     parameter.mul_(1 - group["lr"] * group["weight_decay"])
         return loss

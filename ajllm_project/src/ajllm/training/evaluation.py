@@ -8,8 +8,11 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
-from ajllm.training.distributed import FullyShardedDataParallel
 from ajllm.training.losses import cross_entropy
+from ajllm.training.parallel.expert_parallel import ExpertParallel
+from ajllm.training.parallel.fsdp import FullyShardedDataParallel
+from ajllm.training.parallel.tensor_expert_parallel import TensorExpertParallel
+from ajllm.training.parallel.tensor_parallel import TensorParallel
 
 
 def _distributed_sum(values: torch.Tensor) -> torch.Tensor:
@@ -39,14 +42,24 @@ def evaluate_causal_lm(
         labels = batch["labels"].to(device)
         with torch.autocast(device_type=device.type, dtype=dtype, enabled=enabled):
             logits = model(input_ids)
-            base_model = model.module if isinstance(model, FullyShardedDataParallel) else model
+            base_model = (
+                model.module
+                if isinstance(model, (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel))
+                else model
+            )
             lm_loss = cross_entropy(logits, labels, base_model.config.use_cuda_kernels)
             auxiliary_loss = base_model.auxiliary_loss()
         token_count = (labels != -100).sum()
-        totals[0] += lm_loss.detach().double() * token_count
-        totals[1] += auxiliary_loss.detach().double() * token_count
-        totals[2] += (lm_loss.detach().double() + auxiliary_loss.detach().double()) * token_count
-        totals[3] += token_count
+        # TP replicas run the same batch. Each EP data replica contributes once.
+        tensor_parallel_replica = isinstance(model, TensorParallel) and model.rank != 0
+        tensor_expert_parallel_replica = (
+            isinstance(model, TensorExpertParallel) and model.context.tp_rank != 0
+        )
+        if not tensor_parallel_replica and not tensor_expert_parallel_replica:
+            totals[0] += lm_loss.detach().double() * token_count
+            totals[1] += auxiliary_loss.detach().double() * token_count
+            totals[2] += (lm_loss.detach().double() + auxiliary_loss.detach().double()) * token_count
+            totals[3] += token_count
     _distributed_sum(totals)
     if was_training:
         model.train()

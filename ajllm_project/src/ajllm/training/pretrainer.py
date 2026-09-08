@@ -15,11 +15,14 @@ from tqdm import tqdm
 
 from ajllm.modeling.cuda_kernels import squared_norm_partials
 from ajllm.training.checkpoint import load_checkpoint, save_checkpoint
-from ajllm.training.distributed import FullyShardedDataParallel
 from ajllm.training.evaluation import evaluate_causal_lm
 from ajllm.training.logger import RunLogger
 from ajllm.training.losses import cross_entropy
 from ajllm.training.optimizers import AdamW
+from ajllm.training.parallel.expert_parallel import ExpertParallel
+from ajllm.training.parallel.fsdp import FullyShardedDataParallel
+from ajllm.training.parallel.tensor_expert_parallel import TensorExpertParallel
+from ajllm.training.parallel.tensor_parallel import TensorParallel
 from ajllm.training.schedulers import warmup_cosine_learning_rate
 
 
@@ -73,7 +76,9 @@ def clip_gradients(parameters, maximum_norm: float, use_cuda_kernels: bool = Tru
         partials = [squared_norm_partials(gradient) for gradient in gradients]
         squared_norm = torch.sum(torch.cat(partials))
     else:
-        squared_norm = torch.sum(torch.stack([torch.sum(gradient.float() * gradient.float()) for gradient in gradients]))
+        squared_norm = torch.sum(
+            torch.stack([torch.sum(gradient.float() * gradient.float()) for gradient in gradients])
+        )
     if dist.is_available() and dist.is_initialized():
         # FSDP parameters are local shards; clipping must use the cross-rank norm.
         dist.all_reduce(squared_norm, op=dist.ReduceOp.SUM)
@@ -102,7 +107,11 @@ class Pretrainer:
         self.model, self.dataloader, self.device = model, dataloader, device
         self.config, self.output_dir, self.metadata = config, Path(output_dir), metadata
         self.validation_dataloader = validation_dataloader
-        base_model = model.module if isinstance(model, FullyShardedDataParallel) else model
+        base_model = (
+            model.module
+            if isinstance(model, (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel))
+            else model
+        )
         self.use_cuda_kernels = base_model.config.use_cuda_kernels
         self.optimizer = AdamW(
             model.parameters(),
@@ -190,9 +199,19 @@ class Pretrainer:
                         if parameter.grad is not None:
                             parameter.grad.mul_(correction)
                 self.scaler.unscale_(self.optimizer)
-                if isinstance(self.model, FullyShardedDataParallel):
+                parallel_wrappers = (
+                    FullyShardedDataParallel,
+                    TensorParallel,
+                    ExpertParallel,
+                    TensorExpertParallel,
+                )
+                if isinstance(self.model, parallel_wrappers):
                     self.model.finish_gradient_synchronization()
-                grad_norm = clip_gradients(self.model.parameters(), self.config.grad_clip, self.use_cuda_kernels)
+                grad_norm = (
+                    self.model.clip_grad_norm_(self.config.grad_clip)
+                    if isinstance(self.model, (TensorParallel, ExpertParallel, TensorExpertParallel))
+                    else clip_gradients(self.model.parameters(), self.config.grad_clip, self.use_cuda_kernels)
+                )
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 completed += 1
@@ -275,7 +294,11 @@ class Pretrainer:
         return summary
 
     def _auxiliary_loss(self) -> torch.Tensor:
-        base_model = self.model.module if isinstance(self.model, FullyShardedDataParallel) else self.model
+        base_model = (
+            self.model.module
+            if isinstance(self.model, (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel))
+            else self.model
+        )
         return base_model.auxiliary_loss()
 
     @staticmethod

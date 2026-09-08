@@ -4,18 +4,18 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 import torch
 import yaml
-import pytest
 
 from ajllm.modeling import ModelConfig, TransformerLM, load_model_config
 from ajllm.modeling.flash_attention import flash_attention_pytorch
 from ajllm.tokenization import MiniMindTokenizer
 from ajllm.training.checkpoint import load_checkpoint, save_checkpoint
-from ajllm.training.distributed import FullyShardedDataParallel
 from ajllm.training.logger import RunLogger
 from ajllm.training.losses import cross_entropy
 from ajllm.training.optimizers import AdamW
+from ajllm.training.parallel.fsdp import FullyShardedDataParallel
 from ajllm.utils.view_dataset import inspect_jsonl
 from ajllm.workflows.compare import plot_metric
 from ajllm.workflows.evaluate import evaluate_checkpoint
