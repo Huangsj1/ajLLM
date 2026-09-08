@@ -26,7 +26,7 @@
 
 | 文件 / 对象 | 当前行为 | 设计影响 |
 | --- | --- | --- |
-| `src/ajllm/training/distributed.py` | `FullyShardedDataParallel` 使用默认全局进程组，前向 gather，反向自定义 autograd reduce-scatter 并求平均 | 所有通信函数需支持显式 group；不能让 TP/EP 继续隐式使用 WORLD |
+| `src/ajllm/training/parallel/fsdp.py` | `FullyShardedDataParallel` 使用默认全局进程组，前向 gather，反向自定义 autograd reduce-scatter 并求平均 | 所有通信函数需支持显式 group；不能让 TP/EP 继续隐式使用 WORLD |
 | 同上 | 匹配自定义 `Linear`，含其子类 `VariableGroupedLinear`；非分片参数在 `finish_gradient_synchronization()` 中平均 | 必须按逻辑参数归属区分同步范围 |
 | 同上 | FSDP 默认 checkpoint；此模式 gather 在 checkpointed forward 内，前后 gather hooks 不启用 | 组合时需要唯一的权重恢复和 checkpoint 管理者 |
 | `modeling/layers.py` | `Linear` 是自定义 `nn.Module`，权重 `[out, in]`；Embedding 同样自定义 | 不能假定原生 PyTorch TP 样式可直接匹配 |
@@ -483,7 +483,7 @@ checkpoint recomputation 必须恢复对应 RNG，保持 routing 与 collective 
 | 新增 `training/parallel/expert_parallel.py` | 本地专家拥有权、路由分发与合并 |
 | 新增 `training/parallel/wrapper.py` | 统一转换、公共协议、梯度 finalize |
 | 新增 `training/parallel/amp.py` | 全局溢出判断、同步 loss scale 和恢复 |
-| 修改 `training/distributed.py` | group-aware FSDP、布局集成、动态专家安全调度 |
+| 修改 `training/parallel/fsdp.py` | group-aware FSDP、布局集成、动态专家安全调度 |
 | 修改 `training/pretrainer.py` | 通用协议、step 顺序、并行 clipping/logging |
 | 修改 `workflows/pretrain.py` | 并行配置、sampler、初始化与 wrap |
 | 修改 `training/checkpoint.py`、`evaluation.py` | 并行保存恢复、指标去重 |

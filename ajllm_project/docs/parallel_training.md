@@ -14,7 +14,7 @@ All implementations live in `src/ajllm/training/parallel/`:
 | [expert_parallel.py](../src/ajllm/training/parallel/expert_parallel.py) | Top-1 MoE EP adapter and dispatch |
 | [tensor_expert_parallel.py](../src/ajllm/training/parallel/tensor_expert_parallel.py) | Unified MoE TP×EP wrapper |
 
-The old `training.distributed`, `training.tensor_parallel`, and `training.expert_parallel` paths remain compatibility re-export modules. New code should import from `ajllm.training.parallel` or from a file in that package.
+The previous `training.distributed`, `training.tensor_parallel`, and `training.expert_parallel` modules were removed. Import all parallel wrappers from `ajllm.training.parallel` or from a file in that package.
 
 | Strategy | Wrapper | Supported model | Partition |
 | --- | --- | --- | --- |
@@ -47,12 +47,16 @@ parallel:
 ```
 
 ```bash
+# if not support IB, disable it to avoid SIGSEGV
+NCCL_IB_DISABLE=1 \
 uv run torchrun --standalone --nproc_per_node=4 \
   -m ajllm.workflows.pretrain --config configs/pretrain_dense_tp4.yaml
 
+NCCL_IB_DISABLE=1 \
 uv run torchrun --standalone --nproc_per_node=4 \
   -m ajllm.workflows.pretrain --config configs/pretrain_moe_ep4.yaml
 
+NCCL_IB_DISABLE=1 \
 uv run torchrun --standalone --nproc_per_node=4 \
   -m ajllm.workflows.pretrain --config configs/pretrain_moe_tp2_ep2.yaml
 ```

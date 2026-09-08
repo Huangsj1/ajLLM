@@ -1,27 +1,33 @@
-device: cuda
-seed: 42
-data_path: data/pretrain.jsonl
-validation_data_path: null
+# Four-GPU Top-1 MoE TP×EP example. Start with the Torch expert backend.
 model_config: configs/model_moe.yaml
-output_dir: outputs/pretrain_moe_tp2_ep2
-max_seq_len: 512
-batch_size: 2
+data_path: data/pretrain_t2t_mini.jsonl
+validation_data_path: null
+tokenizer:
+  path: assets/tokenizers/minimind
 epochs: 1
-max_steps: 100
-learning_rate: 0.0003
-min_lr: 0.00003
-warmup_steps: 10
+max_steps: 10000
+batch_size: 16
+gradient_accumulation_steps: 1
+eval_batch_size: 16
+num_workers: 0
+max_seq_len: 512
+learning_rate: 5.0e-4
+min_lr: 5.0e-5
+warmup_steps: 2000
 weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
 mixed_precision: bf16
-num_workers: 2
-log_interval: 10
-eval_interval: 0
-save_interval: 100
-tokenizer:
-  path: assets/tokenizers/minimind
+log_interval: 100
+eval_interval: 1000
+eval_batches: null
+save_interval: 50000
+output_dir: output/pretrain/moe_tp2_ep2
+resume_from: null
+device: auto
+seed: 42
+use_fsdp: false
 parallel:
   tp_size: 2
   ep_size: 2

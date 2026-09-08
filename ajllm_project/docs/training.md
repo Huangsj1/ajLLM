@@ -152,7 +152,7 @@ fsdp_config:
   use_activation_checkpointing: true
 ```
 
-`training/distributed.py` is a deliberately readable implementation rather than the framework's production FSDP wrapper. It works as follows:
+`training/parallel/fsdp.py` is a deliberately readable implementation rather than the framework's production FSDP wrapper. It works as follows:
 
 ```text
 broadcast rank-0 initialization
