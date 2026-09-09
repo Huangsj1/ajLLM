@@ -186,6 +186,10 @@ step_00005000.pt.rank1.optim rank-1 local optimizer shard
 
 Normal training writes `step_00005000.pt.optim`. All ranks cooperatively all-gather model weights before rank 0 writes the portable model checkpoint. On resume, the full state is loaded into local parameter shards and each rank loads its optimizer shard. Add `resume_from: output/pretrain/step_00005000.pt` to the training YAML, retaining the same model YAML, tokenizer, and FSDP world size.
 
+For complete interruption recovery instructions, including TP, EP, TP×EP,
+topology checks, `max_steps` behavior, and required optimizer files, see
+[Parallel training: Resume after an interruption](parallel_training.md#resume-after-an-interruption).
+
 ## Recommended progression
 
 1. Run the CUDA tests, which include a one-step workflow smoke test.

@@ -133,6 +133,63 @@ batch_size × gradient_accumulation_steps × WORLD_SIZE
 
 Every wrapper provides `full_state_dict()` and `load_full_state_dict()`. The main checkpoint uses unwrapped parameter names and full tensor shapes; every participating rank must enter the collective full-state export before rank zero writes the file. Parallel wrappers save rank-local optimizer files and require the same world size, wrapper strategy, and TP/EP topology when resuming.
 
+### Resume after an interruption
+
+Use the latest completed `step_<N>.pt` in `output_dir`; do not use a temporary
+`.pt.tmp` file. A parallel checkpoint consists of the main checkpoint and one
+optimizer file per rank, so keep the whole set together:
+
+```text
+step_00005000.pt             model state, step, data position, and topology
+step_00005000.pt.rank0.optim optimizer state for rank 0
+step_00005000.pt.rank1.optim optimizer state for rank 1
+...
+```
+
+Single-process training instead writes `step_00005000.pt.optim`. The checkpoint
+step is an already completed optimizer update. Resuming restores the model,
+optimizer, epoch, and batch position, then continues at the next update.
+The training sampler applies that batch position directly to its index stream,
+so it does not read or tokenize the already completed batches during recovery.
+
+Edit the original YAML and set `resume_from` to the main `.pt` file. Keep the
+model, tokenizer, data path, sequence length, batch size, accumulation steps,
+seed, precision, and parallel settings unchanged. For example, to resume a
+four-GPU TP×EP run from step 5,000:
+
+```yaml
+# configs/pretrain_moe_tp2_ep2.yaml
+max_steps: 10000
+resume_from: output/pretrain/moe_tp2_ep2/step_00005000.pt
+```
+
+Launch with the same command and process count as the original run:
+
+```bash
+uv run torchrun --standalone --nproc_per_node=4 \
+  -m ajllm.workflows.pretrain --config configs/pretrain_moe_tp2_ep2.yaml
+```
+
+For FSDP, TP, EP, and TP×EP, every rank must start the resume command and each
+rank's `.rank<RANK>.optim` file must be present. FSDP requires the same world
+size. TP, EP, and TP×EP additionally check the saved wrapper type and TP/EP
+topology, so a checkpoint from `tp_size: 2, ep_size: 2` cannot be resumed as
+TP=4 or EP=4.
+
+`max_steps` and `epochs` define the total target, not additional work. They
+must leave a target larger than the saved step; otherwise the trainer reports
+that the checkpoint is already complete. Retaining their original values keeps
+the intended learning-rate schedule. Increasing them extends training, but the
+remaining warmup/cosine schedule is recalculated against the new total.
+
+The current checkpoint format does not save RNG state. The epoch-seeded training
+sampler restores the same data order for checkpoints created with this version
+when its settings remain unchanged, but runs with stochastic layers or external
+randomness are not bitwise identical to the interrupted process. Checkpoints
+created by the older batch-discard recovery path do not contain its single-GPU
+shuffle order; they can restore model and optimizer state, but cannot reproduce
+that earlier data order exactly.
+
 CPU/Gloo reference tests validate TP, EP, and TP×EP against an unwrapped model:
 
 ```bash

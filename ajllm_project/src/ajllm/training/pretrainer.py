@@ -10,7 +10,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ajllm.modeling.cuda_kernels import squared_norm_partials
@@ -158,11 +158,19 @@ class Pretrainer:
         processed_tokens = 0
         completed = start_step
         for epoch in range(start_epoch, self.config.epochs):
-            if isinstance(self.dataloader.sampler, DistributedSampler):
-                self.dataloader.sampler.set_epoch(epoch)
-            iterator = iter(self.dataloader)
-            batches_seen = 0
+            sampler = self.dataloader.sampler
+            if hasattr(sampler, "set_epoch"):
+                sampler.set_epoch(epoch)
             batches_to_skip = start_batch if epoch == start_epoch else 0
+            if hasattr(sampler, "set_start_index"):
+                batch_size = self.dataloader.batch_size
+                if not isinstance(batch_size, int):
+                    raise TypeError("checkpoint recovery requires a fixed DataLoader batch_size")
+                sampler.set_start_index(batches_to_skip * batch_size)
+                batches_seen = batches_to_skip
+            else:
+                batches_seen = 0
+            iterator = iter(self.dataloader)
             while batches_seen < batches_to_skip:
                 next(iterator)
                 batches_seen += 1

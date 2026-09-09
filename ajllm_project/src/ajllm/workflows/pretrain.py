@@ -27,6 +27,7 @@ from ajllm.training.parallel import (
     tensor_parallelize,
 )
 from ajllm.training.pretrainer import PretrainConfig, Pretrainer, is_main_process
+from ajllm.training.samplers import ResumableDistributedSampler, ResumableRandomSampler
 
 
 def _load_yaml(path: str | Path) -> dict[str, Any]:
@@ -72,7 +73,10 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.barrier()
         # TP replicas share a data/RNG stream; EP replicas process distinct data.
-        data_rank = rank // tp_size
+        # FSDP remains a conventional WORLD_SIZE-wide data-parallel run.
+        use_fsdp = bool(config.get("use_fsdp", False))
+        data_replicas = world_size if use_fsdp else ep_size
+        data_rank = rank if use_fsdp else rank // tp_size
         seed = int(config.get("seed", 42)) + data_rank
         random.seed(seed)
         torch.manual_seed(seed)
@@ -104,18 +108,17 @@ def run(config_path: str | Path) -> dict[str, float | int | bool]:
             if config.get("validation_data_path")
             else None
         )
-        data_replicas = ep_size
         sampler = (
-            DistributedSampler(
+            ResumableDistributedSampler(
                 dataset, num_replicas=data_replicas, rank=data_rank, shuffle=True, seed=int(config.get("seed", 42))
             )
-            if data_replicas > 1 or tp_size > 1
-            else None
+            if data_replicas > 1
+            else ResumableRandomSampler(dataset, seed=int(config.get("seed", 42)))
         )
         dataloader = DataLoader(
             dataset,
             batch_size=int(config["batch_size"]),
-            shuffle=sampler is None,
+            shuffle=False,
             sampler=sampler,
             num_workers=int(config.get("num_workers", 0)),
             pin_memory=device.type == "cuda",
