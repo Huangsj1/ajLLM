@@ -24,7 +24,7 @@ mixed_precision: bf16
 log_interval: 100
 eval_interval: 0
 eval_batches: null
-save_interval: 40000
+save_interval: 50000
 output_dir: output/sft/moe
 resume_from: null
 device: auto

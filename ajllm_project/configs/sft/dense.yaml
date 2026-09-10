@@ -27,7 +27,7 @@ mixed_precision: bf16  # Use fp16 only when the local CUDA/PyTorch stack lacks B
 log_interval: 100
 eval_interval: 0
 eval_batches: null
-save_interval: 40000
+save_interval: 50000
 output_dir: output/sft/dense
 resume_from: null
 
