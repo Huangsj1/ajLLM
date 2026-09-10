@@ -17,7 +17,7 @@ max_seq_len: 512
 # SFT starts from the pre-trained weights and therefore uses a lower LR.
 learning_rate: 1.0e-5
 min_lr: 1.0e-6
-warmup_steps: 100
+warmup_steps: 500
 weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95

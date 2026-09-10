@@ -15,7 +15,7 @@ num_workers: 0
 max_seq_len: 512
 learning_rate: 1.0e-5
 min_lr: 1.0e-6
-warmup_steps: 100
+warmup_steps: 500
 weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
