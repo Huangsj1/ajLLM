@@ -489,7 +489,7 @@ checkpoint recomputation 必须恢复对应 RNG，保持 routing 与 collective 
 | 修改 `training/checkpoint.py`、`evaluation.py` | 并行保存恢复、指标去重 |
 | 按需小幅修改 `modeling/` | 抽取可复用计算方法或协议；保留原始单卡与 Triton 路径 |
 | 新增 `tests/test_tensor_parallel.py`、`test_expert_parallel.py`、`test_parallel_training.py` | 分层验证与训练恢复 |
-| 新增 `configs/pretrain_*_tp*.yaml`、`pretrain_*_ep*.yaml` | 4/8 卡示例；不覆盖原始配置 |
+| 新增 `configs/pretrain/*.yaml` | 4/8 卡示例；不覆盖原始配置 |
 
 所有实现改动均在文档审阅后开始。若模块转换可以完全放在 `training/parallel/`，优先不改原模型类；但不以保持源码逐字不变为代价复制大量容易漂移的 Attention 逻辑。
 
@@ -526,10 +526,10 @@ parallel:
 ```bash
 # 未来示例文件，当前尚未创建。
 torchrun --standalone --nproc_per_node=4 -m ajllm.workflows.pretrain \
-  --config configs/pretrain_moe_tp2_ep2.yaml
+  --config configs/pretrain/moe_tp2_ep4.yaml
 
 torchrun --standalone --nproc_per_node=8 -m ajllm.workflows.pretrain \
-  --config configs/pretrain_moe_dp2_tp2_ep2.yaml
+  --config configs/pretrain/moe_tp2_ep4.yaml
 ```
 
 首轮单机一进程一 GPU。服务器启动前记录 `nvidia-smi topo -m`、torch/CUDA/NCCL/Triton 版本以及实际设备型号。TP 放在互联较快的相邻设备；EP all-to-all 同样依赖网络带宽，性能结论以服务器实测为准。

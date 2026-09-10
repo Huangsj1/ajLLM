@@ -1,0 +1,36 @@
+# Single-GPU MoE SFT from the completed MoE pre-training run.
+model_config: configs/model/moe.yaml
+pretrained_checkpoint: output/pretrain/moe/step_00088217.pt
+data_path: data/sft_t2t.jsonl
+validation_data_path: null
+tokenizer:
+  path: assets/tokenizers/minimind
+
+epochs: 1
+max_steps: null
+batch_size: 16
+gradient_accumulation_steps: 1
+eval_batch_size: 16
+num_workers: 0
+max_seq_len: 512
+learning_rate: 1.0e-5
+min_lr: 1.0e-6
+warmup_steps: 100
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+mixed_precision: bf16
+log_interval: 100
+eval_interval: 0
+eval_batches: null
+save_interval: 40000
+output_dir: output/sft/moe
+resume_from: null
+device: auto
+seed: 42
+use_fsdp: false
+fsdp_config:
+  sharding_strategy: FULL_SHARD
+  cpu_offload: false
+  use_activation_checkpointing: true

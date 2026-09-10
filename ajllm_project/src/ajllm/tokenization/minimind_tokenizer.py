@@ -1,4 +1,4 @@
-"""Small pre-training interface around MiniMind's published BPE tokenizer."""
+"""Small training interface around MiniMind's published BPE tokenizer."""
 
 from __future__ import annotations
 
@@ -11,9 +11,10 @@ from tokenizers import Tokenizer as BackendTokenizer
 class MiniMindTokenizer:
     """Load the exact MiniMind tokenizer JSON without depending on Transformers.
 
-    Only the stable encode/decode and special-ID surface needed by pre-training
-    is exposed. Chat templates and post-training-specific tokenizer APIs stay
-    out of the pre-training codebase.
+    Only the stable encode/decode and special-token surface needed by the
+    project's training datasets is exposed.  The SFT dataset owns the explicit
+    MiniMind chat serialization so this adapter does not need Transformers or
+    a Jinja runtime.
     """
 
     def __init__(self, tokenizer_path: str | Path, config_path: str | Path | None = None) -> None:
@@ -25,9 +26,12 @@ class MiniMindTokenizer:
             raise FileNotFoundError(config_path)
         self._backend = BackendTokenizer.from_file(str(tokenizer_path))
         self._config = json.loads(config_path.read_text(encoding="utf-8"))
-        self.pad_token_id = self._token_id(self._config["pad_token"])
-        self.bos_token_id = self._token_id(self._config["bos_token"])
-        self.eos_token_id = self._token_id(self._config["eos_token"])
+        self.pad_token = self._config["pad_token"]
+        self.bos_token = self._config["bos_token"]
+        self.eos_token = self._config["eos_token"]
+        self.pad_token_id = self._token_id(self.pad_token)
+        self.bos_token_id = self._token_id(self.bos_token)
+        self.eos_token_id = self._token_id(self.eos_token)
         self.vocab_size = self._backend.get_vocab_size(with_added_tokens=True)
 
     @classmethod

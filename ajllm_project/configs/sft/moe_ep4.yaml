@@ -1,6 +1,7 @@
-# Four-GPU Top-1 MoE TP×EP example. Start with the Torch expert backend.
-model_config: configs/model_moe.yaml
-data_path: data/pretrain_t2t_mini.jsonl
+# Four-GPU Top-1 MoE SFT with expert parallelism.
+model_config: configs/model/moe.yaml
+pretrained_checkpoint: output/pretrain/moe/step_00088217.pt
+data_path: data/sft_t2t_mini.jsonl
 validation_data_path: null
 tokenizer:
   path: assets/tokenizers/minimind
@@ -11,24 +12,24 @@ gradient_accumulation_steps: 1
 eval_batch_size: 16
 num_workers: 0
 max_seq_len: 512
-learning_rate: 5.0e-4
-min_lr: 5.0e-5
-warmup_steps: 2000
+learning_rate: 1.0e-5
+min_lr: 1.0e-6
+warmup_steps: 100
 weight_decay: 0.1
 beta1: 0.9
 beta2: 0.95
 grad_clip: 1.0
 mixed_precision: bf16
 log_interval: 100
-eval_interval: 1000
+eval_interval: 0
 eval_batches: null
-save_interval: 50000
-output_dir: output/pretrain/moe_tp2_ep2
+save_interval: 5000
+output_dir: output/sft/moe_ep4
 resume_from: null
 device: auto
 seed: 42
 use_fsdp: false
 parallel:
-  tp_size: 2
-  ep_size: 2
+  tp_size: 1
+  ep_size: 4
   expert_backend: torch

@@ -39,10 +39,10 @@ parallel:
   ep_size: 4
   expert_backend: torch
 
-# Four-GPU Top-1 MoE TP×EP
+# Eight-GPU Top-1 MoE TP×EP
 parallel:
   tp_size: 2
-  ep_size: 2
+  ep_size: 4
   expert_backend: torch
 ```
 
@@ -50,15 +50,15 @@ parallel:
 # if not support IB, disable it to avoid SIGSEGV
 NCCL_IB_DISABLE=1 \
 uv run torchrun --standalone --nproc_per_node=4 \
-  -m ajllm.workflows.pretrain --config configs/pretrain_dense_tp4.yaml
+  -m ajllm.workflows.pretrain --config configs/pretrain/dense_tp4.yaml
 
 NCCL_IB_DISABLE=1 \
 uv run torchrun --standalone --nproc_per_node=4 \
-  -m ajllm.workflows.pretrain --config configs/pretrain_moe_ep4.yaml
+  -m ajllm.workflows.pretrain --config configs/pretrain/moe_ep4.yaml
 
 NCCL_IB_DISABLE=1 \
-uv run torchrun --standalone --nproc_per_node=4 \
-  -m ajllm.workflows.pretrain --config configs/pretrain_moe_tp2_ep2.yaml
+uv run torchrun --standalone --nproc_per_node=8 \
+  -m ajllm.workflows.pretrain --config configs/pretrain/moe_tp2_ep4.yaml
 ```
 
 For FSDP, set `use_fsdp: true` and leave both parallel sizes at one. FSDP×TP and FSDP×EP are rejected. For TP, both `num_heads` and `num_kv_heads` must divide by `tp_size`; for MoE TP×EP, `d_ff` must also divide by `tp_size` and `num_experts` by `ep_size`.
@@ -158,22 +158,22 @@ seed, precision, and parallel settings unchanged. For example, to resume a
 four-GPU TP×EP run from step 5,000:
 
 ```yaml
-# configs/pretrain_moe_tp2_ep2.yaml
+# configs/pretrain/moe_tp2_ep4.yaml
 max_steps: 10000
-resume_from: output/pretrain/moe_tp2_ep2/step_00005000.pt
+resume_from: output/pretrain/moe_tp2_ep4/step_00005000.pt
 ```
 
 Launch with the same command and process count as the original run:
 
 ```bash
-uv run torchrun --standalone --nproc_per_node=4 \
-  -m ajllm.workflows.pretrain --config configs/pretrain_moe_tp2_ep2.yaml
+uv run torchrun --standalone --nproc_per_node=8 \
+  -m ajllm.workflows.pretrain --config configs/pretrain/moe_tp2_ep4.yaml
 ```
 
 For FSDP, TP, EP, and TP×EP, every rank must start the resume command and each
 rank's `.rank<RANK>.optim` file must be present. FSDP requires the same world
 size. TP, EP, and TP×EP additionally check the saved wrapper type and TP/EP
-topology, so a checkpoint from `tp_size: 2, ep_size: 2` cannot be resumed as
+topology, so a checkpoint from `tp_size: 2, ep_size: 4` cannot be resumed as
 TP=4 or EP=4.
 
 `max_steps` and `epochs` define the total target, not additional work. They

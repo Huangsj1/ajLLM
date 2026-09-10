@@ -85,7 +85,7 @@ def test_jsonl_inspector_reports_counts_and_examples(tmp_path, capsys) -> None:
 
 
 def test_default_dense_config_is_triton_compatible() -> None:
-    config_path = Path(__file__).resolve().parents[1] / "configs" / "model_dense.yaml"
+    config_path = Path(__file__).resolve().parents[1] / "configs" / "model" / "dense.yaml"
     config = load_model_config(config_path, vocab_size=6400)
     assert (config.d_model, config.num_heads, config.num_kv_heads) == (768, 12, 4)
     assert config.d_model // config.num_heads == 64

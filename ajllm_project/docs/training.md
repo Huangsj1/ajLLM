@@ -2,7 +2,7 @@
 
 ## Scope and quick start
 
-`python -m ajllm.workflows.pretrain` is the only training entry point. It accepts JSONL records shaped as `{"text": "a document"}`. The workflow only connects config, data, model and trainer; datasets live in `src/ajllm/datasets/` and optimization mechanics live in `src/ajllm/training/`.
+`python -m ajllm.workflows.pretrain` is the pre-training entry point. It accepts JSONL records shaped as `{"text": "a document"}`. The workflow only connects config, data, model and trainer; datasets live in `src/ajllm/datasets/` and optimization mechanics live in `src/ajllm/training/`. Conversational SFT is documented separately in [sft.md](sft.md).
 
 ```bash
 uv sync --extra dev
@@ -11,10 +11,10 @@ uv run pytest
 
 ```bash
 # pretrain a dense model on a single GPU
-uv run python -m ajllm.workflows.pretrain --config configs/pretrain_dense.yaml
+uv run python -m ajllm.workflows.pretrain --config configs/pretrain/dense.yaml
 
 # pretrain a moe model on a single GPU
-uv run python -m ajllm.workflows.pretrain --config configs/pretrain_moe.yaml
+uv run python -m ajllm.workflows.pretrain --config configs/pretrain/moe.yaml
 ```
 
 Use `device: cuda`; this pre-training path targets the project's CUDA + Triton environment. `batch_size` is per process. Effective batch size is `batch_size × gradient_accumulation_steps × world_size`.
@@ -42,8 +42,8 @@ a run with `resume_from` appends so its existing loss curve remains continuous.
 
 ## Dense/MoE experiment configuration
 
-Use [pretrain_dense.yaml](../configs/pretrain_dense.yaml) first, then
-[pretrain_moe.yaml](../configs/pretrain_moe.yaml). Their default output directories
+Use [dense.yaml](../configs/pretrain/dense.yaml) first, then
+[moe.yaml](../configs/pretrain/moe.yaml). Their default output directories
 are isolated as `output/pretrain/dense/` and `output/pretrain/moe/`, so runs,
 checkpoints and metrics cannot overwrite each other. For a fair comparison, keep
 tokenizer, data, `epochs`, optimizer values, seed, sequence length and effective
@@ -85,7 +85,7 @@ Evaluate a portable checkpoint on any JSONL pre-training split:
 
 ```bash
 uv run python -m ajllm.workflows.evaluate \
-  --checkpoint output/pretrain/dense/step_00010000.pt \
+  --checkpoint output/pretrain/dense/step_00088217.pt \
   --data-path data/pretrain_validation.jsonl --batch-size 16
 ```
 
@@ -108,7 +108,7 @@ Generate from a checkpoint using the paired MiniMind tokenizer:
 
 ```bash
 uv run python -m ajllm.workflows.generate \
-  --checkpoint output/pretrain/dense/step_00010000.pt \
+  --checkpoint output/pretrain/dense/step_00088217.pt \
   --prompt "人工智能的发展" \
   --max-new-tokens 128 \
   --temperature 0.8 --top-k 50 --top-p 0.9
@@ -141,7 +141,7 @@ Launch one process per GPU:
 
 ```bash
 uv run torchrun --nproc_per_node=2 \
-  -m ajllm.workflows.pretrain --config configs/pretrain_config.yaml
+  -m ajllm.workflows.pretrain --config configs/pretrain/dense.yaml
 ```
 
 ```yaml

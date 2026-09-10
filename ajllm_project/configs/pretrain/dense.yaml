@@ -1,12 +1,12 @@
 # Dense baseline. Keep this configuration unchanged for a fair MoE comparison.
-model_config: configs/model_dense.yaml
-data_path: data/pretrain_t2t_mini.jsonl
+model_config: configs/model/dense.yaml
+data_path: data/pretrain_t2t.jsonl
 validation_data_path: null  # Optional JSONL with the same {"text": ...} schema.
 tokenizer:
   path: assets/tokenizers/minimind
 
 epochs: 1  # One epoch visits every JSONL record once.
-max_steps: 10000  # Set, for example, 100 for a short smoke run; null completes every epoch.
+max_steps: null  # Set, for example, 100 for a short smoke run; null completes every epoch.
 batch_size: 32
 gradient_accumulation_steps: 1  # This GPU's dense-model memory limit.
 eval_batch_size: 32
