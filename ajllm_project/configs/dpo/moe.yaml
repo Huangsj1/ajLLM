@@ -1,0 +1,40 @@
+# Single-GPU DPO from the completed Top-1 MoE SFT checkpoint.
+model_config: configs/model/moe.yaml
+sft_checkpoint: output/sft/moe/step_00159670.pt
+data_path: data/dpo.jsonl
+validation_data_path: null
+tokenizer:
+  path: assets/tokenizers/minimind
+
+epochs: 3
+max_steps: null
+batch_size: 16  # MoE policy + frozen MoE reference have a higher memory footprint.
+gradient_accumulation_steps: 1
+eval_batch_size: 16
+num_workers: 0
+max_seq_len: 512
+
+learning_rate: 5.0e-6
+min_lr: 5.0e-7
+warmup_steps: 100
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+beta: 0.1
+mixed_precision: bf16
+
+log_interval: 100
+eval_interval: 0
+eval_batches: null
+save_interval: 5000
+output_dir: output/dpo/moe
+resume_from: null
+
+device: auto
+seed: 42
+use_fsdp: false
+fsdp_config:
+  sharding_strategy: FULL_SHARD
+  cpu_offload: false
+  use_activation_checkpointing: true

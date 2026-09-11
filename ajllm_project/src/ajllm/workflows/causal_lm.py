@@ -1,4 +1,4 @@
-"""Shared wiring for causal-LM pre-training and supervised fine-tuning."""
+"""Shared wiring for pre-training, SFT, and preference-training workflows."""
 
 from __future__ import annotations
 
@@ -10,9 +10,10 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, DistributedSampler
 
-from ajllm.datasets import PretrainDataset, SFTDataset
+from ajllm.datasets import DPODataset, PretrainDataset, SFTDataset
 from ajllm.modeling import ModelConfig, build_model, load_model_config
 from ajllm.tokenization import MiniMindTokenizer
+from ajllm.training.dpo_trainer import DPOConfig, DPOTrainer
 from ajllm.training.parallel import (
     ExpertParallel,
     FullyShardedDataParallel,
@@ -28,7 +29,7 @@ from ajllm.training.parallel import (
 from ajllm.training.pretrainer import PretrainConfig, Pretrainer, is_main_process
 from ajllm.training.samplers import ResumableDistributedSampler, ResumableRandomSampler
 
-TrainingStage = Literal["pretrain", "sft"]
+TrainingStage = Literal["pretrain", "sft", "dpo"]
 _PARALLEL_WRAPPERS = (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel)
 
 
@@ -108,7 +109,7 @@ def _upgrade_legacy_top1_moe_state_dict(
 def _load_pretrained_weights(
     model: torch.nn.Module, model_config: ModelConfig, checkpoint_path: str | Path
 ) -> None:
-    """Load portable pre-training weights before applying a parallel wrapper."""
+    """Load portable checkpoint weights before applying a parallel wrapper."""
     source = Path(checkpoint_path)
     if not source.is_file():
         raise FileNotFoundError(f"pretrained_checkpoint does not exist: {source}")
@@ -119,14 +120,15 @@ def _load_pretrained_weights(
     saved_config = checkpoint.get("metadata", {}).get("model_config")
     if saved_config is not None and saved_config != model_config.__dict__:
         raise ValueError(
-            "pretrained_checkpoint model_config differs from model_config; SFT must use the identical architecture"
+            "checkpoint model_config differs from model_config; "
+            "the initialized model must use the identical architecture"
         )
     model.load_state_dict(_upgrade_legacy_top1_moe_state_dict(state_dict, model))
 
 
 def _build_dataset(
     stage: TrainingStage, data_path: str | Path, tokenizer: MiniMindTokenizer, sequence_length: int
-) -> PretrainDataset | SFTDataset:
+) -> PretrainDataset | SFTDataset | DPODataset:
     if stage == "pretrain":
         return PretrainDataset(
             data_path,
@@ -136,7 +138,11 @@ def _build_dataset(
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
-    return SFTDataset(data_path, tokenizer, sequence_length, pad_token_id=tokenizer.pad_token_id)
+    elif stage == "sft":
+        return SFTDataset(data_path, tokenizer, sequence_length, pad_token_id=tokenizer.pad_token_id)
+    elif stage == "dpo":
+        return DPODataset(data_path, tokenizer, sequence_length, pad_token_id=tokenizer.pad_token_id)
+    raise ValueError(f"Unknown training stage: {stage}")
 
 
 def _wrap_model(
@@ -190,13 +196,15 @@ def _validate_parallel_config(config: dict[str, Any], world_size: int) -> tuple[
 
 
 def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, float | int | bool]:
-    """Run either causal-LM stage; the dataset and initialization policy differ."""
+    """Run a shared causal-LM stage; data and trainer are stage-specific."""
     config = _load_yaml(config_path)
     if stage == "sft":
         if config.get("resume_from") and config.get("pretrained_checkpoint"):
             raise ValueError("resume_from and pretrained_checkpoint are mutually exclusive")
         if not config.get("resume_from") and not isinstance(config.get("pretrained_checkpoint"), str):
             raise ValueError("SFT requires pretrained_checkpoint unless resuming an SFT checkpoint")
+    if stage == "dpo" and not isinstance(config.get("sft_checkpoint"), str):
+        raise ValueError("DPO requires sft_checkpoint: path/to/sft_checkpoint.pt")
     device, rank, world_size = initialize_distributed()
     try:
         if config.get("device", "auto") == "cpu":
@@ -264,7 +272,14 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
         model = build_model(model_config).to(device)
         if stage == "sft" and config.get("pretrained_checkpoint"):
             _load_pretrained_weights(model, model_config, config["pretrained_checkpoint"])
+        reference_model: torch.nn.Module | None = None
+        if stage == "dpo":
+            reference_model = build_model(model_config).to(device)
+            _load_pretrained_weights(model, model_config, config["sft_checkpoint"])
+            _load_pretrained_weights(reference_model, model_config, config["sft_checkpoint"])
         model = _wrap_model(model, config, parallel_config, world_size)
+        if reference_model is not None:
+            reference_model = _wrap_model(reference_model, config, parallel_config, world_size)
         if is_main_process():
             base_model = model.module if isinstance(model, _PARALLEL_WRAPPERS) else model
             parameter_count = (
@@ -277,8 +292,40 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
             )
             (output_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         metadata: dict[str, Any] = {"model_config": model_config.__dict__, "training_config": config}
-        if stage == "sft":
-            metadata["stage"] = "sft"
+        if stage in {"sft", "dpo"}:
+            metadata["stage"] = stage
+        if stage == "dpo":
+            metadata["reference_checkpoint"] = config["sft_checkpoint"]
+            assert reference_model is not None
+            trainer = DPOTrainer(
+                model,
+                reference_model,
+                dataloader,
+                device,
+                DPOConfig(
+                    epochs=int(config["epochs"]),
+                    max_steps=int(config["max_steps"]) if config.get("max_steps") is not None else None,
+                    learning_rate=float(config["learning_rate"]),
+                    min_lr=float(config["min_lr"]),
+                    warmup_steps=int(config.get("warmup_steps", 0)),
+                    gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 1)),
+                    weight_decay=float(config.get("weight_decay", 0.1)),
+                    beta1=float(config.get("beta1", 0.9)),
+                    beta2=float(config.get("beta2", 0.95)),
+                    grad_clip=float(config.get("grad_clip", 1.0)),
+                    mixed_precision=config.get("mixed_precision"),
+                    log_interval=int(config.get("log_interval", 50)),
+                    eval_interval=int(config.get("eval_interval", 0)),
+                    eval_batches=config.get("eval_batches"),
+                    save_interval=int(config.get("save_interval", 2_000)),
+                    resume_from=config.get("resume_from"),
+                    beta=float(config.get("beta", 0.1)),
+                ),
+                output_dir,
+                metadata,
+                validation_dataloader,
+            )
+            return trainer.train()
         trainer = Pretrainer(
             model,
             dataloader,
@@ -316,3 +363,7 @@ def run_pretrain(config_path: str | Path) -> dict[str, float | int | bool]:
 
 def run_sft(config_path: str | Path) -> dict[str, float | int | bool]:
     return run_causal_lm(config_path, "sft")
+
+
+def run_dpo(config_path: str | Path) -> dict[str, float | int | bool]:
+    return run_causal_lm(config_path, "dpo")

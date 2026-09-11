@@ -107,10 +107,25 @@ uv run python -m ajllm.workflows.compare \
 Generate from a checkpoint using the paired MiniMind tokenizer:
 
 ```bash
+# pretrain
 uv run python -m ajllm.workflows.generate \
-  --checkpoint output/pretrain/dense/step_00088217.pt \
+  --checkpoint output/pretrain/moe/step_00088217.pt \
   --prompt "人工智能的发展" \
-  --max-new-tokens 128 \
+  --max-new-tokens 256 \
+  --temperature 0.8 --top-k 50 --top-p 0.9
+
+# sft
+uv run python -m ajllm.workflows.generate \
+  --checkpoint output/sft/moe/step_00159670.pt \
+  --prompt "人工智能的发展" \
+  --max-new-tokens 256 \
+  --temperature 0.8 --top-k 50 --top-p 0.9
+
+# dpo
+uv run python -m ajllm.workflows.generate \
+  --checkpoint output/dpo/moe/step_00003219.pt \
+  --prompt "人工智能的发展" \
+  --max-new-tokens 256 \
   --temperature 0.8 --top-k 50 --top-p 0.9
 ```
 
