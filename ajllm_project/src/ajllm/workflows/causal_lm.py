@@ -10,10 +10,11 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, DistributedSampler
 
-from ajllm.datasets import DPODataset, PretrainDataset, SFTDataset
+from ajllm.datasets import DPODataset, PretrainDataset, RLAIFDataset, SFTDataset, collate_rlaif
 from ajllm.modeling import ModelConfig, build_model, load_model_config
 from ajllm.tokenization import MiniMindTokenizer
 from ajllm.training.dpo_trainer import DPOConfig, DPOTrainer
+from ajllm.training.grpo_trainer import GRPOConfig, GRPOTrainer
 from ajllm.training.parallel import (
     ExpertParallel,
     FullyShardedDataParallel,
@@ -27,9 +28,10 @@ from ajllm.training.parallel import (
     tensor_parallelize,
 )
 from ajllm.training.pretrainer import PretrainConfig, Pretrainer, is_main_process
+from ajllm.training.rewards import SkyworkRewardModel
 from ajllm.training.samplers import ResumableDistributedSampler, ResumableRandomSampler
 
-TrainingStage = Literal["pretrain", "sft", "dpo"]
+TrainingStage = Literal["pretrain", "sft", "dpo", "grpo"]
 _PARALLEL_WRAPPERS = (FullyShardedDataParallel, TensorParallel, ExpertParallel, TensorExpertParallel)
 
 
@@ -106,9 +108,7 @@ def _upgrade_legacy_top1_moe_state_dict(
     return converted
 
 
-def _load_pretrained_weights(
-    model: torch.nn.Module, model_config: ModelConfig, checkpoint_path: str | Path
-) -> None:
+def _load_pretrained_weights(model: torch.nn.Module, model_config: ModelConfig, checkpoint_path: str | Path) -> None:
     """Load portable checkpoint weights before applying a parallel wrapper."""
     source = Path(checkpoint_path)
     if not source.is_file():
@@ -127,8 +127,13 @@ def _load_pretrained_weights(
 
 
 def _build_dataset(
-    stage: TrainingStage, data_path: str | Path, tokenizer: MiniMindTokenizer, sequence_length: int
-) -> PretrainDataset | SFTDataset | DPODataset:
+    stage: TrainingStage,
+    data_path: str | Path,
+    tokenizer: MiniMindTokenizer,
+    sequence_length: int,
+    *,
+    open_thinking: bool = False,
+) -> PretrainDataset | SFTDataset | DPODataset | RLAIFDataset:
     if stage == "pretrain":
         return PretrainDataset(
             data_path,
@@ -142,6 +147,8 @@ def _build_dataset(
         return SFTDataset(data_path, tokenizer, sequence_length, pad_token_id=tokenizer.pad_token_id)
     elif stage == "dpo":
         return DPODataset(data_path, tokenizer, sequence_length, pad_token_id=tokenizer.pad_token_id)
+    elif stage == "grpo":
+        return RLAIFDataset(data_path, tokenizer, sequence_length, open_thinking=open_thinking)
     raise ValueError(f"Unknown training stage: {stage}")
 
 
@@ -205,6 +212,14 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
             raise ValueError("SFT requires pretrained_checkpoint unless resuming an SFT checkpoint")
     if stage == "dpo" and not isinstance(config.get("sft_checkpoint"), str):
         raise ValueError("DPO requires sft_checkpoint: path/to/sft_checkpoint.pt")
+    if stage == "grpo":
+        if not isinstance(config.get("sft_checkpoint"), str):
+            raise ValueError("GRPO requires sft_checkpoint: path/to/sft_checkpoint.pt")
+        reward_config = config.get("reward_model")
+        if not isinstance(reward_config, dict) or not isinstance(reward_config.get("path"), str):
+            raise ValueError("GRPO requires reward_model: {path: reward_model/Skywork-Reward-V2-Qwen3-0.6B}")
+        if config.get("validation_data_path"):
+            raise ValueError("GRPO uses online rollouts and does not support validation_data_path")
     device, rank, world_size = initialize_distributed()
     try:
         if config.get("device", "auto") == "cpu":
@@ -229,12 +244,30 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
 
         tokenizer = _load_tokenizer(config)
         model_config = load_model_config(config["model_config"], tokenizer.vocab_size)
-        sequence_length = int(config.get("max_seq_len", model_config.context_length))
-        if sequence_length > model_config.context_length:
-            raise ValueError("max_seq_len cannot exceed model context_length")
-        dataset = _build_dataset(stage, config["data_path"], tokenizer, sequence_length)
+        if stage == "grpo":
+            sequence_length = int(config.get("max_prompt_len", model_config.context_length))
+            max_new_tokens = int(config.get("max_new_tokens", 256))
+            if sequence_length + max_new_tokens > model_config.context_length:
+                raise ValueError("max_prompt_len + max_new_tokens cannot exceed model context_length")
+        else:
+            sequence_length = int(config.get("max_seq_len", model_config.context_length))
+            if sequence_length > model_config.context_length:
+                raise ValueError("max_seq_len cannot exceed model context_length")
+        dataset = _build_dataset(
+            stage,
+            config["data_path"],
+            tokenizer,
+            sequence_length,
+            open_thinking=bool(config.get("open_thinking", False)),
+        )
         validation_dataset = (
-            _build_dataset(stage, config["validation_data_path"], tokenizer, sequence_length)
+            _build_dataset(
+                stage,
+                config["validation_data_path"],
+                tokenizer,
+                sequence_length,
+                open_thinking=bool(config.get("open_thinking", False)),
+            )
             if config.get("validation_data_path")
             else None
         )
@@ -252,6 +285,7 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
             sampler=sampler,
             num_workers=int(config.get("num_workers", 0)),
             pin_memory=device.type == "cuda",
+            collate_fn=collate_rlaif if stage == "grpo" else None,
         )
         validation_sampler = (
             DistributedSampler(validation_dataset, num_replicas=data_replicas, rank=data_rank, shuffle=False)
@@ -273,7 +307,7 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
         if stage == "sft" and config.get("pretrained_checkpoint"):
             _load_pretrained_weights(model, model_config, config["pretrained_checkpoint"])
         reference_model: torch.nn.Module | None = None
-        if stage == "dpo":
+        if stage in {"dpo", "grpo"}:
             reference_model = build_model(model_config).to(device)
             _load_pretrained_weights(model, model_config, config["sft_checkpoint"])
             _load_pretrained_weights(reference_model, model_config, config["sft_checkpoint"])
@@ -292,10 +326,13 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
             )
             (output_dir / "resolved_config.yaml").write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
         metadata: dict[str, Any] = {"model_config": model_config.__dict__, "training_config": config}
-        if stage in {"sft", "dpo"}:
+        if stage in {"sft", "dpo", "grpo"}:
             metadata["stage"] = stage
-        if stage == "dpo":
+        if stage in {"dpo", "grpo"}:
             metadata["reference_checkpoint"] = config["sft_checkpoint"]
+        if stage == "grpo":
+            metadata["reward_model"] = config["reward_model"]
+        if stage == "dpo":
             assert reference_model is not None
             trainer = DPOTrainer(
                 model,
@@ -324,6 +361,55 @@ def run_causal_lm(config_path: str | Path, stage: TrainingStage) -> dict[str, fl
                 output_dir,
                 metadata,
                 validation_dataloader,
+            )
+            return trainer.train()
+        if stage == "grpo":
+            assert reference_model is not None
+            reward_config = config["reward_model"]
+            reward_model = SkyworkRewardModel(
+                reward_config["path"],
+                device,
+                max_length=int(reward_config.get("max_length", 4096)),
+                dtype=torch.bfloat16 if config.get("mixed_precision") == "bf16" else torch.float16,
+            )
+            trainer = GRPOTrainer(
+                model,
+                reference_model,
+                reward_model,
+                tokenizer,
+                dataloader,
+                device,
+                GRPOConfig(
+                    epochs=int(config["epochs"]),
+                    max_steps=int(config["max_steps"]) if config.get("max_steps") is not None else None,
+                    learning_rate=float(config["learning_rate"]),
+                    min_lr=float(config["min_lr"]),
+                    warmup_steps=int(config.get("warmup_steps", 0)),
+                    gradient_accumulation_steps=int(config.get("gradient_accumulation_steps", 1)),
+                    weight_decay=float(config.get("weight_decay", 0.1)),
+                    beta1=float(config.get("beta1", 0.9)),
+                    beta2=float(config.get("beta2", 0.95)),
+                    grad_clip=float(config.get("grad_clip", 1.0)),
+                    mixed_precision=config.get("mixed_precision"),
+                    log_interval=int(config.get("log_interval", 50)),
+                    eval_interval=0,
+                    eval_batches=None,
+                    save_interval=int(config.get("save_interval", 2_000)),
+                    resume_from=config.get("resume_from"),
+                    num_generations=int(config.get("num_generations", 4)),
+                    updates_per_rollout=int(config.get("updates_per_rollout", 4)),
+                    max_new_tokens=max_new_tokens,
+                    temperature=float(config.get("temperature", 0.8)),
+                    top_k=int(config.get("top_k", 50)),
+                    top_p=float(config.get("top_p", 0.95)),
+                    kl_coef=float(config.get("kl_coef", 0.04)),
+                    clip_epsilon=float(config.get("clip_epsilon", 0.2)),
+                    advantage_epsilon=float(config.get("advantage_epsilon", 1e-4)),
+                    rollout_backend=str(config.get("rollout_backend", "torch")),
+                    vllm=config.get("vllm"),
+                ),
+                output_dir,
+                metadata,
             )
             return trainer.train()
         trainer = Pretrainer(
@@ -367,3 +453,7 @@ def run_sft(config_path: str | Path) -> dict[str, float | int | bool]:
 
 def run_dpo(config_path: str | Path) -> dict[str, float | int | bool]:
     return run_causal_lm(config_path, "dpo")
+
+
+def run_grpo(config_path: str | Path) -> dict[str, float | int | bool]:
+    return run_causal_lm(config_path, "grpo")

@@ -6,13 +6,17 @@ readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
     "matplotlib>=3.11.1",
-    "numpy>=2.4",
+    "numpy>=1.25,<2.4",
     "pyyaml>=6.0",
     "regex>=2026.3.32",
-    "torch~=2.11.0",
+    "torch>=2.9.0",
     "tqdm>=4.67",
     "einops>=0.8.0",
-    "tokenizers>=0.22,<0.23",
+    "tokenizers>=0.21",
+    "huggingface-hub[cli]>=0.34,<1",
+    "safetensors>=0.5",
+    "transformers>=4.56",
+    "vllm>=0.12.0",
 ]
 
 [project.optional-dependencies]
@@ -29,13 +33,18 @@ build-backend = "uv_build"
 module-name = "ajllm"
 module-root = "src"
 
+[tool.uv]
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'"
+]
+
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu130", marker = "sys_platform == 'win32'" }]
+torch = [{ index = "pytorch-cu130" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

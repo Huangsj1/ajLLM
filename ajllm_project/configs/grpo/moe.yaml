@@ -1,0 +1,53 @@
+# Online GRPO from the completed Top-1 MoE SFT checkpoint and local Skywork Reward V2.
+model_config: configs/model/moe.yaml
+sft_checkpoint: output/sft/moe/step_00159670.pt
+data_path: data/rlaif.jsonl
+tokenizer:
+  path: assets/tokenizers/minimind
+reward_model:
+  path: reward_model/Skywork-Reward-V2-Qwen3-0.6B
+  max_length: 4096
+
+epochs: 1
+max_steps: null
+batch_size: 1  # Policy + reference + reward model are resident during online rollouts.
+gradient_accumulation_steps: 1
+num_workers: 0
+max_prompt_len: 256
+max_new_tokens: 256
+num_generations: 4
+updates_per_rollout: 4
+open_thinking: true
+temperature: 0.8
+top_k: 50
+top_p: 0.95
+rollout_backend: torch
+# vllm:
+#   model_id: /path/to/vllm-compatible-policy
+#   gpu: 1
+#   port: 8000
+#   gpu_memory_utilization: 0.9
+
+learning_rate: 1.0e-6
+min_lr: 1.0e-7
+warmup_steps: 50
+weight_decay: 0.1
+beta1: 0.9
+beta2: 0.95
+grad_clip: 1.0
+kl_coef: 0.04
+clip_epsilon: 0.2
+advantage_epsilon: 1.0e-4
+mixed_precision: bf16
+
+log_interval: 1
+save_interval: 500
+output_dir: output/grpo/moe
+resume_from: null
+device: auto
+seed: 42
+use_fsdp: false
+fsdp_config:
+  sharding_strategy: FULL_SHARD
+  cpu_offload: false
+  use_activation_checkpointing: true

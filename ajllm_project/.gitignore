@@ -71,3 +71,4 @@ htmlcov/
 
 # Local MiniMind project checkout (do not ignore tokenizer assets below assets/)
 /minimind/
+/reward_model/
