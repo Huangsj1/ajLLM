@@ -286,22 +286,36 @@ def sync_policy_weights(policy: torch.nn.Module, vllm_base_url: str, weight_sync
     }
 
     torch.cuda.set_device(next(policy.parameters()).device)
-    _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        update_future = executor.submit(
-            _http_json,
-            "POST",
-            f"{vllm_base_url}/update_weights",
-            {"update_info": update_info},
-            300,
+    paused = False
+    try:
+        _http_json("POST", f"{vllm_base_url}/pause", timeout=60)
+        paused = True
+        # vLLM 0.23 requires an explicit update session.  ``True`` selects
+        # its checkpoint-format loader, which accepts Qwen3's split Q/K/V
+        # names and packs them into the serving kernels.
+        _http_json(
+            "POST", f"{vllm_base_url}/start_weight_update", {"is_checkpoint_format": True}, timeout=60
         )
-        NCCLWeightTransferEngine.trainer_send_weights(
-            iterator=iter(weights),
-            trainer_args=NCCLTrainerSendWeightsArgs(
-                group=weight_sync_group,
-                packed=True,
-            ),
-        )
-        update_future.result()
-    _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
-    _http_json("POST", f"{vllm_base_url}/resume", timeout=60)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            update_future = executor.submit(
+                _http_json,
+                "POST",
+                f"{vllm_base_url}/update_weights",
+                {"update_info": update_info},
+                300,
+            )
+            NCCLWeightTransferEngine.trainer_send_weights(
+                iterator=iter(weights),
+                trainer_args=NCCLTrainerSendWeightsArgs(
+                    group=weight_sync_group,
+                    packed=True,
+                ),
+            )
+            update_future.result()
+        _http_json("POST", f"{vllm_base_url}/finish_weight_update", timeout=300)
+        _http_json("POST", f"{vllm_base_url}/reset_prefix_cache", timeout=60)
+    finally:
+        # Do not leave the rollout server paused if a transfer or HTTP request
+        # fails.  vLLM clears failed update sessions internally.
+        if paused:
+            _http_json("POST", f"{vllm_base_url}/resume", timeout=60)
