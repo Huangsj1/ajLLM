@@ -124,3 +124,39 @@ def test_vllm_weight_names_and_token_id_completion_payload(monkeypatch: pytest.M
     assert [completion.token_ids for completion in completions] == [[9], [10]]
     assert requests[0]["prompt"] == [[1, 2, 3]]
     assert requests[0]["add_special_tokens"] is False
+
+
+def test_weight_sync_resolves_unindexed_cuda_to_the_current_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[int] = []
+
+    monkeypatch.setattr(vllm_util.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(vllm_util.torch.cuda, "set_device", lambda index: calls.append(index))
+    monkeypatch.setattr(vllm_util, "_http_json", lambda *args, **kwargs: {"world_size": 1})
+    monkeypatch.setattr(vllm_util, "get_ip", lambda: "127.0.0.1", raising=False)
+
+    # Stop before initializing the real NCCL group; the device selection is
+    # the regression fixed here and must remain testable without a GPU.
+    class StopHere(Exception):
+        pass
+
+    class FakeEngine:
+        @staticmethod
+        def trainer_init(_config: dict) -> None:
+            raise StopHere
+
+    import sys
+    import types
+
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.distributed.weight_transfer.nccl_engine",
+        types.SimpleNamespace(NCCLWeightTransferEngine=FakeEngine),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.utils.network_utils",
+        types.SimpleNamespace(get_ip=lambda: "127.0.0.1", get_open_port=lambda: 1),
+    )
+    with pytest.raises(StopHere):
+        vllm_util.init_weight_sync("http://server", "cuda")
+    assert calls == [0]

@@ -239,7 +239,15 @@ def init_weight_sync(vllm_base_url: str, policy_device: str):
         "world_size": world_size,
     }
 
-    torch.cuda.set_device(torch.device(policy_device))
+    # ``device: auto`` resolves to ``torch.device("cuda")`` in the training
+    # workflow.  NCCL's trainer initializer needs a concrete local ordinal;
+    # retain an explicit ordinal when supplied and otherwise use the process's
+    # current device (logical cuda:0 when CUDA_VISIBLE_DEVICES=0,1).
+    device = torch.device(policy_device)
+    if device.type != "cuda":
+        raise ValueError(f"vLLM weight sync requires a CUDA policy device, got {device}")
+    device_index = torch.cuda.current_device() if device.index is None else device.index
+    torch.cuda.set_device(device_index)
     with ThreadPoolExecutor(max_workers=1) as executor:
         init_future = executor.submit(
             _http_json,
