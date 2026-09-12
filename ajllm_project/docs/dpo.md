@@ -1,96 +1,116 @@
 # Direct Preference Optimization (DPO)
 
-DPO is the preference-alignment stage after SFT.  It starts with two identical
-copies of a completed SFT checkpoint: a trainable policy ($\pi_\theta$), and a
-frozen reference policy ($\pi_{\mathrm{ref}}$).  For each prompt ($x$), the
-dataset supplies a preferred completion ($y_w$) (`chosen`) and a weaker
-completion ($y_l$) (`rejected`).  No reward model or on-policy rollout is
-needed.
+## 1. Objective
 
-The implemented objective is:
+DPO starts from an SFT checkpoint and keeps an identical frozen reference
+policy \(\pi_{\mathrm{ref}}\). For prompt \(x\), preferred completion
+\(y_w\), and rejected completion \(y_l\), the implemented objective is:
 
 $$
-\mathcal{L}_{\text{DPO}}(\pi_\theta; \pi_{\text{ref}}) =
--\mathbb{E}_{(x, y_w, y_l) \sim \mathcal{D}} \left[
-\log \sigma \left(
-\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)}
-- \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}
-\right)
-\right].
+\mathcal{L}_{\mathrm{DPO}}(\pi_\theta;\pi_{\mathrm{ref}}) =
+-\mathbb{E}_{(x,y_w,y_l)\sim\mathcal{D}}\left[
+\log\sigma\left(
+\beta\log\frac{\pi_\theta(y_w\mid x)}{\pi_{\mathrm{ref}}(y_w\mid x)}
+-\beta\log\frac{\pi_\theta(y_l\mid x)}{\pi_{\mathrm{ref}}(y_l\mid x)}
+\right)\right] + \mathcal{L}_{\mathrm{MoE\ aux}}.
 $$
 
-Equivalently, the trainer sums token log-probabilities over each assistant
-completion, computes the policy/reference log-ratio for `chosen` and
-`rejected`, subtracts the latter from the former, multiplies by `beta`, and
-applies `-logsigmoid`.  Router auxiliary loss is added for MoE models, exactly
-as in pre-training and SFT.
+The trainer sums completion-token log-probabilities per branch, calculates the
+chosen/rejected policy-reference margins, and applies `-logsigmoid`. The
+reference is frozen for the entire run.
 
-## Dataset
+## 2. Dataset
 
-`data/dpo.jsonl` uses the MiniMind preference-pair schema:
+`data/dpo.jsonl` contains one pair of conversations per line. The shared prefix
+is the prompt; both branches must end in an assistant response.
 
-~~~json
+```json
 {
   "chosen": [
-    {"role": "user", "content": "Explain DPO."},
-    {"role": "assistant", "content": "...preferred answer..."}
+    {"role": "user", "content": "continue"},
+    {"role": "assistant", "content": "As Recharge Retreats grows, we plan to expand our team..."}
   ],
   "rejected": [
-    {"role": "user", "content": "Explain DPO."},
-    {"role": "assistant", "content": "...weaker answer..."}
+    {"role": "user", "content": "continue"},
+    {"role": "assistant", "content": "A. Scaling: 1. Offer a franchise model..."}
   ]
 }
-~~~
+```
 
-The two arrays must have an identical prefix and each must end with an
-assistant message.  This makes the shared prefix the DPO prompt.  Messages are
-serialized with the same MiniMind template as SFT and `generate_chat`; system
-messages, thinking blocks, tools, and tool calls therefore retain the same
-format.  Only assistant completion tokens contribute to sequence
-log-probabilities.  Each branch keeps its final `max_seq_len + 1` serialized
-tokens, just like SFT.
+Only the final assistant completion in each branch contributes to its sequence
+log-probability. MiniMind message formatting is shared with SFT and generation.
 
-## Launch
+## 3. Prerequisites
 
-The supplied dense and MoE configurations point at the completed SFT
-checkpoints currently produced by this project:
+```bash
+uv sync --extra dev
+```
 
-~~~bash
-# Set max_steps: 100 in the selected YAML for an initial smoke run.
+DPO needs a completed matching SFT checkpoint for both the initial policy and
+immutable reference. The supplied paths are:
+
+```text
+output/sft/dense/step_00100000.pt
+output/sft/moe/step_00159670.pt
+```
+
+No reward-model download is required.
+
+## 4. Train
+
+```bash
+# Dense: output/dpo/dense/step_00003219.pt
 uv run python -m ajllm.workflows.dpo --config configs/dpo/dense.yaml
+
+# Top-1 MoE: output/dpo/moe/step_00003219.pt
 uv run python -m ajllm.workflows.dpo --config configs/dpo/moe.yaml
-~~~
+```
 
-`sft_checkpoint` is mandatory, even when resuming: it is the immutable
-reference model.  `resume_from` restores only the trainable DPO policy,
-optimizer, sampler position, and step counter.  Do not replace
-`sft_checkpoint` for a resumed run; doing so changes the objective.  The DPO
-checkpoint metadata records the reference path and has the same portable model
-format as every other stage.
+Keep `sft_checkpoint` fixed when resuming. `resume_from` restores only the
+trainable policy, optimizer, sampler position, and completed step.
 
-DPO holds a policy and a reference model concurrently, so reduce `batch_size`
-or increase gradient accumulation before reducing `max_seq_len` if VRAM is
-tight.  The same FSDP, TP, EP, and TP×EP wrappers used by the prior stages are
-supported through the standard `use_fsdp` / `parallel` YAML fields; each rank
-also owns a frozen reference-model shard.
+## 5. Plot
 
-The metrics JSONL includes `dpo_loss`, `auxiliary_loss`, `chosen_reward`,
-`rejected_reward`, `reward_margin`, and `preference_accuracy`.  A positive
-margin and an accuracy above 0.5 indicate that the policy has moved toward the
-preferred responses relative to the frozen reference.
+```bash
+uv run python -m ajllm.workflows.plot_training --run output/dpo/dense --smooth 20
+uv run python -m ajllm.workflows.plot_training --run output/dpo/moe --smooth 20
+```
 
-## Generation after DPO
+The common workflow plots `total_loss`. `metrics.jsonl` additionally records
+`chosen_reward`, `rejected_reward`, `reward_margin`, and
+`preference_accuracy` for preference diagnostics.
 
-No special generation implementation is needed.  The existing portable
-checkpoint loader reads DPO checkpoint metadata, so use the standard chat
-generation command with the resulting policy checkpoint:
+## 6. Generate
 
-~~~bash
+Use a DPO checkpoint as an ordinary portable policy checkpoint:
+
+```bash
 uv run python -m ajllm.workflows.generate \
-  --checkpoint output/dpo/dense/step_00005000.pt \
-  --messages-json messages.json --open-thinking
-~~~
+  --checkpoint output/dpo/dense/step_00003219.pt \
+  --messages-json assets/prompt/chat_messages.json --open-thinking
 
-For plain continuation prompts, replace `--messages-json ...` with
-`--prompt "..."`.  Tool handling and the registered-callable restriction are
-unchanged from SFT generation.
+uv run python -m ajllm.workflows.generate \
+  --checkpoint output/dpo/moe/step_00003219.pt \
+  --messages-json assets/prompt/chat_messages.json --open-thinking
+
+uv run python -m ajllm.workflows.generate \
+  --checkpoint output/dpo/dense/step_00003219.pt \
+  --prompt-file assets/prompt/continuation.txt
+```
+
+## 7. Multi-GPU
+
+DPO uses the common causal-LM workflow, so its policy and frozen reference can
+be wrapped with the same FSDP, TP, EP, or TP×EP strategies as the matching
+architecture. No dedicated DPO parallel YAML is shipped: copy a dense or MoE
+DPO YAML, preserve its SFT checkpoint, and add the desired parallel block from
+[parallel training](parallel_training.md). Then launch one process per GPU:
+
+```bash
+# Example: copied dense DPO YAML with parallel.tp_size: 4, parallel.ep_size: 1
+NCCL_IB_DISABLE=1 uv run torchrun --standalone --nproc_per_node=4 \
+  -m ajllm.workflows.dpo --config configs/dpo/dense_tp4.yaml
+```
+
+FSDP cannot be combined with TP/EP. Resume only with the same topology and keep
+all rank-local optimizer files beside the main checkpoint.

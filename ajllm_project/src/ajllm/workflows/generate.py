@@ -217,6 +217,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     prompt_group = parser.add_mutually_exclusive_group(required=True)
     prompt_group.add_argument("--prompt", help="Plain pre-training-style prompt")
+    prompt_group.add_argument("--prompt-file", help="UTF-8 text file containing a plain continuation prompt")
     prompt_group.add_argument("--messages-json", help="JSON file containing a conversation message array")
     parser.add_argument("--tools-json", help="Optional JSON file containing tool schemas for chat prompting")
     parser.add_argument("--open-thinking", action="store_true", help="Let the assistant generate its think block")
@@ -235,11 +236,10 @@ def main() -> None:
     model.load_state_dict(_upgrade_legacy_top1_moe_state_dict(checkpoint["model_state_dict"], model))
     torch.manual_seed(args.seed)
     tokenizer = MiniMindTokenizer.from_pretrained(args.tokenizer)
-    if args.prompt is not None:
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8") if args.prompt_file is not None else args.prompt
+    if prompt is not None:
         print(
-            generate(
-                model, tokenizer, args.prompt, args.max_new_tokens, args.temperature, args.top_k, args.top_p, device
-            )
+            generate(model, tokenizer, prompt, args.max_new_tokens, args.temperature, args.top_k, args.top_p, device)
         )
         return
     messages = _load_json(args.messages_json, "messages-json")
