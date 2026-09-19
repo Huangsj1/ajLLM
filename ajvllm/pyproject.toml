@@ -1,7 +1,7 @@
 [project]
 name = "ajvllm"
 version = "0.1.0"
-description = "A configurable byte-level BPE and Transformer language model toolkit"
+description = "An educational CUDA inference engine for dense decoder-only language models"
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -17,13 +17,21 @@ dependencies = [
     "safetensors>=0.5",
     "transformers>=4.56",
     "vllm>=0.12.0",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0",
     "ruff>=0.15.8",
+    "httpx>=0.28",
 ]
+
+[project.scripts]
+ajvllm-serve = "ajvllm.workflows.serve:main"
+ajvllm-generate = "ajvllm.workflows.generate:main"
 
 [build-system]
 requires = ["uv_build>=0.11,<0.12"]
@@ -48,7 +56,8 @@ torch = [{ index = "pytorch-cu130" }]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not model'"
+markers = ["cuda: requires a CUDA GPU", "model: uses the local Qwen checkpoint"]
 
 [tool.ruff]
 line-length = 120
@@ -56,3 +65,4 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+

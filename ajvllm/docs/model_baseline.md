@@ -1,0 +1,122 @@
+# Native Qwen2.5 execution
+
+## Implemented model
+
+The CUDA baseline reads local Qwen2.5 dense config and safetensors, implements
+RMSNorm, RoPE, GQA, SwiGLU and the causal LM head, and maintains per-request layer
+KV tensors. It supports full prefill, repeated prefill chunks, one-token decode,
+and mixed request batches. The local checkpoint is Qwen2.5-0.5B-Instruct: 24 layers,
+896 hidden features, 14 query heads, two KV heads, and a 151936-entry vocabulary.
+All dimensions come from configuration. Both generation-config EOS IDs are used.
+
+The loader supports single and indexed sharded safetensors, validates tensor
+names/shapes once at load time, and preserves tied embedding/head storage.
+Parameters are constructed on meta and populated on CUDA. MoE, quantization,
+scaled RoPE, and sliding-window variants are rejected explicitly. Transformers
+is used for tokenization and as an independent model oracle, never for native
+execution. See the [official Qwen config](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json)
+and [reference implementation](https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/qwen2/modeling_qwen2.py).
+
+## One forward per scheduler batch
+
+`Qwen2Runner.execute` builds one `ModelBatch` from all scheduled requests and
+invokes the model once. Prefill chunks and decode tokens share packed projections,
+attention, and MLP operations. An empty schedule does not launch the model.
+
+See [packed batching](batching.md) for scheduling and future kernel boundaries.
+The eager attention backend still pads mixed query/context lengths; variable-length
+and paged kernels are planned behind the same packed model interface.
+
+| Data | Shape / meaning |
+| --- | --- |
+| Token IDs and positions | `[T]`, concatenated scheduled slices and absolute positions |
+| Sequence IDs / query offsets | `[T]`, map packed tokens to batch rows and local query positions |
+| Hidden states and MLP input | `[T, hidden_size]`, no padding in linear projections |
+| Queries for attention | `[B, query_heads, Qmax, head_dim]` |
+| Packed keys and values | `[B, kv_heads, Kmax, head_dim]` |
+| Causal/padding mask | `[B, 1, Qmax, Kmax]`, constructed once per batch |
+| Stored KV | Per request/layer `[kv_heads, actual_context_length, head_dim]` |
+| LM head output | `[sampling_ready_requests, vocab_size]` |
+
+For each layer, Q/K/V are projected for all T tokens together. Cached tensors are
+copied into padded batch buffers, and new K/V are scattered to their absolute
+positions. Attention then uses one batched QK multiplication, softmax, and batched
+PV multiplication. The result is gathered back to T packed rows before the output
+projection and MLP. Python loops only move cache data and assemble metadata; they
+do not evaluate a model or attention function per request.
+
+For request r with cached length C and new query offset i, key j is visible when
+`j <= C+i` and `j < context_length[r]`. Request rows are independent; padding never
+becomes a stored token. Decode queries can be padded to the longest prefill chunk.
+Query padding is discarded after attention. Tests compare mixed ragged batches
+with independent full-context Transformers outputs and assert exactly one model
+and projection call per scheduler step.
+
+Partial prefill has no sampling row. Only requests that finish their available
+input contribute a final hidden row to the head. Selected logits are copied
+back to the host once per batch for the sampler. `temperature=0` and stochastic
+sampling use the same request-specific policy as before.
+
+## RoPE tables
+
+The model creates cosine/sine tables for `max_position_embeddings` during
+initialization. They are non-persistent buffers, excluded from checkpoint loading.
+Each forward only indexes them by the packed absolute positions.
+
+Device/dtype conversion rebuilds the tables once. Weight loading materializes each unique meta parameter once, preserving tied
+embedding/head aliases, then initializes the rotary tables on CUDA. It avoids
+the temporary duplicate large allocation caused by recursively using `to_empty`.
+Rebuilding starts from FP32 angles rather than converting previously rounded BF16
+factors back to FP32. The forward path never recomputes frequencies or trigonometry.
+Tests check table pointers remain stable across prefill/decode and that conversion
+rebuilds correct values.
+
+## KV ownership and validation boundaries
+
+Each forward constructs replacement contiguous K/V tensors without mutating its
+input caches. Per-request outputs own independent storage; retaining one request
+cannot keep an entire previous batch alive through a tensor view. Terminal events
+release its tensors. PyTorch may keep freed storage reserved; `cache_bytes` counts
+live KV tensors, not allocator reservations.
+
+The engine validates user token IDs, context limits, request IDs and sampling
+settings at admission. The loader validates external checkpoint structure. The
+runner checks only cache continuity at its execution boundary. Inner layers trust
+the batch metadata and no longer repeat token, vocabulary, shape, or per-layer
+cache checks. The engine retains the result-key/width contract and the sampler
+retains non-finite/all-masked checks because these detect execution failures.
+
+For numerical tests, `model(1d_token_tensor, cache)` remains a single-sequence
+convenience wrapper around the same packed path. `logits_to_keep=0` returns every
+new row, a positive count returns trailing rows, and `None` skips output logits.
+Production execution passes `ModelBatch` directly.
+
+## Scope and numerical limits
+
+Contiguous KV allocation/copying and padded eager attention are still expensive.
+There is no block allocator, prefix sharing, PagedAttention, FlashAttention, CUDA
+Graph, quantization, or tensor parallelism yet. Batch token budget counts real
+input tokens, whereas memory policy also accounts for padded attention workspace.
+The service uses conservative capacity estimates and real CUDA warmup/peak
+measurements; see [serving](serving.md).
+
+FP32 checks use `atol=2e-4, rtol=2e-5` for the real checkpoint and tighter tolerances
+for tiny models. BF16/FP16 comparisons use the same execution shape as the oracle.
+Changing chunk/batch shapes can change reduced-precision results; bitwise batch
+invariance is not promised. The earlier BF16 seven-token chunk comparison had
+exact native/reference parity for the same shape but up to `3.84375` difference
+versus a full prompt, also present in the oracle. This is why cross-schedule
+correctness diagnosis uses FP32.
+
+## Run
+
+```bash
+uv run ajvllm-generate --prompt "What is the capital of France?"
+uv run ajvllm-generate --dtype float32 --prompt "Explain GQA." --max-tokens 48
+uv run pytest tests/test_qwen2_cuda.py tests/test_batching_cuda.py tests/test_mixed_scheduling_cuda.py -s
+uv run python tests/check_local_batch.py
+```
+
+CUDA is mandatory. `AJVLLM_TEST_MODEL` overrides the local test checkpoint path;
+checkpoint-specific EOS expectations still target Qwen2.5-0.5B-Instruct. The
+original CPU synthetic runner, tests, demo and configuration have been deleted.
