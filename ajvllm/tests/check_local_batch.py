@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import torch
+from model_inputs import forward_tokens
 
 from ajvllm.execution.qwen2 import Qwen2Runner
 from ajvllm.scheduling.batch import Phase, ScheduledRequest, SchedulerOutput
@@ -23,7 +24,7 @@ def main():
     runner = Qwen2Runner.from_directory("model/Qwen2.5-0.5B-Instruct", dtype=torch.float32)
     sequences = [(1, 2, 3, 4, 5, 6, 7, 8), (2, 3, 4, 5), (3, 4, 5, 6, 7, 8)]
     with torch.inference_mode():
-        runner._caches["2"] = runner.model(torch.tensor(sequences[2][:-1], device="cuda")).cache
+        runner._caches["2"] = forward_tokens(runner.model, torch.tensor(sequences[2][:-1], device="cuda")).caches[0]
         plan = SchedulerOutput(
             (
                 ScheduledRequest("0", sequences[0], 0, Phase.PREFILL, True),
@@ -34,8 +35,8 @@ def main():
         actual = runner.execute(plan)
         errors = []
         for row, sequence in enumerate(sequences):
-            expected = runner.model(torch.tensor(sequence, device="cuda"), logits_to_keep=1).logits[-1]
-            logits = torch.tensor(actual[str(row)], device="cuda")
+            expected = forward_tokens(runner.model, torch.tensor(sequence, device="cuda"), logits_to_keep=1).logits[-1]
+            logits = actual[str(row)]
             torch.testing.assert_close(logits, expected, atol=2e-4, rtol=2e-5)
             errors.append((logits - expected).abs().max().item())
             runner.release(str(row))

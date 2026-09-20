@@ -75,12 +75,21 @@ class Attention(nn.Module):
             for row, length in enumerate(batch.context_lengths)
         )
         groups = config.num_attention_heads // config.num_key_value_heads
-        repeated_keys = keys.repeat_interleave(groups, dim=1)
-        repeated_values = values.repeat_interleave(groups, dim=1)
-        scores = torch.matmul(queries, repeated_keys.transpose(-1, -2)) * config.head_dim**-0.5
+        # Put each KV head's query-head group into the GEMM query dimension.
+        # This shares K/V directly instead of materializing one copy per query head.
+        grouped_queries = queries.view(
+            batch.num_requests, config.num_key_value_heads, groups * batch.max_query_len, config.head_dim
+        )
+        scores = torch.matmul(grouped_queries, keys.transpose(-1, -2)) * config.head_dim**-0.5
+        scores = scores.view(batch.num_requests, config.num_attention_heads, batch.max_query_len, batch.max_context_len)
         scores.masked_fill_(batch.causal_mask, torch.finfo(scores.dtype).min)
         probabilities = F.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        attended = torch.matmul(probabilities, repeated_values)
+        grouped_probabilities = probabilities.view(
+            batch.num_requests, config.num_key_value_heads, groups * batch.max_query_len, batch.max_context_len
+        )
+        attended = torch.matmul(grouped_probabilities, values).view(
+            batch.num_requests, config.num_attention_heads, batch.max_query_len, config.head_dim
+        )
         packed = attended[batch.sequence_ids, :, batch.query_offsets].reshape(count, config.hidden_size)
         return self.o_proj(packed), present
 

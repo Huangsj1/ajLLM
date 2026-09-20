@@ -30,7 +30,7 @@ src/ajvllm/
   requests/              mutable lifecycle and immutable output events
   engine/                admission, execution, sampling, stop checks, cleanup
   scheduling/            token-budget policy and immutable execution plans
-  sampling/              parameter validation and reference logits sampling
+  sampling/              parameter validation and batched CUDA sampling
   execution/             runner protocol, packed batch metadata, and CUDA Qwen runner
   tokenization/          token/text protocol and local Qwen chat tokenizer
   workflows/             CUDA text generation and persistent server entry points
@@ -65,7 +65,7 @@ flowchart LR
 The engine owns requests and their independent random generators. The scheduler
 selects work and admits requests; it never samples, modifies progress counters,
 or knows physical KV addresses. The runner owns execution state and returns
-logits keyed by request ID, only where the plan requests sampling. One batch is
+CUDA logits keyed by request ID, only where the plan requests sampling. One batch is
 in flight at a time. Public methods are single-threaded; callers may submit or
 cancel between `step()` calls. The asynchronous server serializes admission/cancellation commands
 into this loop and offloads model steps to one dedicated execution thread.
@@ -166,16 +166,31 @@ compatibility or copy their implementation.
 
 ## Sampling
 
-The CPU sampler applies repetition penalty to prompt and generated token IDs,
-then presence/frequency penalties to generated-token counts, then minimum-length
-stop suppression. Greedy decoding (`temperature=0`) chooses the smallest token ID
-on a tie. Otherwise apply temperature, top-k, then top-p (keeping the first token
-that crosses cumulative probability p), normalize, and draw with the request RNG.
-`top_k=0` means disabled. Returned log probability describes the final filtered
-sampling distribution, with greedy log probability zero. Negative infinity masks
-tokens; NaN, positive infinity, empty or fully masked distributions fail clearly.
-Independent RNG streams ensure unrelated batching does not perturb seeded draws.
-The reference algorithm favors readability over large-vocabulary performance.
+The runner only computes CUDA logits. The engine checks the result IDs and shapes,
+then calls one CUDA sampler for all sampling-ready requests. There are no greedy
+or CPU-fallback branches in the engine or runner.
+
+The sampler stacks GPU rows and applies repetition penalty to prompt/generated
+IDs, then presence/frequency penalties using generated-token counts, then masks
+EOS and explicit stop IDs until `min_tokens` is reached. Counts, penalties, masks,
+temperature, stable sorting, top-k/top-p filtering, normalization, inverse-CDF
+selection, and selected-token log probabilities use CUDA tensors. `top_k=0` means
+unlimited. Top-p retains the token crossing the cumulative threshold.
+
+All requests follow the same distribution pipeline. `temperature=0` is represented
+as top-k=1 with unit temperature; stable sorting chooses the smallest token ID on
+ties. No argmax fast path or CPU sampler is retained. NaN, positive infinity and
+all-masked distributions fail the whole batch before token outputs are committed.
+Only a compact `[batch, 3]` packet (token ID, log probability, invalid flag) is
+copied to the host; full logits never leave the GPU. Python loops assemble history
+metadata and request-local RNG draws, not vocabulary-wide sampling calculations.
+
+Each request lazily owns a CUDA `torch.Generator`, seeded independently. Identical
+logits/policies and draw counts produce the same request-local stream irrespective
+of batch membership/order. This replaces Python RNG: seeded outputs are not promised
+to match the old implementation, other devices, or changed floating-point model
+execution shapes. Sampling arithmetic uses FP32. Custom sampling kernels are a
+future optimization behind this interface.
 
 ## Stage 2a: Qwen2.5 baseline (implemented)
 
@@ -299,11 +314,24 @@ KV occupancy, cache hit rate, preemptions, p50/p95/p99 inter-token latency, and
 throughput belong to later trace/GPU benchmarks. Current correctness tests and
 server smoke checks are not throughput benchmarks.
 
-## Mixed execution
+## Implementation refinements
 
-Each nonempty scheduler output becomes one packed `ModelBatch`. Prefill chunks
-and decode tokens share projections and one model invocation. Eager attention
-currently pads queries and contexts; future variable-length attention kernels
-can remove this padding without changing the engine's batching contract.
-See [packed batching](../batching.md). Default tests use tiny CUDA models;
-large local-model tests require explicit selection.
+- Mixed batching: separate whole-model prefill/decode launches duplicated work.
+  Each schedule now produces one packed `ModelBatch`; eager attention still pads
+  query/context dimensions. Future kernels can remove padding behind that interface.
+- RoPE and loading: cached rotary tables avoid per-forward trigonometry; shared
+  tied-parameter allocation avoids a transient duplicate embedding/head allocation.
+- Sampling: full CPU vocabulary sorting caused large host stalls. A greedy-only
+  CUDA shortcut improved that case but complicated engine dispatch and left other
+  policies on CPU. The current unified CUDA sampler handles all policies and moves
+  only selected results back to the host. Legacy CPU/GPU comparison scripts were
+  removed after validation; correctness tests remain.
+- GQA: grouped QK/PV matmuls share K/V directly rather than repeating them per query
+  head. A bounded earlier experiment reduced live peak allocations by about 16 MiB;
+  repeated measurements did not establish a reliable throughput gain. The capacity
+  estimate keeps a conservative workspace reserve.
+
+With `--profile-steps`, cumulative stage times cover preparation, model forward,
+CUDA sampling, and compact result transfer. Normal execution adds no profiling
+synchronizations. Allocated/reserved memory is reported separately from device-wide
+nvidia-smi memory. See [benchmarking](../benchmarking.md) for metric definitions.

@@ -1,6 +1,7 @@
 """A persistent async control loop with one dedicated model-execution thread."""
 
 import asyncio
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 
@@ -47,10 +48,19 @@ class RequestStream:
 
 class EngineService:
     def __init__(
-        self, engine: Engine, budget: MemoryBudget | None = None, *, max_pending_requests=128, stream_capacity=128
+        self,
+        engine: Engine,
+        budget: MemoryBudget | None = None,
+        *,
+        max_pending_requests=128,
+        stream_capacity=128,
+        profile_steps=False,
     ):
         if max_pending_requests < 1 or stream_capacity < 1:
             raise ValueError("queue limits must be positive")
+        self.profile_steps = profile_steps
+        engine._sampler.profile_enabled = profile_steps
+        engine.runner.profile_enabled = profile_steps
         self.engine = engine
         self.budget = budget
         self.max_pending_requests = max_pending_requests
@@ -62,7 +72,21 @@ class EngineService:
         self.task = None
         self.closing = False
         self.failure: str | None = None
-        self.stats = {}
+        self.step_timing = {kind: {"steps": 0, "total_s": 0.0} for kind in ("prefill", "decode", "mixed")}
+        model = engine.runner.model
+        self.metadata = {
+            "resolved_engine": asdict(engine.config),
+            "model_config": asdict(model.config),
+            "dtype": str(model.dtype),
+            "device": str(model.device),
+            "gpu_name": torch.cuda.get_device_name(model.device),
+            "torch_version": torch.__version__,
+        }
+        self.stats = {
+            **self.metadata,
+            "profile_steps": self.profile_steps,
+            "memory": self.budget.snapshot() if self.budget else None,
+        }
 
     async def start(self):
         if self.task is None:
@@ -149,12 +173,22 @@ class EngineService:
     def _step(self):
         if self.budget:
             self.budget.before_step(self.engine)
+        if self.profile_steps:
+            torch.cuda.synchronize(self.engine.runner.model.device)
+        started = time.perf_counter()
         try:
             outputs = self.engine.step()
         except EngineExecutionError as exc:
             if self.budget and isinstance(exc.__cause__, torch.cuda.OutOfMemoryError):
                 self.budget.on_oom()
             outputs = list(exc.outputs)
+        phases = {item.phase.value for item in self.engine.last_batch.requests}
+        if phases and self.profile_steps:
+            torch.cuda.synchronize(self.engine.runner.model.device)
+            kind = next(iter(phases)) if len(phases) == 1 else "mixed"
+            measurement = self.step_timing[kind]
+            measurement["steps"] += 1
+            measurement["total_s"] += time.perf_counter() - started
         if self.budget:
             self.budget.after_step(self.engine)
         return outputs
@@ -164,9 +198,10 @@ class EngineService:
         try:
             running = True
             while running:
+                # wait for a command if there are no unfinished requests
                 if not self.engine.has_unfinished_requests and self.commands.empty():
                     running = self._command(await self.commands.get())
-                # Bound admission work so a flood cannot starve model execution.
+                # handle all pending commands, up to the max_pending_requests limit
                 for _ in range(self.max_pending_requests):
                     if not running or self.commands.empty():
                         break
@@ -177,7 +212,21 @@ class EngineService:
                     for output in await loop.run_in_executor(self.executor, self._step):
                         self._publish(output)
                     self.stats = {
+                        **self.metadata,
                         "engine": asdict(self.engine.metrics),
+                        "stage_seconds": dict(self.engine.runner.stage_seconds)
+                        | dict(self.engine._sampler.stage_seconds),
+                        "transfer_bytes": self.engine._sampler.transfer_bytes,
+                        "allocator": {
+                            "allocated_bytes": torch.cuda.memory_allocated(self.engine.runner.model.device),
+                            "reserved_bytes": torch.cuda.memory_reserved(self.engine.runner.model.device),
+                            "peak_allocated_bytes": torch.cuda.max_memory_allocated(self.engine.runner.model.device),
+                            "peak_reserved_bytes": torch.cuda.max_memory_reserved(self.engine.runner.model.device),
+                        },
+                        "profile_steps": self.profile_steps,
+                        "step_timing": {key: dict(value) for key, value in self.step_timing.items()}
+                        if self.profile_steps
+                        else {},
                         "active_requests": self.engine.num_unfinished_requests,
                         "token_budget": self.engine.token_budget,
                         "memory": self.budget.snapshot() if self.budget else None,

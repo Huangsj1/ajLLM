@@ -11,12 +11,6 @@ from ajvllm.modeling.qwen2.layers import DecoderLayer, RMSNorm, rotary_factors
 
 
 @dataclass(frozen=True)
-class ModelOutput:
-    logits: torch.Tensor | None
-    cache: KVCache
-
-
-@dataclass(frozen=True)
 class BatchOutput:
     logits: torch.Tensor | None
     caches: tuple[KVCache, ...]
@@ -66,22 +60,8 @@ class Qwen2ForCausalLM(nn.Module):
         return self.model.embed_tokens.weight.dtype
 
     @torch.inference_mode()
-    def forward(
-        self, input_ids: torch.Tensor | ModelBatch, cache: KVCache | None = None, *, logits_to_keep: int | None = 0
-    ) -> ModelOutput | BatchOutput:
-        """The runner passes ModelBatch; a 1D tensor remains a numerical-reference convenience."""
-        single = isinstance(input_ids, torch.Tensor)
-        if single:
-            if input_ids.ndim != 1 or not input_ids.numel():
-                raise ValueError("input_ids must be a nonempty 1D tensor")
-            batch = ModelBatch.build([input_ids], [cache], self.device, [])
-            if batch.max_context_len > self.config.max_position_embeddings:
-                raise ValueError("input exceeds checkpoint context length")
-            if logits_to_keep is not None:
-                start = 0 if logits_to_keep == 0 else max(0, input_ids.numel() - logits_to_keep)
-                batch.sample_indices = torch.arange(start, input_ids.numel(), device=self.device)
-        else:
-            batch = input_ids
+    def forward(self, batch: ModelBatch) -> BatchOutput:
+        """Execute all scheduled tokens through one packed model path."""
         x = self.model.embed_tokens(batch.token_ids)
         factors = self.rope_cos[batch.positions], self.rope_sin[batch.positions]
         layers = []
@@ -92,4 +72,4 @@ class Qwen2ForCausalLM(nn.Module):
         if batch.sample_indices.numel():
             logits = self.lm_head(self.model.norm(x[batch.sample_indices])).float()
         caches = tuple(tuple(layer[row] for layer in layers) for row in range(batch.num_requests))
-        return ModelOutput(logits, caches[0]) if single else BatchOutput(logits, caches)
+        return BatchOutput(logits, caches)

@@ -10,7 +10,7 @@ independent CUDA test oracle.
 
 ```bash
 uv sync --locked --extra dev
-uv run ajvllm-serve --gpu-memory-utilization 0.7 --initial-token-budget 32
+uv run ajvllm-serve --gpu-memory-utilization 0.7
 ```
 
 The default model is `model/Qwen2.5-0.5B-Instruct`, device `cuda:0`, dtype BF16,
@@ -64,13 +64,14 @@ remaining prefill budget. It executes **one packed mixed `ModelBatch` forward pe
 Prefill chunks and decode tokens share the same model call. Embeddings, QKV/output projections,
 MLPs, and selected output logits operate on packed tensors. Eager attention uses
 batched matrix multiplications with padding masks and per-request causal offsets.
+Grouped QK/PV matmuls share K/V without replicating them for every query head.
 Loops over requests only pack/unpack their contiguous KV tensors; they never invoke
 separate model or attention forwards. RoPE tables are precomputed and indexed.
 
 This is a readable GPU baseline, not a paged or FlashAttention implementation.
-Padded attention workspace and KV copying still have costs. Sampling remains a
-host reference implementation after one bulk logits transfer; the removed CPU
-artifacts were the synthetic backend/tests, not the host control plane.
+Padded attention workspace and KV copying still have costs. All sampling policies
+use one batched CUDA tensor pipeline, including penalties, masks, temperature,
+top-k/top-p and random selection. Only selected results return to the host.
 
 Public imports remain `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Configuration lives in `config/`, lifecycle types in `requests/`, tokenizer/chat
@@ -78,5 +79,15 @@ handling in `tokenization/`, and runtime memory policy in `runtime/`. Future mem
 kernel, quantization, and distributed directories remain reserved.
 
 See [architecture](docs/architecture/architecture.md), [model execution](docs/model_baseline.md),
-[packed batching](docs/batching.md), and [serving](docs/serving.md)
+[serving](docs/serving.md), and [benchmarking](docs/benchmarking.md)
 for algorithms, limitations, and validation records.
+
+## Service performance measurements
+
+Start with `uv run ajvllm-serve --config configs/engine/benchmark.toml --profile-steps`.
+In another terminal run `uv run ajvllm-benchmark --concurrency 4 --requests 24`.
+The default dataset has 12 long prompts (about 1024/2048/3072 tokens), with 64
+output tokens per request. Reports include TTFT, decode duration, TPOT, throughput
+and GPU utilization, saved under `benchmarks/results/`.
+See [benchmarking](docs/benchmarking.md) for memory expectations, comparison settings,
+and sampling controls.

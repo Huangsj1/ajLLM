@@ -1,8 +1,9 @@
 """Internal request state and detached, immutable streaming events."""
 
-import random
 from dataclasses import dataclass, field
 from enum import StrEnum
+
+import torch
 
 from ajvllm.sampling.params import SamplingParams
 
@@ -34,10 +35,7 @@ class Request:
     status: RequestStatus = RequestStatus.WAITING
     first_token_time: float | None = None
     finish_time: float | None = None
-    rng: random.Random = field(init=False, repr=False)
-
-    def __post_init__(self) -> None:
-        self.rng = random.Random(self.sampling_params.seed)
+    rng: torch.Generator | None = field(default=None, repr=False)
 
     @property
     def num_tokens(self) -> int:

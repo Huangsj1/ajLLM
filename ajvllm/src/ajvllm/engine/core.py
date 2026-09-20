@@ -41,7 +41,7 @@ class Engine:
         self._sampler = Sampler()
         self._clock = clock
         self._metrics = EngineMetrics()
-        self._pending_outputs: deque[RequestOutput] = deque()       # unexpected outputs
+        self._pending_outputs: deque[RequestOutput] = deque()  # unexpected outputs
         self._closed = False
         self.last_batch = SchedulerOutput()
 
@@ -161,27 +161,15 @@ class Engine:
         self._metrics.scheduled_prefill_tokens += sum(i.num_tokens for i in batch.requests if i.phase == Phase.PREFILL)
         self._metrics.scheduled_decode_tokens += sum(i.num_tokens for i in batch.requests if i.phase == Phase.DECODE)
         try:
-            # 2. Execute the model for all scheduled requests in the batch
+            # 2. execute the model
             logits = self.runner.execute(batch)
-            expected = {item.request_id for item in batch.requests if item.do_sample}
-            if set(logits) != expected:
+            ready = [self._scheduler.requests[item.request_id] for item in batch.requests if item.do_sample]
+            if set(logits) != {request.request_id for request in ready}:
                 raise ValueError("runner logits keys do not match sampling-ready request IDs")
-            samples = {}
-            for item in batch.requests:
-                if item.do_sample:
-                    request = self._scheduler.requests[item.request_id]
-                    row = logits[item.request_id]
-                    if len(row) != self.runner.vocab_size:
-                        raise ValueError("runner logits width does not match vocabulary")
-                    # 3. Sample the next token for each request that is ready to sample
-                    samples[item.request_id] = self._sampler.sample(
-                        row,
-                        request.sampling_params,
-                        request.rng,
-                        request.prompt_token_ids,
-                        request.output_token_ids,
-                        self.eos_token_ids,
-                    )
+            if any(row.shape != (self.runner.vocab_size,) for row in logits.values()):
+                raise ValueError("runner logits width does not match vocabulary")
+            # 3. sample the next token for each request that is ready to decode
+            samples = self._sampler.sample(logits, ready, self.eos_token_ids)
         except Exception as exc:
             errors = tuple(
                 self._finish(self._scheduler.requests[item.request_id], FinishReason.ERROR, error=str(exc))

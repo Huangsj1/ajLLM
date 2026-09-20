@@ -7,8 +7,7 @@ uv sync --locked --extra dev
 uv run ajvllm-serve \
   --model model/Qwen2.5-0.5B-Instruct \
   --config configs/engine/qwen2.toml \
-  --gpu-memory-utilization 0.7 \
-  --initial-token-budget 32
+  --gpu-memory-utilization 0.7
 ```
 
 The default bind address is `127.0.0.1:8000`. Options also include `--host`, `--port`,
@@ -106,9 +105,11 @@ then the token-budget ceiling. It rejects a target that cannot fit even one
 full-context request. The resolved configuration is printed so these reductions
 are visible. The configured `max_model_len` is never silently shortened.
 
-Startup executes a small real CUDA warmup and records its allocation peak. It
-halves the probe budget on OOM or a peak above the target. Runtime begins at
-`min(initial_token_budget, safe_ceiling)`. Every eight successful saturated steps,
+The server uses TOML `max_num_batched_tokens` as the requested initial budget;
+there is no separate startup-budget CLI option. The memory estimate first lowers
+it to a safe ceiling. CUDA warmup then records the allocation peak and halves the
+budget on OOM or a peak above the target. Runtime starts with the resulting budget.
+Every eight successful saturated steps,
 it can double the budget if both measured memory and the conservative estimate
 leave headroom. It never exceeds the configured/safe ceiling. A low-traffic service
 may use far less than the specified fraction; it does not create artificial work
@@ -139,36 +140,18 @@ by [vLLM optimization guidance](https://docs.vllm.ai/en/latest/configuration/opt
 The current contiguous-KV estimator will be replaced with block accounting in
 the memory optimization stage.
 
-## Validation on RTX 3080 Ti
+## Metrics and validation
 
-Final regression on 2026-09-19: `uv run pytest -s` passed all 49 CUDA-required
-tests in 14.87 seconds. Ruff lint and formatting checks also passed.
+Memory snapshots include MiB/GiB display fields alongside raw byte counts.
+HTTP generation events expose relative durations in `timing`, including numeric
+`*_s` values and human-readable seconds. `--profile-steps` enables synchronized
+prefill/decode/mixed step measurements plus preparation, model, CUDA sampling,
+and compact result transfer times. Sampling always executes on CUDA; no sampling
+backend selector is needed.
 
-The CUDA tests cover ragged mixed batches and one-call-per-step projection assertions,
-MHA/GQA/MQA numerical parity, chunk sizes above/below token budgets, budget=1,
-sequence limits, multi-iteration prefill, decode rotation after budget reduction,
-EOS/minimum/context boundaries, cancellation, failed batches, and cache release.
-
-Async service tests send requests while a real GPU forward is in flight, verify
-idle wakeup, cancel waiting/running work, saturate request/output queues, reuse
-request IDs, and verify graceful shutdown. A real TCP HTTP/SSE test uses an
-ephemeral localhost port and verifies disconnect cancellation. All model work
-uses CUDA; there are no synthetic CPU fallback tests.
-
-On 2026-09-19, the installed server was also started with the local BF16
-Qwen2.5-0.5B-Instruct checkpoint, utilization 0.55 and initial token budget 4.
-Two concurrent HTTP chat requests returned:
-
-- `The capital of France is Paris.`
-- `Two planets that I can name are Earth and Mars.`
-
-The budget grew from 4 to 8. PyTorch's observed allocation peak was 1,027,594,240
-bytes (about 0.96 GiB), below the 6,549,536,768-byte target after the safety reserve.
-Both requests completed, active request count returned to zero, and the temporary
-server was shut down. This validates behavior, not peak throughput or target-fill
-performance.
-
-The earlier 49-test run above is a historical validation record. Current default tests
-exclude real-checkpoint fixtures to keep WSL memory use low. Run small CUDA test
-files serially; `tests/check_local_batch.py` loads only one real model and uses
-contexts of at most eight tokens. See [packed batching](batching.md).
+Default tests use small CUDA models and exclude heavyweight checkpoint fixtures.
+Run test files serially. They cover chunking, mixed batching, sampling policies,
+request arrival during execution, cancellation, backpressure and HTTP streaming.
+`tests/check_local_batch.py` is an optional single-checkpoint numerical check with
+contexts of at most eight tokens. The [benchmark workflow](benchmarking.md)
+describes reusable datasets, configurable concurrency and comparison methodology.

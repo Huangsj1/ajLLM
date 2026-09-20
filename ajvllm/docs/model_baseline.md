@@ -23,7 +23,7 @@ and [reference implementation](https://github.com/huggingface/transformers/blob/
 invokes the model once. Prefill chunks and decode tokens share packed projections,
 attention, and MLP operations. An empty schedule does not launch the model.
 
-See [packed batching](batching.md) for scheduling and future kernel boundaries.
+See [architecture](architecture/architecture.md) for scheduling and future kernel boundaries.
 The eager attention backend still pads mixed query/context lengths; variable-length
 and paged kernels are planned behind the same packed model interface.
 
@@ -40,8 +40,10 @@ and paged kernels are planned behind the same packed model interface.
 
 For each layer, Q/K/V are projected for all T tokens together. Cached tensors are
 copied into padded batch buffers, and new K/V are scattered to their absolute
-positions. Attention then uses one batched QK multiplication, softmax, and batched
-PV multiplication. The result is gathered back to T packed rows before the output
+positions. Query heads sharing one KV head are folded into the query dimension
+for batched QK/PV multiplications; K/V are no longer replicated with
+`repeat_interleave`. Scores are reshaped back to query-head layout for causal
+masking and softmax. The result is gathered back to T packed rows before the output
 projection and MLP. Python loops only move cache data and assemble metadata; they
 do not evaluate a model or attention function per request.
 
@@ -53,9 +55,11 @@ with independent full-context Transformers outputs and assert exactly one model
 and projection call per scheduler step.
 
 Partial prefill has no sampling row. Only requests that finish their available
-input contribute a final hidden row to the head. Selected logits are copied
-back to the host once per batch for the sampler. `temperature=0` and stochastic
-sampling use the same request-specific policy as before.
+input contribute a final hidden row to the LM head. The runner returns CUDA
+tensors keyed by request ID. The sampler applies all policies on GPU; only selected
+token IDs, log probabilities and validity flags return to the host. There is no
+CPU sampling fallback or special greedy dispatch in the engine. See the
+[sampling contract](architecture/architecture.md#sampling) for filtering and RNG rules.
 
 ## RoPE tables
 
@@ -86,17 +90,17 @@ the batch metadata and no longer repeat token, vocabulary, shape, or per-layer
 cache checks. The engine retains the result-key/width contract and the sampler
 retains non-finite/all-masked checks because these detect execution failures.
 
-For numerical tests, `model(1d_token_tensor, cache)` remains a single-sequence
-convenience wrapper around the same packed path. `logits_to_keep=0` returns every
-new row, a positive count returns trailing rows, and `None` skips output logits.
-Production execution passes `ModelBatch` directly.
+`Qwen2ForCausalLM.forward` accepts only `ModelBatch` and returns `BatchOutput`.
+Numerical tests explicitly build packed inputs and select sampling indices for
+all-token comparisons; there is no single-tensor path in the production model.
 
 ## Scope and numerical limits
 
 Contiguous KV allocation/copying and padded eager attention are still expensive.
 There is no block allocator, prefix sharing, PagedAttention, FlashAttention, CUDA
 Graph, quantization, or tensor parallelism yet. Batch token budget counts real
-input tokens, whereas memory policy also accounts for padded attention workspace.
+input tokens, whereas memory policy also accounts for padded attention workspace
+and the general sampler's score, sorting, probability and history buffers.
 The service uses conservative capacity estimates and real CUDA warmup/peak
 measurements; see [serving](serving.md).
 

@@ -30,6 +30,7 @@ dev = [
 ]
 
 [project.scripts]
+ajvllm-benchmark = "ajvllm.workflows.benchmark:main"
 ajvllm-serve = "ajvllm.workflows.serve:main"
 ajvllm-generate = "ajvllm.workflows.generate:main"
 

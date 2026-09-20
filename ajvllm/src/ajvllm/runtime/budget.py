@@ -13,12 +13,12 @@ from ajvllm.execution.qwen2 import Qwen2Runner
 class BudgetStats:
     total_bytes: int
     target_bytes: int
-    baseline_bytes: int
-    profile_peak_bytes: int = 0
-    observed_peak_bytes: int = 0
-    token_budget: int = 1           # current token budget for the next step
-    token_ceiling: int = 1          # maximum token budget allowed by the memory target
-    max_num_seqs: int = 1           # maximum number of sequences allowed by the memory target
+    baseline_bytes: int                 # memory used by model weights and static buffers
+    profile_peak_bytes: int = 0         # peak memory observed during warmup
+    observed_peak_bytes: int = 0        # peak memory observed during runtime
+    token_budget: int = 1  # current token budget for the next step
+    token_ceiling: int = 1  # maximum token budget allowed by the memory target
+    max_num_seqs: int = 1  # maximum number of sequences allowed by the memory target
 
 
 class MemoryBudget:
@@ -34,8 +34,8 @@ class MemoryBudget:
         config: EngineConfig,
         *,
         gpu_memory_utilization: float = 0.5,
-        initial_token_budget: int = 32,
-        safety_bytes: int = 512 * 1024**2,
+        initial_token_budget: int = 4096,
+        safety_bytes: int = 512 * 1024**2,  # 512 MB
         growth_interval: int = 8,
     ):
         if not 0 < gpu_memory_utilization < 1 or initial_token_budget < 1 or growth_interval < 1 or safety_bytes < 0:
@@ -58,13 +58,14 @@ class MemoryBudget:
             slots -= 1
         if self.estimate(slots, 1) > target:
             raise MemoryError("memory target cannot fit weights, one full-context request, and workspace")
-        # 2. max_num_batched_tokens(total budget): the number of tokens that can be admitted without exceeding the memory target
+        # 2. max_num_batched_tokens: tokens admitted without exceeding the memory target.
         ceiling = config.max_num_batched_tokens
         while ceiling > 1 and self.estimate(slots, ceiling) > target:
             ceiling = max(1, ceiling // 2)
         self.config = replace(config, max_num_seqs=slots, max_num_batched_tokens=ceiling)
         self.stats.max_num_seqs, self.stats.token_ceiling = slots, ceiling
         self.stats.token_budget = min(initial_token_budget, ceiling)
+        # use maximum admitted batch to warm up the model and measure peak memory usage
         self._warmup()
 
     def estimate(self, slots: int, tokens: int) -> int:
@@ -78,17 +79,24 @@ class MemoryBudget:
         kv_per_token = 2 * cfg.num_hidden_layers * cfg.num_key_value_heads * cfg.head_dim * size
         # Old + replacement caches plus packing; reserve all admitted requests to their context limit.
         kv = 3 * slots * context * kv_per_token
-        repeated_kv = 2 * slots * context * cfg.hidden_size * size
+        # Retain the earlier expanded-KV-sized reserve for backend workspace.
+        # Grouped eager GQA no longer allocates repeated K/V, but removing this
+        # safety margin should follow capacity profiling on longer workloads.
+        workspace_reserve = 2 * slots * context * cfg.hidden_size * size
         # Mixed batches pad every request to the largest query/context dimensions,
         # including decode rows. Reserve that workspace even when prefill is capped.
         attention = min(slots, tokens) * cfg.num_attention_heads * query * context * (3 * size + 4)
         activations = tokens * (8 * cfg.hidden_size + 4 * cfg.intermediate_size) * size
-        logits = slots * cfg.vocab_size * (size + 4)
-        return self.stats.baseline_bytes + kv + repeated_kv + attention + activations + logits
+        # General CUDA sampling keeps FP32 scores/probabilities/CDFs, history
+        # buffers, int64 sorted IDs and sorting workspace on device.
+        logits = slots * cfg.vocab_size * 64
+        return self.stats.baseline_bytes + kv + workspace_reserve + attention + activations + logits
 
     @torch.inference_mode()
     def _warmup(self) -> None:
-        # Small real CUDA probes. Never fill the GPU to discover its failure limit.
+        '''Warm up the model with a single forward pass of the maximum admitted batch.
+        If the warmup fits within the memory target, we can use the current token budget.
+        If the warmup exceeds the memory target, halve the token budget and try again, until we reach the minimum of 1 token.'''
         while True:
             try:
                 budget = min(
@@ -96,19 +104,25 @@ class MemoryBudget:
                 )
                 slots = min(self.config.max_num_seqs, budget)
                 chunk = min(self.config.max_model_len, self.config.max_prefill_chunk_size or budget)
+                # Warmup with a single forward pass of the maximum admitted batch.
                 sequences = [[0] * min(chunk, budget // slots + (row < budget % slots)) for row in range(slots)]
                 torch.cuda.reset_peak_memory_stats(self.device)
+                # 1.prefill
                 output = self.runner.model(ModelBatch.build(sequences, [None] * slots, self.device, range(slots)))
+                # if prefill requests length is less than max_model_len, run a decode step
                 if max(map(len, sequences)) < self.config.max_model_len:
                     caches = output.caches
                     del output
+                    # 2.decode
                     output = self.runner.model(ModelBatch.build([[0]] * slots, caches, self.device, range(slots)))
                     del caches
                 torch.cuda.synchronize(self.device)
                 self.stats.profile_peak_bytes = torch.cuda.max_memory_allocated(self.device)
                 del output
+                # If the warmup fits within the memory target, we can use the current token budget.
                 if self.stats.profile_peak_bytes <= self.stats.target_bytes:
                     return
+            # if OOM, halve the token budget and try again, until we reach the minimum of 1 token
             except torch.cuda.OutOfMemoryError:
                 pass
             if self.stats.token_budget == 1:

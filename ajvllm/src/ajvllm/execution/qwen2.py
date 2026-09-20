@@ -1,6 +1,8 @@
 """CUDA Qwen2 runner with private contiguous KV per request."""
 
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import torch
@@ -37,6 +39,21 @@ class Qwen2Runner:
         self.max_model_len = model.config.max_position_embeddings
         self.eos_token_ids = tuple(eos_token_ids)
         self._caches: dict[str, KVCache] = {}
+        self.profile_enabled = False
+        self.stage_seconds = {key: 0.0 for key in ("prepare", "model")}
+
+    @contextmanager
+    def _stage(self, name):
+        if not self.profile_enabled:
+            yield
+            return
+        torch.cuda.synchronize(self.model.device)
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            torch.cuda.synchronize(self.model.device)
+            self.stage_seconds[name] += time.perf_counter() - started
 
     @classmethod
     def from_directory(
@@ -65,7 +82,7 @@ class Qwen2Runner:
         return 0 if cache is None else cache[0][0].shape[1]
 
     @torch.inference_mode()
-    def execute(self, batch: SchedulerOutput) -> dict[str, list[float]]:
+    def execute(self, batch: SchedulerOutput) -> dict[str, torch.Tensor]:
         # Admission validates tokens and the scheduler constructs valid slices. The
         # runner checks only the cache-continuity contract across this boundary.
         for item in batch.requests:
@@ -75,18 +92,19 @@ class Qwen2Runner:
             return {}
         # All scheduled slices share one packed model forward.
         sampling_rows = [row for row, item in enumerate(batch.requests) if item.do_sample]
-        inputs = ModelBatch.build(
-            [item.token_ids for item in batch.requests],
-            [self._caches.get(item.request_id) for item in batch.requests],
-            self.model.device,
-            sampling_rows,
-        )
-        output = self.model(inputs)
+        with self._stage("prepare"):
+            inputs = ModelBatch.build(
+                [item.token_ids for item in batch.requests],
+                [self._caches.get(item.request_id) for item in batch.requests],
+                self.model.device,
+                sampling_rows,
+            )
+        with self._stage("model"):
+            output = self.model(inputs)
         self._caches.update((item.request_id, cache) for item, cache in zip(batch.requests, output.caches, strict=True))
         if output.logits is None:
             return {}
-        rows = output.logits.cpu().tolist()
-        return {batch.requests[index].request_id: logits for index, logits in zip(sampling_rows, rows, strict=True)}
+        return {batch.requests[index].request_id: row for index, row in zip(sampling_rows, output.logits, strict=True)}
 
     def release(self, request_id: str) -> None:
         self._caches.pop(request_id, None)

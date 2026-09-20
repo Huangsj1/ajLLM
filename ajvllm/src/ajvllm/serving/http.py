@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 
 from ajvllm import SamplingParams
+from ajvllm.serving.presentation import memory_display, request_timing
 from ajvllm.serving.service import EngineService, ServiceBusy
 from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 
@@ -45,7 +46,7 @@ def create_app(service: EngineService, tokenizer: Qwen2Tokenizer) -> FastAPI:
     async def health():
         if service.failure or service.closing:
             raise HTTPException(503, service.failure or "service is stopping")
-        return {"status": "ready", **service.stats}
+        return {"status": "ready", **memory_display(service.stats)}
 
     @app.delete("/requests/{request_id}")
     async def cancel(request_id: str):
@@ -60,7 +61,10 @@ def create_app(service: EngineService, tokenizer: Qwen2Tokenizer) -> FastAPI:
         return tokenizer.encode(body.prompt)
 
     def serialize(output):
-        return asdict(output) | {"text": tokenizer.decode(output.output_token_ids)}
+        data = asdict(output)
+        for key in ("arrival_time", "first_token_time", "finish_time"):
+            data.pop(key)
+        return data | {"text": tokenizer.decode(output.output_token_ids), "timing": request_timing(output)}
 
     @app.post("/generate")
     async def generate(body: GenerationInput, request: Request):

@@ -219,3 +219,62 @@ def test_execution_failure_does_not_stop_service_and_waiting_cancel(runner):
         assert runner.cache_bytes == 0
 
     asyncio.run(scenario())
+
+
+def test_benchmark_streaming_and_timing_on_cuda(runner):
+    from ajvllm.serving.presentation import memory_display
+    from ajvllm.workflows.benchmark import run_benchmark
+
+    async def scenario():
+        service = make_service(runner, profile_steps=True)
+        app = create_app(service, Qwen2Tokenizer("model/Qwen2.5-0.5B-Instruct"))
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        server = uvicorn.Server(uvicorn.Config(app, log_level="error", lifespan="on"))
+        task = asyncio.create_task(server.serve(sockets=[sock]))
+        try:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert server.started
+            report = await asyncio.to_thread(
+                run_benchmark,
+                f"http://127.0.0.1:{port}",
+                [{"id": "short", "token_ids": [1, 2]}, {"id": "chunked", "token_ids": [3] * 9}],
+                requests=4,
+                concurrency=2,
+                max_tokens=3,
+                warmup=1,
+                interval=0.1,
+            )
+            assert report["successful_requests"] == 4 and report["failed_requests"] == 0
+            assert report["output_tokens_per_s"] > 0
+            assert all(row["output_tokens"] == 3 for row in report["requests"])
+            for row in report["requests"]:
+                assert row["latency_s"] >= row["ttft_s"] > 0
+                assert row["tpot_s"] >= 0
+                assert row["server_timing"]["display"]["latency_s"].endswith(" s")
+            assert sum(value["steps"] for value in report["server_steps"].values()) > 0
+            assert report["server_steps"]["prefill"]["total_s"] > 0
+            assert report["gpu"]["samples"] > 0 or report["gpu"]["errors"]
+            # A one-token response has no decode interval or TPOT denominator.
+            one = await asyncio.to_thread(
+                run_benchmark,
+                f"http://127.0.0.1:{port}",
+                [{"token_ids": [1]}],
+                requests=1,
+                concurrency=1,
+                max_tokens=1,
+                warmup=0,
+            )
+            assert one["latency"]["tpot_s"] is None
+            assert memory_display({"target_bytes": 1024**3})["target_display"] == "1.00 GiB"
+        finally:
+            server.should_exit = True
+            await task
+            sock.close()
+        assert runner.cache_bytes == 0
+
+    asyncio.run(scenario())

@@ -1,7 +1,9 @@
 """The only interface the control plane needs from an execution backend."""
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from typing import Protocol
+
+import torch
 
 from ajvllm.scheduling.batch import SchedulerOutput
 
@@ -10,8 +12,8 @@ class ModelRunner(Protocol):
     vocab_size: int
     eos_token_ids: tuple[int, ...]
 
-    def execute(self, batch: SchedulerOutput) -> Mapping[str, Sequence[float]]:
-        """Consume every slice; return one vocabulary row per do_sample entry only.
+    def execute(self, batch: SchedulerOutput) -> Mapping[str, torch.Tensor]:
+        """Consume every slice; return CUDA vocabulary rows for sampling-ready requests.
 
         Positions must continue the previously committed prefix for each request.
         A failed batch may have partially advanced backend state and must be released.

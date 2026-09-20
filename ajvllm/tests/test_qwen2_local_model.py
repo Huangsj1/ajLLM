@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from model_inputs import forward_tokens
 from transformers import AutoModelForCausalLM
 
 from ajvllm import Engine, EngineConfig, SamplingParams
@@ -54,18 +55,18 @@ def tokenizer(checkpoint):
 def test_real_full_chunked_and_forced_decode(models, tokenizer, text):
     native, reference = models
     ids = torch.tensor(tokenizer.encode_chat([{"role": "user", "content": text}]), device="cuda")
-    full = native(ids).logits
+    full = forward_tokens(native, ids).logits
     oracle = reference(ids[None], use_cache=False).logits[0].float()
     torch.testing.assert_close(full, oracle, atol=2e-4, rtol=2e-5)
     cache = None
     hf_cache = None
     rows = []
     for chunk in ids.split(7):
-        out = native(chunk, cache)
+        out = forward_tokens(native, chunk, cache)
         expected = reference(chunk[None], past_key_values=hf_cache, use_cache=True)
         torch.testing.assert_close(out.logits, expected.logits[0].float(), atol=2e-4, rtol=2e-5)
         rows.append(out.logits)
-        cache, hf_cache = out.cache, expected.past_key_values
+        cache, hf_cache = out.caches[0], expected.past_key_values
     chunked = torch.cat(rows)
     torch.testing.assert_close(chunked, full, atol=2e-4, rtol=2e-5)
     print(
@@ -81,11 +82,11 @@ def test_real_full_chunked_and_forced_decode(models, tokenizer, text):
     # Consume identical generated tokens to isolate incremental-forward correctness.
     for _ in range(8):
         token = out.logits[-1].argmax().reshape(1)
-        out = native(token, cache)
+        out = forward_tokens(native, token, cache)
         expected = reference(token[None], past_key_values=hf_cache, use_cache=True)
         torch.testing.assert_close(out.logits, expected.logits[0].float(), atol=2e-4, rtol=2e-5)
         assert out.logits.argmax().item() == expected.logits.argmax().item()
-        cache, hf_cache = out.cache, expected.past_key_values
+        cache, hf_cache = out.caches[0], expected.past_key_values
 
 
 @torch.inference_mode()
@@ -133,17 +134,17 @@ def test_real_bfloat16_matches_oracle_for_same_chunk_schedule(checkpoint, tokeni
     ids = torch.tensor(
         tokenizer.encode_chat([{"role": "user", "content": "What is the capital of France?"}]), device="cuda"
     )
-    full = native(ids).logits
+    full = forward_tokens(native, ids).logits
     oracle = reference(ids[None], use_cache=False).logits[0].float()
     torch.testing.assert_close(full, oracle, atol=0, rtol=0)
     cache = None
     hf_cache = None
     rows = []
     for chunk in ids.split(7):
-        out = native(chunk, cache)
+        out = forward_tokens(native, chunk, cache)
         expected = reference(chunk[None], past_key_values=hf_cache, use_cache=True)
         torch.testing.assert_close(out.logits, expected.logits[0].float(), atol=0, rtol=0)
-        cache, hf_cache = out.cache, expected.past_key_values
+        cache, hf_cache = out.caches[0], expected.past_key_values
         rows.append(out.logits)
     print(
         json.dumps(
@@ -171,7 +172,9 @@ def test_real_packed_mixed_batch_matches_full_oracle(models, tokenizer):
     runner = Qwen2Runner(native)
     for row, start in enumerate(starts):
         if start:
-            runner._caches[str(row)] = native(torch.tensor(prompts[row][:start], device="cuda")).cache
+            runner._caches[str(row)] = forward_tokens(native, torch.tensor(prompts[row][:start], device="cuda")).caches[
+                0
+            ]
     plan = SchedulerOutput(
         tuple(
             ScheduledRequest(str(row), tuple(ids[start:]), start, Phase.DECODE if row == 1 else Phase.PREFILL, True)
@@ -188,6 +191,6 @@ def test_real_packed_mixed_batch_matches_full_oracle(models, tokenizer):
     assert calls[0].num_requests == 3
     for row, ids in enumerate(prompts):
         expected = reference(torch.tensor([ids], device="cuda"), use_cache=False).logits[0, -1].float()
-        torch.testing.assert_close(torch.tensor(actual[str(row)], device="cuda"), expected, atol=2e-4, rtol=2e-5)
+        torch.testing.assert_close(actual[str(row)], expected, atol=2e-4, rtol=2e-5)
         runner.release(str(row))
     assert runner.cache_bytes == 0

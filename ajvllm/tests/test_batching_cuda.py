@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from model_inputs import forward_tokens
 from test_qwen2_cuda import pair, tiny_config
 
 from ajvllm import Engine, EngineConfig, EngineExecutionError, SamplingParams
@@ -30,7 +31,7 @@ def test_ragged_mixed_batch_is_one_forward(models):
     sequences = [[1, 2, 3, 4, 5, 6, 7, 8], [10, 11, 12, 13], [20, 21, 22, 23, 24]]
     starts = [0, 3, 2]
     caches = [
-        None if start == 0 else native(torch.tensor(seq[:start], device="cuda")).cache
+        None if start == 0 else forward_tokens(native, torch.tensor(seq[:start], device="cuda")).caches[0]
         for seq, start in zip(sequences, starts, strict=True)
     ]
     runner = Qwen2Runner(native)
@@ -56,7 +57,7 @@ def test_ragged_mixed_batch_is_one_forward(models):
     assert calls[0].num_requests == 3 and projections == [12]
     for row, seq in enumerate(sequences):
         expected = oracle(torch.tensor([seq], device="cuda"), use_cache=False).logits[0, -1].float()
-        torch.testing.assert_close(torch.tensor(logits[str(row)], device="cuda"), expected, atol=2e-6, rtol=1e-4)
+        torch.testing.assert_close(logits[str(row)], expected, atol=2e-6, rtol=1e-4)
         assert runner.cached_tokens(str(row)) == len(seq)
     runner.release("0")
     # Releasing another request must not retain its cache through a batch-wide tensor view.
@@ -73,8 +74,8 @@ def test_rope_is_cached_and_rebuilt_only_on_conversion(models):
     model, _ = models
     pointers = (model.rope_cos.data_ptr(), model.rope_sin.data_ptr())
     with patch("ajvllm.modeling.qwen2.model.rotary_factors", side_effect=AssertionError("RoPE recomputed in forward")):
-        out = model(torch.tensor([1, 2, 3], device="cuda"))
-        model(torch.tensor([4], device="cuda"), out.cache)
+        out = forward_tokens(model, torch.tensor([1, 2, 3], device="cuda"))
+        forward_tokens(model, torch.tensor([4], device="cuda"), out.caches[0])
     assert pointers == (model.rope_cos.data_ptr(), model.rope_sin.data_ptr())
     assert not any("rope_" in key for key in model.state_dict())
     model.to(dtype=torch.bfloat16)
@@ -165,7 +166,7 @@ def test_dynamic_budget_rotation_unchunked_and_terminal_boundaries(models):
 
 def test_real_sampling_eos_minimum_and_bad_admission(models):
     model, _ = models
-    first = model(torch.tensor([1, 2], device="cuda")).logits[-1].argmax().item()
+    first = forward_tokens(model, torch.tensor([1, 2], device="cuda")).logits[-1].argmax().item()
     runner = Qwen2Runner(model, (first,))
     config = EngineConfig(max_model_len=128)
     engine = Engine(runner, config)
@@ -218,3 +219,17 @@ def test_memory_warmup_growth_reduction_and_impossible_target(models):
         MemoryBudget(runner, config, gpu_memory_utilization=1e-9, safety_bytes=0)
     with pytest.raises(ValueError):
         MemoryBudget(runner, replace(config, enable_chunked_prefill=False, max_num_batched_tokens=128))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_qwen_seven_query_heads_per_kv_head_without_replication(dtype):
+    config = tiny_config(hidden_size=112, num_attention_heads=14, num_key_value_heads=2)
+    native, oracle = pair(config, dtype)
+    sequences = [[1, 2, 3, 4, 5], [6, 7, 8]]
+    with patch.object(torch.Tensor, "repeat_interleave", side_effect=AssertionError("KV replication")):
+        output = native(ModelBatch.build(sequences, [None, None], native.device, [0, 1]))
+    for row, tokens in enumerate(sequences):
+        expected = oracle(torch.tensor([tokens], device="cuda"), use_cache=False).logits[0, -1].float()
+        tolerance = 2e-6 if dtype == torch.float32 else 0.02
+        torch.testing.assert_close(output.logits[row], expected, atol=tolerance, rtol=1e-4)

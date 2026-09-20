@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from model_inputs import forward_tokens
 from safetensors.torch import load_file, save_file
 from transformers import Qwen2Config as HFConfig
 from transformers import Qwen2ForCausalLM as HFModel
@@ -56,7 +57,7 @@ def pair(config, dtype=torch.float32):
 def test_dense_gqa_full_chunked_and_decode(kv_heads, dtype):
     native, reference = pair(tiny_config(num_key_value_heads=kv_heads), dtype)
     ids = torch.tensor([1, 7, 2, 8, 3, 9, 4, 10, 5, 11, 6], device="cuda")
-    full = native(ids)
+    full = forward_tokens(native, ids)
     expected = reference(ids[None], use_cache=False).logits[0].float()
     # Same dtype and schedule should match the independent eager oracle tightly.
     tolerance = {torch.float32: 2e-6, torch.float16: 0.002, torch.bfloat16: 0.02}[dtype]
@@ -65,12 +66,12 @@ def test_dense_gqa_full_chunked_and_decode(kv_heads, dtype):
     hf_cache = None
     rows = []
     for start, stop in [(0, 3), (3, 8), (8, 9), (9, 10), (10, 11)]:
-        result = native(ids[start:stop], cache)
+        result = forward_tokens(native, ids[start:stop], cache)
         oracle = reference(ids[None, start:stop], past_key_values=hf_cache, use_cache=True)
         torch.testing.assert_close(result.logits, oracle.logits[0].float(), atol=tolerance, rtol=1e-4)
         if cache is not None:
             assert cache[0][0].shape[1] == start  # Functional, unmodified input cache.
-        cache, hf_cache = result.cache, oracle.past_key_values
+        cache, hf_cache = result.caches[0], oracle.past_key_values
         for k, v in cache:
             assert k.shape == v.shape == (kv_heads, stop, native.config.head_dim)
             assert k.is_contiguous() and v.is_contiguous() and k.is_cuda
@@ -84,12 +85,14 @@ def test_causal_mask_ignores_future_and_partial_prefill_skips_head():
     first = torch.tensor([1, 2, 3, 4, 5], device="cuda")
     changed = first.clone()
     changed[3:] = 10
-    torch.testing.assert_close(model(first).logits[:3], model(changed).logits[:3], atol=1e-6, rtol=1e-5)
+    torch.testing.assert_close(
+        forward_tokens(model, first).logits[:3], forward_tokens(model, changed).logits[:3], atol=1e-6, rtol=1e-5
+    )
     calls = []
     handle = model.lm_head.register_forward_hook(lambda *_: calls.append(True))
-    result = model(first[:2], logits_to_keep=None)
+    result = forward_tokens(model, first[:2], logits_to_keep=None)
     assert result.logits is None and not calls
-    result = model(first[2:], result.cache, logits_to_keep=1)
+    result = forward_tokens(model, first[2:], result.caches[0], logits_to_keep=1)
     assert result.logits.shape == (1, 97) and len(calls) == 1
     handle.remove()
 
@@ -134,7 +137,7 @@ def test_strict_checkpoint_loading_and_tying(tmp_path, tied, sharded):
     assert loaded.device.type == "cuda"
     assert (loaded.model.embed_tokens.weight is loaded.lm_head.weight) == tied
     ids = torch.tensor([4, 5, 6], device="cuda")
-    torch.testing.assert_close(loaded(ids).logits, native(ids).logits, atol=0, rtol=0)
+    torch.testing.assert_close(forward_tokens(loaded, ids).logits, forward_tokens(native, ids).logits, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("fault", ["missing", "extra", "shape", "conflicting_tie"])
