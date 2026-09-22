@@ -8,8 +8,9 @@ from pathlib import Path
 
 import torch
 
-from ajvllm import Engine, EngineConfig, SamplingParams
-from ajvllm.execution.qwen2 import Qwen2Runner
+from ajvllm import EngineConfig, SamplingParams
+from ajvllm.config.memory import MemoryConfig
+from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 
 
@@ -28,18 +29,28 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     with args.config.open("rb") as file:
-        config = EngineConfig(**tomllib.load(file)["engine"])
+        settings = tomllib.load(file)
+    config = EngineConfig(**settings["engine"])
+    memory_config = MemoryConfig(**settings.get("memory", {}))
     params = SamplingParams(
         max_tokens=args.max_tokens, temperature=args.temperature, top_p=args.top_p, top_k=args.top_k, seed=args.seed
     )
     tokenizer = Qwen2Tokenizer(args.model)
-    runner = Qwen2Runner.from_directory(args.model, device=args.device, dtype=getattr(torch, args.dtype))
-    engine = Engine(runner, config)
+    runtime = InferenceRuntime.from_directory(
+        args.model,
+        config,
+        device=args.device,
+        dtype=getattr(torch, args.dtype),
+        memory_config=memory_config,
+    )
+    engine = runtime.engine
+    runner = engine.runner
+
     try:
         for index, prompt in enumerate(args.prompt or ["Explain grouped-query attention in two sentences."]):
             ids = tokenizer.encode(prompt) if args.raw else tokenizer.encode_chat([{"role": "user", "content": prompt}])
             engine.add_request(str(index), ids, params)
-        for output in engine.run():
+        for output in runtime.run():
             if output.finished:
                 print(
                     json.dumps(

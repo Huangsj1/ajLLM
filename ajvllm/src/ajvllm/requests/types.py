@@ -36,6 +36,7 @@ class Request:
     first_token_time: float | None = None
     finish_time: float | None = None
     rng: torch.Generator | None = field(default=None, repr=False)
+    cache_salt: str = ""
 
     @property
     def num_tokens(self) -> int:
@@ -47,7 +48,7 @@ class Request:
 
     @property
     def is_prefill(self) -> bool:
-        return self.num_computed_tokens < len(self.prompt_token_ids)
+        return self.num_computed_tokens < len(self.prompt_token_ids) or self.num_tokens - self.num_computed_tokens > 1
 
 
 @dataclass(frozen=True)

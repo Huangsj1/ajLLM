@@ -36,8 +36,10 @@ class Engine:
         model_limit = getattr(runner, "max_model_len", None)
         if model_limit is not None and self.config.max_model_len > model_limit:
             raise ValueError("engine max_model_len exceeds the runner's checkpoint context length")
+        if runner.kv_cache is not None and self.config.max_model_len > runner.kv_cache.capacity_tokens:
+            raise ValueError("KV pool must fit the engine context limit")
         self.eos_token_ids = tuple(runner.eos_token_ids)
-        self._scheduler = Scheduler(self.config)
+        self._scheduler = Scheduler(self.config, runner.kv_cache)
         self._sampler = Sampler()
         self._clock = clock
         self._metrics = EngineMetrics()
@@ -76,7 +78,12 @@ class Engine:
         self._scheduler.token_budget = budget
 
     def add_request(
-        self, request_id: str, prompt_token_ids: Iterable[int], sampling_params: SamplingParams | None = None
+        self,
+        request_id: str,
+        prompt_token_ids: Iterable[int],
+        sampling_params: SamplingParams | None = None,
+        *,
+        cache_salt: str = "",
     ) -> None:
         if self._closed:
             raise RuntimeError("engine is closed")
@@ -87,12 +94,14 @@ class Engine:
         params = sampling_params if sampling_params is not None else SamplingParams()
         if not isinstance(params, SamplingParams):
             raise TypeError("sampling_params must be SamplingParams")
+        if not isinstance(cache_salt, str):
+            raise ValueError("cache_salt must be a string")
         tokens = tuple(prompt_token_ids)
         if not tokens or len(tokens) > self.config.max_model_len:
             raise ValueError("prompt must be nonempty and fit max_model_len")
         self._validate_tokens(tokens)
         self._validate_tokens(params.stop_token_ids)
-        request = Request(request_id, tokens, params, self._clock())
+        request = Request(request_id, tokens, params, self._clock(), cache_salt=cache_salt)
         self._scheduler.add(request)
         if params.max_tokens == 0 or len(tokens) == self.config.max_model_len:
             self._pending_outputs.append(self._finish(request, FinishReason.LENGTH))

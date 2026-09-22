@@ -6,3 +6,10 @@ max_model_len = 4096
 enable_chunked_prefill = true
 max_prefill_chunk_size = 512
 max_prefill_tokens_per_step = 4096
+
+[memory]
+backend = "paged"
+block_size = 16
+# Omit num_blocks to fit the resolved sequence/context capacity.
+enable_prefix_cache = true
+cache_namespace = "local"

@@ -2,7 +2,7 @@
 
 An educational single-GPU inference engine for Qwen2.5 dense/GQA models.
 It implements native model execution, packed continuous batching, chunked prefill,
-per-request contiguous KV, and a persistent HTTP/SSE service. Model execution does
+paged KV storage with prefix reuse, and a persistent HTTP/SSE service. Model execution does
 not delegate to vLLM or Transformers. Transformers provides tokenization and the
 independent CUDA test oracle.
 
@@ -43,8 +43,8 @@ uv run ruff check .
 ```
 
 The offline CLI uses the same packed model path and is useful for fixed workloads.
-Its explicit token budget is configured in TOML; adaptive budgeting runs in the
-service. Default tests use tiny CUDA models for batching, lifecycle, serving and numerical
+Its token budget is configured in TOML; startup calibration and per-step adaptation
+share the same runtime as the service. Default tests use tiny CUDA models for batching, lifecycle, serving and numerical
 checks. Real-checkpoint tests are opt-in (`-m model`) and are excluded by default
 to avoid retaining large models in a full test run. A bounded single-model check
 is available as `uv run python tests/check_local_batch.py`. The synthetic CPU runner/tests, demo,
@@ -65,18 +65,19 @@ Prefill chunks and decode tokens share the same model call. Embeddings, QKV/outp
 MLPs, and selected output logits operate on packed tensors. Eager attention uses
 batched matrix multiplications with padding masks and per-request causal offsets.
 Grouped QK/PV matmuls share K/V without replicating them for every query head.
-Loops over requests only pack/unpack their contiguous KV tensors; they never invoke
-separate model or attention forwards. RoPE tables are precomputed and indexed.
+The memory manager owns reference-counted pages and prefix hashes; attention uses
+batched scatter/gather without separate model or attention forwards. RoPE tables are precomputed and indexed.
 
-This is a readable GPU baseline, not a paged or FlashAttention implementation.
-Padded attention workspace and KV copying still have costs. All sampling policies
+Stage 2b implements block allocation, prefix caching, copy-on-write and preemption
+with recomputation. Native PagedAttention and FlashAttention kernels are still
+planned; padded attention workspace and eager context gathers still have costs. All sampling policies
 use one batched CUDA tensor pipeline, including penalties, masks, temperature,
 top-k/top-p and random selection. Only selected results return to the host.
 
 Public imports remain `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Configuration lives in `config/`, lifecycle types in `requests/`, tokenizer/chat
-handling in `tokenization/`, and runtime memory policy in `runtime/`. Future memory,
-kernel, quantization, and distributed directories remain reserved.
+handling in `tokenization/`, and runtime memory policy in `runtime/`. Memory algorithms live in `memory/`; kernel, quantization and distributed
+directories remain reserved.
 
 See [architecture](docs/architecture/architecture.md), [model execution](docs/model_baseline.md),
 [serving](docs/serving.md), and [benchmarking](docs/benchmarking.md)

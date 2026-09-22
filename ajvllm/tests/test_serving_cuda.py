@@ -12,7 +12,9 @@ import uvicorn
 from test_qwen2_cuda import pair, tiny_config
 
 from ajvllm import Engine, EngineConfig, SamplingParams
+from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.qwen2 import Qwen2Runner
+from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.serving.http import create_app
 from ajvllm.serving.service import EngineService, ServiceBusy
 from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
@@ -20,18 +22,26 @@ from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 pytestmark = pytest.mark.cuda
 
 
-@pytest.fixture
-def runner():
+@pytest.fixture(params=["contiguous", "paged"])
+def runner(request):
     assert torch.cuda.is_available()
     model, _ = pair(tiny_config())
-    return Qwen2Runner(model)
+    runner = Qwen2Runner(
+        model,
+        memory_config=MemoryConfig(backend=request.param, block_size=4),
+        engine_config=EngineConfig(max_model_len=128, max_num_seqs=3),
+    )
+    return runner
 
 
 def make_service(runner, **kwargs):
     engine = Engine(
         runner, EngineConfig(max_model_len=128, max_num_seqs=3, max_num_batched_tokens=4, max_prefill_chunk_size=2)
     )
-    return EngineService(engine, **kwargs)
+    runtime = InferenceRuntime(engine)
+    service = EngineService(runtime, **kwargs)
+    assert service.runtime is runtime
+    return service
 
 
 def test_live_arrival_during_forward_and_idle_restart(runner):
@@ -190,7 +200,7 @@ def test_http_sse_disconnect_cancellation_and_concurrent_requests(runner):
 def test_execution_failure_does_not_stop_service_and_waiting_cancel(runner):
     async def scenario():
         engine = Engine(runner, EngineConfig(max_model_len=128, max_num_seqs=1, max_num_batched_tokens=2))
-        service = await EngineService(engine).start()
+        service = await EngineService(InferenceRuntime(engine)).start()
         calls = 0
 
         def fail_once(*_):

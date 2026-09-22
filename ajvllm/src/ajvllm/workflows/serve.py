@@ -9,9 +9,9 @@ from pathlib import Path
 import torch
 import uvicorn
 
-from ajvllm import Engine, EngineConfig
-from ajvllm.execution.qwen2 import Qwen2Runner
-from ajvllm.runtime.budget import MemoryBudget
+from ajvllm import EngineConfig
+from ajvllm.config.memory import MemoryConfig
+from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.serving.http import create_app
 from ajvllm.serving.presentation import memory_display
 from ajvllm.serving.service import EngineService
@@ -33,22 +33,23 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     with args.config.open("rb") as file:
-        config = EngineConfig(**tomllib.load(file)["engine"])
-    runner = Qwen2Runner.from_directory(args.model, device=args.device, dtype=getattr(torch, args.dtype))
-    # Dynamic memory budget
-    budget = MemoryBudget(
-        runner,
+        settings = tomllib.load(file)
+    config = EngineConfig(**settings["engine"])
+    memory_config = MemoryConfig(**settings.get("memory", {}))
+    runtime = InferenceRuntime.from_directory(
+        args.model,
         config,
+        device=args.device,
+        dtype=getattr(torch, args.dtype),
+        memory_config=memory_config,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        initial_token_budget=config.max_num_batched_tokens,
     )
-    engine = Engine(runner, budget.config)
-    engine.set_token_budget(budget.stats.token_budget)
-    service = EngineService(
-        engine, budget, max_pending_requests=args.max_pending_requests, profile_steps=args.profile_steps
-    )
+    service = EngineService(runtime, max_pending_requests=args.max_pending_requests, profile_steps=args.profile_steps)
     print(
-        json.dumps({"resolved_engine": asdict(budget.config), "memory": memory_display(budget.snapshot())}), flush=True
+        json.dumps(
+            {"resolved_engine": asdict(runtime.engine.config), "memory": memory_display(runtime.budget.snapshot())}
+        ),
+        flush=True,
     )
     app = create_app(service, Qwen2Tokenizer(args.model))
     uvicorn.run(app, host=args.host, port=args.port, workers=1)

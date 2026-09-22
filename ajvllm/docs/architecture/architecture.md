@@ -6,20 +6,20 @@ ajvLLM is an educational inference engine implemented independently of vLLM.
 The implemented model target is Qwen2.5 dense decoder-only text generation,
 including grouped-query attention (GQA). MoE, multimodal models, speculative
 decoding, beam search, and production HTTP compatibility are outside this plan.
-The control plane must not depend on Torch, CUDA, tensor layouts, or model weights.
+Scheduling policies operate on token counts and block ownership rather than tensor layouts or model weights.
 
 | Stage | Deliverables | Exit criteria |
 | --- | --- | --- |
 | 1: framework (implemented here) | Request lifecycle, sampling, runner protocol, synchronous engine, streaming token outputs, continuous batching, token budgets, chunked prefill, cancellation, metrics, persistent serving | CUDA integration tests prove scheduling invariants, batched execution, and live request handling |
 | 2a: model baseline (implemented) | Native Qwen2.5 weight loader, tokenizer adapter, eager dense/GQA forward, simple contiguous per-request KV storage | Full vs incremental and chunked logits agree with a trusted Qwen2 implementation on tiny and real checkpoints |
-| 2b: memory (planned) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
+| 2b: memory (implemented) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
 | 3: compute (planned) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
 | 4: advanced (planned) | CUDA Graphs, quantization, tensor parallelism, prefill/decode disaggregation | Backend parity, distributed correctness, and workload-specific performance evidence |
 
 The native backend now executes each logical scheduler batch as one packed mixed model
 forward, caches RoPE factors, and serves live HTTP/SSE requests. Synthetic CPU
 artifacts have been removed. See the [model guide](../model_baseline.md) and
-[serving guide](../serving.md). Memory paging and optimized kernels remain planned.
+[serving guide](../serving.md). Paged storage and prefix reuse are implemented; optimized attention kernels remain planned.
 
 ## Repository layout
 
@@ -35,14 +35,14 @@ src/ajvllm/
   tokenization/          token/text protocol and local Qwen chat tokenizer
   workflows/             CUDA text generation and persistent server entry points
   modeling/qwen2/        native eager dense/GQA model and checkpoint loader
-  memory/                planned cache manager, block pool, prefix index
+  memory/                block ownership, paged CUDA storage, prefix index, contiguous reference
   attention/backends/    planned eager/paged attention interfaces
   kernels/               planned Torch/Triton/CUDA kernels
   runtime/               adaptive CUDA memory budget; graph capture remains planned
   quantization/          planned quantized linear and KV representations
   distributed/           planned TP collectives and KV transfer
   serving/               async engine service and HTTP/SSE; disaggregation remains planned
-benchmarks/              planned trace, latency, throughput, and memory studies
+benchmarks/              reusable datasets; service latency, throughput and memory measurements
 tests/                   framework tests and CUDA model acceptance tests
 ```
 
@@ -222,33 +222,79 @@ chunked logits, mixed batches, and incremental decoding before introducing paged
 
 ## Stage 2b: memory algorithms
 
-Planned ownership: scheduler requests logical capacity from `KVCacheManager`;
-`BlockManager` owns physical page IDs, a free queue, reference counts, and eviction
-metadata; attention reads block tables and tensor storage without allocating.
+Implemented as a separate memory subsystem. Serving and offline generation default
+to paged storage; `MemoryConfig(backend="contiguous")` keeps the numerical reference.
+The scheduler still produces one mixed `ModelBatch` and the runner calls the model
+once. Paging changes KV ownership and storage, not the attention algorithm.
 
-For block size B, logical token t maps to block `t // B`, offset `t % B`. A request
-needs `ceil((C+n)/B)` resident blocks before executing n tokens. Estimate bytes per
-block as `2 * layers * B * kv_heads * head_dim * element_bytes`, adjusted later
-for TP and quantization. Reserve enough capacity atomically across all layers;
-on failure roll back reservations before changing computed-token counts.
+| Module | Responsibility |
+| --- | --- |
+| `config/memory.py` | Backend, block size, optional physical block count, prefix policy and namespace |
+| `memory/blocks.py` | Physical IDs, reference counts, free queue and cached-page LRU eviction |
+| `memory/manager.py` | Request block tables, atomic capacity reservation, prefix hashes and copy-on-write |
+| `memory/storage.py` | Fixed CUDA pool, slot mappings, eager scatter/gather and stream lifetime events |
+| `memory/contiguous.py` | Original cache packing/replacement path for numerical and performance comparisons |
+| `scheduling/scheduler.py` | Admission, memory-pressure victim selection and recomputation |
 
-First implement block tables over an eager gather/scatter attention reference.
-Then implement native paged reads/writes. Allocation, indexing, and kernel speed
-are separate milestones. Reuse pages only after all device users complete.
+For block size B, logical token t maps to block `t // B`, offset `t % B`.
+The pool shape is `[layers, 2, num_blocks, B, kv_heads, head_dim]`. Each block
+uses `2 * layers * B * kv_heads * head_dim * element_bytes` bytes. Capacity
+reservation checks all required IDs before mutation; one ID represents storage
+across all layers. The runner commits computed tokens and publishes prefix blocks
+only after a successful complete model forward. Cancellation and execution failures
+release request references. CUDA events order pool access across warmup and worker
+streams, including failed forwards, before recycled pages are reused.
 
-Prefix caching indexes complete blocks by chained hashes of parent prefix and
-block tokens, plus model revision, adapters, positional settings, cache dtype,
-and isolation domain. Shared pages are immutable; writable shared tails require
-copy-on-write. A hit advances only verified reusable computed tokens; if final
-prompt logits are absent, leave at least the final token to recompute for sampling.
-Use reference counts for ownership and LRU among unreferenced blocks for eviction.
-This plan follows the concepts in [vLLM prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching/).
+The old path copied each request's entire historical KV into replacement storage
+on every step. Paged writes now scatter only newly computed tokens into their
+physical slots. The eager attention adapter still gathers padded contexts into a
+per-layer temporary tensor; it masks invalid slots to zero, including recycled
+uninitialized values. Native PagedAttention reads, fused cache writes and eliminating
+the remaining gather/padding belong to Stage 3.
 
-Under pressure, preempt a selected running request, release its private pages,
-reset its computed prefix to reusable cached state (or zero), and requeue for
-recomputation without resampling already generated outputs. Preserve RNG state
-and distinguish replay from new generation. Tests must cover shared prefixes,
-partial tails, exhaustion, rollback, cancellation, stale hashes, and preemption.
+Prefix caching uses SHA-256 chained over the parent hash and each complete block's
+token IDs. The root includes the configured namespace and request `cache_salt`.
+Each manager belongs to one immutable model instance, positional configuration and
+dtype: pages cannot cross model instances. There is no persistent or distributed
+cache, adapter switching or hot weight reload. Future support for these must add
+identity/version invalidation. An application requiring tenant isolation must assign
+salts in its trusted admission layer; a client-provided salt is not authentication.
+
+Only complete blocks are published. A cache hit leaves at least one token to
+recompute because KV does not store final logits. Active references pin pages;
+zero-reference cached pages remain reusable until LRU eviction. Uncached private
+tails are recycled first. Independently computed duplicate hashes are not merged
+within the same batch. A manager-level `fork` shares existing state; appending to a
+shared partial tail first copies that block across layers. Failed copy allocation
+leaves original ownership unchanged. The service currently exposes ordinary requests,
+not beam search or a fork endpoint.
+
+If a reservation cannot fit, the scheduler preempts the youngest unprotected
+running request, releases its references and requeues it. It never preempts a
+request already selected in the current batch. Replay processes the retained prompt
+and generated token history without resampling old outputs; the request's CUDA RNG
+state is preserved. A pool must fit at least one maximum-context request so that
+recomputation can make progress. Token budget and physical page capacity remain
+independent constraints. Prefix lookup alone does not count as a hit until admitted
+work actually commits.
+
+`num_blocks` defaults to `max_num_seqs * ceil(max_model_len / B)` after startup
+capacity resolution. A smaller explicit pool permits overcommit with recomputation.
+The pool is allocated once; freeing a request reduces live page references, not
+PyTorch allocated bytes. `/health` reports pool, used, free, cached and shared blocks,
+prefix-hit tokens, evictions, copy-on-write copies and preemptions. Free pages include
+cached pages with zero references, so free and cached counts overlap.
+
+CUDA tests cover full/partial prefixes, salts, last-token recomputation, shared tails,
+exhaustion/rollback, stale hashes, cancellation, model failure, cross-stream reuse,
+FP32/FP16/BF16 mixed batches and greedy/stochastic replay consistency. Small local
+checkpoint measurements and their limitations are recorded in
+[benchmarking](../benchmarking.md#stage-2b-bounded-comparison).
+
+The ownership and hashing design follows [vLLM prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching/).
+The eager block-table reference prepares the interface for
+[vLLM-style paged attention](https://docs.vllm.ai/en/latest/design/paged_attention/),
+but does not implement that optimized kernel yet.
 
 ## Stage 3: compute algorithms
 
@@ -335,3 +381,61 @@ With `--profile-steps`, cumulative stage times cover preparation, model forward,
 CUDA sampling, and compact result transfer. Normal execution adds no profiling
 synchronizations. Allocated/reserved memory is reported separately from device-wide
 nvidia-smi memory. See [benchmarking](../benchmarking.md) for metric definitions.
+
+### Runtime and memory ownership refinement
+
+The previous `MemoryBudget` both inspected Qwen2 internals and initialized the
+runner's KV manager. Its warmup bypassed the runner for contiguous storage, and
+offline generation did not apply runtime budget adjustments. These responsibilities
+are now separated:
+
+```mermaid
+flowchart TD
+    R[InferenceRuntime startup] --> W[Load model weights]
+    W --> E[Qwen2MemoryEstimate: backend workspace and KV capacity]
+    E --> B[MemoryBudget: resolve sequence and token limits]
+    B --> Q[Construct Qwen2Runner with resolved configuration]
+    Q --> M[KVCacheManager constructs and owns PagedKVStorage]
+    Q --> P[runner.probe: SchedulerOutput to runner.execute]
+    P --> C[Engine ready]
+    C --> S[InferenceRuntime.step: budget checks, engine step, feedback]
+    S --> H[HTTP service]
+    S --> O[Offline generation]
+```
+
+`runtime/budget.py` remains in `runtime/`: process memory headroom, warmup peak
+feedback and token-budget adaptation are execution policies, not KV ownership or
+HTTP concerns. The controller receives an estimate callable; it does not import
+a model, runner, KV manager or attention layout. Its constructor only resolves
+capacity; explicit `warmup(probe)` performs device work after runner construction.
+The initial budget comes from the configured token ceiling, reduced as necessary.
+
+`execution/capacity.py` contains `Qwen2MemoryEstimate`, the eager backend's
+model-specific workspace estimate. It uses architecture dimensions, element size
+and immutable engine/memory settings, without retaining model weights or a runner.
+It excludes loaded weights/static buffers, which the controller measures once
+before the KV pool exists. Runtime estimates include the resolved pool capacity
+once, avoiding double counting.
+
+`runtime/inference.py` coordinates startup for both CLIs: load weights, plan
+capacity, construct the runner with `memory_config` and resolved `engine_config`,
+then warm up. This order preserves constructor-time KV initialization without
+allocating an uncalibrated maximum pool. Direct fixed-capacity callers can pass
+these two configurations to `Qwen2Runner` themselves. There is no post-construction
+`configure_memory` operation. Omitting memory configuration on a direct runner
+keeps the contiguous numerical baseline.
+
+`KVCacheManager` receives cache policy, capacity and tensor dimensions/device/dtype;
+it derives block count, validates single-request capacity and constructs the
+physical pool itself. It never receives a Qwen2 model. `Qwen2Runner.probe` constructs
+prefill and decode `SchedulerOutput` objects for both backends. Only prefix-publication
+suppression is backend-specific; cleanup always uses `runner.release`, including
+failed warmup attempts. The manager's prefix policy is restored in `finally`.
+
+`InferenceRuntime.step/run` applies budget checks and successful-step feedback in
+both online and offline execution. CUDA OOM lowers the next budget and propagates
+the engine's existing failure outputs; it never retries advanced requests silently.
+`EngineService` receives the existing `InferenceRuntime` directly and retains no
+separate engine/budget state. The HTTP service owns transport queues, cancellation
+and profiling, while the
+model-independent `Engine.step/run` remains available for fixed-budget tests.

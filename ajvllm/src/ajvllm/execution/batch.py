@@ -6,8 +6,8 @@ from itertools import accumulate
 
 import torch
 
-LayerKV = tuple[torch.Tensor, torch.Tensor]
-KVCache = tuple[LayerKV, ...]
+from ajvllm.memory.storage import PagedBatch
+from ajvllm.memory.types import KVCache  # re-export for existing reference callers
 
 
 @dataclass
@@ -21,6 +21,7 @@ class ModelBatch:
     caches: tuple[KVCache | None, ...]
     sample_indices: torch.Tensor
     causal_mask: torch.Tensor
+    paged: PagedBatch | None = None
 
     @property
     def num_requests(self) -> int:
@@ -41,11 +42,14 @@ class ModelBatch:
         caches: Sequence[KVCache | None],
         device: torch.device,
         sample_requests: Sequence[int],
+        *,
+        starts: Sequence[int] | None = None,
     ) -> "ModelBatch":
         # all request sequences length
         lengths = tuple(len(tokens) for tokens in sequences)
         # cache[0][0] means 1st layer's k tensor, shape: (num_heads, seq_len, head_dim)
-        starts = [0 if cache is None else cache[0][0].shape[1] for cache in caches]
+        if starts is None:
+            starts = [0 if cache is None else cache[0][0].shape[1] for cache in caches]
         # contexts = cached tokens + current query tokens
         contexts = tuple(start + length for start, length in zip(starts, lengths, strict=True))
         offsets = list(accumulate(lengths))

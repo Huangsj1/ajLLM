@@ -5,10 +5,12 @@ from typing import Protocol
 
 import torch
 
+from ajvllm.memory.manager import KVCacheManager
 from ajvllm.scheduling.batch import SchedulerOutput
 
 
 class ModelRunner(Protocol):
+    kv_cache: KVCacheManager | None
     vocab_size: int
     eos_token_ids: tuple[int, ...]
 

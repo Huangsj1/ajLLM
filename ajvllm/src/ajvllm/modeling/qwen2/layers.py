@@ -4,7 +4,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from ajvllm.execution.batch import LayerKV, ModelBatch
+from ajvllm.execution.batch import ModelBatch
+from ajvllm.memory.contiguous import update_layer
+from ajvllm.memory.types import LayerKV
 from ajvllm.modeling.qwen2.config import Qwen2Config
 
 
@@ -57,23 +59,12 @@ class Attention(nn.Module):
         factors = tuple(factor[:, None, :] for factor in factors)
         q, k = apply_rotary(q, *factors), apply_rotary(k, *factors)
         queries = x.new_zeros(batch.num_requests, config.num_attention_heads, batch.max_query_len, config.head_dim)
-        keys = x.new_zeros(batch.num_requests, config.num_key_value_heads, batch.max_context_len, config.head_dim)
-        values = torch.zeros_like(keys)
-        # Only cache packing is per-request; there is no per-request model/attention execution.
-        for row, cache in enumerate(batch.caches):
-            if cache is not None:
-                old_k, old_v = cache[layer_index]
-                keys[row, :, : old_k.shape[1]] = old_k
-                values[row, :, : old_v.shape[1]] = old_v
         queries[batch.sequence_ids, :, batch.query_offsets] = q
-        keys[batch.sequence_ids, :, batch.positions] = k
-        values[batch.sequence_ids, :, batch.positions] = v
-        # Independent storage avoids retaining an entire old batch through a single live request.
-        # (request1(k, v), request2(k, v), ...)), k/v shape = (num_heads, cached_seq_len, head_dim)
-        present = tuple(
-            (keys[row, :, :length].clone().contiguous(), values[row, :, :length].clone().contiguous())
-            for row, length in enumerate(batch.context_lengths)
-        )
+        if batch.paged is None:
+            keys, values, present = update_layer(batch, layer_index, k, v)
+        else:
+            keys, values = batch.paged.update(layer_index, k, v)
+            present = ()
         groups = config.num_attention_heads // config.num_key_value_heads
         # Put each KV head's query-head group into the GEMM query dimension.
         # This shares K/V directly instead of materializing one copy per query head.

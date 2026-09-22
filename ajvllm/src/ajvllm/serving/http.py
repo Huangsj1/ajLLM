@@ -23,6 +23,7 @@ class GenerationInput(BaseModel):
     token_ids: list[int] | None = None
     sampling: dict = Field(default_factory=dict)
     stream: bool = False
+    cache_salt: str = ""
 
     @model_validator(mode="after")
     def one_input(self):
@@ -71,7 +72,7 @@ def create_app(service: EngineService, tokenizer: Qwen2Tokenizer) -> FastAPI:
         try:
             params = SamplingParams(**body.sampling)
             ids = await asyncio.to_thread(encode, body)
-            handle = await service.submit(body.request_id, ids, params)
+            handle = await service.submit(body.request_id, ids, params, cache_salt=body.cache_salt)
         except ServiceBusy as exc:
             raise HTTPException(429, str(exc)) from exc
         except (ValueError, TypeError) as exc:

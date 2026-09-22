@@ -1,4 +1,4 @@
-# Conservative eager baseline for a 12 GB GPU; no cache block allocator yet.
+# Paged KV with eager attention; startup calibrates capacity for the available GPU.
 [engine]
 max_num_seqs = 8                       # Scheduler max total batch sequence size
 max_num_batched_tokens = 5000           # Scheduler max total budget
@@ -6,3 +6,10 @@ max_model_len = 4096                    # model's max seq_len
 enable_chunked_prefill = true
 max_prefill_chunk_size = 512            # max chunk prefill size for a request
 max_prefill_tokens_per_step = 4096      # aggregate prefill cap within the shared scheduler budget
+
+[memory]
+backend = "paged"
+block_size = 16
+# Omit num_blocks to fit the resolved sequence/context capacity.
+enable_prefix_cache = true
+cache_namespace = "local"

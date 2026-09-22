@@ -95,8 +95,9 @@ worst-case cache/workspace space for `max_num_seqs * max_model_len`.
 
 The estimate includes:
 
-- Three times full-context KV storage for old/replacement tensors and packing.
-- Repeated GQA K/V workspace for eager attention.
+- A fixed physical KV pool for the paged backend, plus per-layer gather workspace.
+- Conservative GQA workspace headroom for eager attention.
+- Three times full-context KV storage only for the contiguous comparison backend.
 - Padded attention scores/probabilities, scaling with `B * heads * Qmax * Kmax`.
 - Packed projection/MLP activations and sampling logits.
 
@@ -132,13 +133,12 @@ heuristic, not a hard GPU reservation or a guarantee against every OOM.
 ceiling, and admitted sequence cap. Measurements use PyTorch allocated bytes;
 `nvidia-smi` also includes allocator reservations and driver/display allocations.
 The configured input-token ceiling remains independent of prompt/output length.
-Adaptive budgeting currently requires chunked prefill. The offline CLI retains
-its explicit fixed budget for reproducible tests.
+Adaptive budgeting currently requires chunked prefill. The offline CLI uses the same startup calibration and per-step budget adaptation
+through `InferenceRuntime`.
 
 The separation of decode priority, chunked prefill, and memory capacity is informed
 by [vLLM optimization guidance](https://docs.vllm.ai/en/latest/configuration/optimization/).
-The current contiguous-KV estimator will be replaced with block accounting in
-the memory optimization stage.
+The paged estimator accounts for the fixed pool separately from attention workspace.
 
 ## Metrics and validation
 
@@ -155,3 +155,42 @@ request arrival during execution, cancellation, backpressure and HTTP streaming.
 `tests/check_local_batch.py` is an optional single-checkpoint numerical check with
 contexts of at most eight tokens. The [benchmark workflow](benchmarking.md)
 describes reusable datasets, configurable concurrency and comparison methodology.
+
+## Paged KV configuration
+
+Both engine TOML files include this section:
+
+```toml
+[memory]
+backend = "paged" # "contiguous" selects the comparison backend
+block_size = 16
+enable_prefix_cache = true
+cache_namespace = "local"
+# num_blocks = 288 # Optional; otherwise derived from resolved sequence/context capacity.
+```
+
+A pool must fit one maximum-context request. Reducing an explicit `num_blocks`
+can trigger scheduler preemption and replay; this trades recomputation for a lower
+fixed KV allocation. It does not reduce the padded attention workspace by itself.
+Changing these settings requires restarting the server.
+
+`POST /generate` accepts optional `cache_salt` (default empty string). Requests
+share complete matching prefixes only within the same model manager, namespace
+and salt. Assign salts at a trusted boundary when isolating tenants. Outputs and
+partial tails are never blindly reused as prompt logits: at least the last input
+token is evaluated. Restart the server to obtain a cold prefix cache.
+
+`/health` includes `kv_cache`: `pool_bytes` is physically allocated CUDA storage,
+`used_bytes` counts blocks referenced by requests, and `cached_blocks` counts
+indexed reusable prefixes. Idle cached pages may also be free for eviction.
+Releasing a request does not shrink the pool, so allocated VRAM can stay constant
+across concurrency levels. PyTorch `reserved_bytes` additionally includes reusable
+allocator segments and is distinct from all these cache ownership metrics.
+Counters expose prefix hits/tokens, evictions, COW copies, preemptions and logical
+persistent KV write bytes; these writes exclude temporary attention gathers.
+
+Startup is coordinated by `runtime/inference.py`: loaded weights are measured
+before capacity resolution and KV allocation. The runner constructs its manager
+with resolved capacity, then both cache backends warm up through `runner.execute`.
+`MemoryBudget` remains a runtime policy independent of HTTP and Qwen2 internals;
+backend-specific workspace estimates live in `execution/capacity.py`.

@@ -71,5 +71,9 @@ class Qwen2ForCausalLM(nn.Module):
         logits = None
         if batch.sample_indices.numel():
             logits = self.lm_head(self.model.norm(x[batch.sample_indices])).float()
-        caches = tuple(tuple(layer[row] for layer in layers) for row in range(batch.num_requests))
+        caches = (
+            tuple(tuple(layer[row] for layer in layers) for row in range(batch.num_requests))
+            if batch.paged is None
+            else ()
+        )
         return BatchOutput(logits, caches)

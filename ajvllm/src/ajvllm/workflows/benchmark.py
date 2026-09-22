@@ -182,6 +182,24 @@ def run_benchmark(
         },
         "itl_s": distribution(value for row in successful for value in row["itl_s"]),
         "server_steps": steps,
+        "kv_cache": {
+            "backend": after.get("kv_cache", {}).get("backend"),
+            "counters": {
+                key: after.get("kv_cache", {}).get(key, 0) - before.get("kv_cache", {}).get(key, 0)
+                for key in (
+                    "prefix_hits",
+                    "prefix_hit_tokens",
+                    "evictions",
+                    "cow_copies",
+                    "preemptions",
+                    "written_tokens",
+                    "kv_write_bytes",
+                    "cow_copy_bytes",
+                )
+            },
+            "pool_bytes": after.get("kv_cache", {}).get("pool_bytes", 0),
+            "peak_used_bytes": after.get("kv_cache", {}).get("peak_used_bytes", 0),
+        },
         "stage_seconds": {
             key: value - before.get("stage_seconds", {}).get(key, 0.0)
             for key, value in after.get("stage_seconds", {}).items()
@@ -254,6 +272,7 @@ def main():
         print(f"{kind} step mean (synchronized engine wall time): {display}")
     if not report["server_steps"]:
         print("Step timings unavailable; start the server with --profile-steps to enable them.")
+    print("KV cache:", json.dumps(report["kv_cache"]))
     print("Stage totals (s):", json.dumps(report["stage_seconds"]))
     print(f"Sample metadata transfer: {report['transfer_bytes'] / 1024**2:.3f} MiB")
     print(f"Report: {args.output}")

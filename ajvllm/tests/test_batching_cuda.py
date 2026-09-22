@@ -9,7 +9,9 @@ from model_inputs import forward_tokens
 from test_qwen2_cuda import pair, tiny_config
 
 from ajvllm import Engine, EngineConfig, EngineExecutionError, SamplingParams
+from ajvllm.config import MemoryConfig
 from ajvllm.execution.batch import ModelBatch
+from ajvllm.execution.capacity import Qwen2MemoryEstimate
 from ajvllm.execution.qwen2 import Qwen2Runner
 from ajvllm.modeling.qwen2.layers import rotary_factors
 from ajvllm.runtime.budget import MemoryBudget
@@ -202,7 +204,12 @@ def test_memory_warmup_growth_reduction_and_impossible_target(models):
     model, _ = models
     runner = Qwen2Runner(model)
     config = EngineConfig(max_model_len=128, max_num_seqs=2, max_num_batched_tokens=8)
-    budget = MemoryBudget(runner, config, initial_token_budget=1, growth_interval=1)
+    estimate = Qwen2MemoryEstimate(
+        model.config, model.model.embed_tokens.weight.element_size(), config, MemoryConfig(backend="contiguous")
+    )
+    budget = MemoryBudget(model.device, config, estimate=estimate, growth_interval=1)
+    budget.stats.token_budget = 1
+    budget.warmup(runner.probe)
     engine = Engine(runner, budget.config)
     engine.add_request("a", [1] * 40, SamplingParams(max_tokens=1, temperature=0))
     used = []
@@ -216,9 +223,11 @@ def test_memory_warmup_growth_reduction_and_impossible_target(models):
     budget.on_oom()
     assert budget.stats.token_budget == 4
     with pytest.raises(MemoryError):
-        MemoryBudget(runner, config, gpu_memory_utilization=1e-9, safety_bytes=0)
+        MemoryBudget(model.device, config, estimate=estimate, gpu_memory_utilization=1e-9, safety_bytes=0)
     with pytest.raises(ValueError):
-        MemoryBudget(runner, replace(config, enable_chunked_prefill=False, max_num_batched_tokens=128))
+        MemoryBudget(
+            model.device, replace(config, enable_chunked_prefill=False, max_num_batched_tokens=128), estimate=estimate
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

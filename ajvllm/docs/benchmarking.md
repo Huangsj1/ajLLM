@@ -46,8 +46,8 @@ its initial budget from TOML `max_num_batched_tokens`; memory estimation and
 warmup can reduce it before serving requests.
 
 For BF16 Qwen2.5-0.5B, persistent KV uses 12 KiB per token. Four resident 2048-token
-inputs need about 96 MiB just for KV. Replacement caches, packing and padded eager
-attention add workspace. Memory utilization is a capacity ceiling, not a target
+inputs need about 96 MiB just for KV. The fixed paged pool reserves physical capacity at startup; eager gathers and padded
+attention add workspace. The contiguous reference additionally copies replacement caches. Memory utilization is a capacity ceiling, not a target
 that the server fills with unused allocations. Long documents exercise real KV
 and attention costs; this synthetic repeated dataset is not a production traffic
 model. Increase request repetitions for longer measurements rather than inflating
@@ -71,7 +71,7 @@ requests are recorded separately, excluded from latency distributions and cause
 CLI exit code 1. They are not silently retried.
 
 With `--profile-steps`, before/after health snapshots provide deltas for pure
-prefill, pure decode and mixed step counts/times. They include engine overhead;
+prefill, pure decode and mixed step counts/times. They include engine overhead and runtime budget checks;
 CUDA synchronization ensures partial-prefill work has completed. Mixed steps
 cannot be attributed accurately to separate prefill/decode compute times. TTFT
 is not pure prefill time, and pure-prefill step means are not total request prefill
@@ -113,3 +113,70 @@ results useful to ongoing comparisons; one-off experiment runners and historical
 reference implementations are not part of the maintained benchmark workflow.
 Implementation rationale and brief optimization history live in
 [architecture](architecture/architecture.md#implementation-refinements).
+
+## Stage 2b bounded comparison
+
+For storage-only comparisons set `[memory] backend = "contiguous"`, then
+`backend = "paged", enable_prefix_cache = false`. Measure prefix reuse separately
+with `enable_prefix_cache = true`. Restart for each case. The repeated dataset
+and excluded warmup request deliberately warm the prefix cache; this is not a
+cold or unique-prompt benchmark. To test cold misses use unique token sequences
+or disable prefix caching. A cache salt creates an isolation domain, not a memory
+capacity limit.
+
+The benchmark report includes `kv_cache.counters` as before/after deltas.
+`kv_write_bytes` counts logical persistent KV writes across layers, excluding
+eager context gathers, temporary tensors and hardware memory transactions.
+`cow_copy_bytes` records full-block copies separately. `pool_bytes` is fixed
+storage; `peak_used_bytes` is a lifetime high-water mark of referenced physical
+pages, not a benchmark delta. These complement allocator and device-wide metrics.
+
+Measured on the local RTX 3080 Ti with Qwen2.5-0.5B-Instruct BF16, two CPU
+threads, synchronized stage profiling, and a 40% PyTorch allocator cap. Each
+cell below used a fresh process with fixed scheduling (no adaptive controller):
+context 1152, sequence cap 4, token budget 512, per-request prefill chunk 128,
+aggregate prefill budget 480, and block size 16. The paged pool contained 288
+blocks (54 MiB). Tokenize the first four `long.jsonl` prompts without special
+tokens and truncate them to 256, 512, 768 and 1024 tokens respectively. Cycle
+these four rows over 12 measured requests after one excluded warmup request;
+use 16 output tokens, temperature 0.8, top-p 0.9, seed 0 and ignore EOS.
+All nine cases completed 12/12 requests without failures.
+
+| Backend | Concurrency | Output tokens/s | Mean TTFT (s) | Mean TPOT (s) | Peak allocated MiB |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Contiguous | 1 | 24.50 | 0.1607 | 0.0328 | 1009.8 |
+| Paged, prefix off | 1 | 25.11 | 0.1484 | 0.0326 | 1041.3 |
+| Paged, prefix on | 1 | 28.42 | 0.0818 | 0.0321 | 1041.3 |
+| Contiguous | 2 | 40.93 | 0.2051 | 0.0360 | 1045.5 |
+| Paged, prefix off | 2 | 38.64 | 0.2231 | 0.0376 | 1059.2 |
+| Paged, prefix on | 2 | 51.85 | 0.1006 | 0.0333 | 1058.8 |
+| Contiguous | 4 | 70.21 | 0.2286 | 0.0382 | 1101.4 |
+| Paged, prefix off | 4 | 73.57 | 0.2325 | 0.0358 | 1097.3 |
+| Paged, prefix on | 4 | 95.23 | 0.1094 | 0.0344 | 1095.5 |
+
+These are single bounded observations, not statistical throughput guarantees or
+results for the longer default benchmark settings. Allocated peaks include the
+excluded warmup; they exclude allocator reservations and CUDA driver memory.
+No conclusion about sustained SM utilization follows from these short runs.
+
+Persistent KV writes fell from 1681.9–1708.7 MiB in the contiguous path to
+92.1 MiB with paging alone (about 94.5% fewer bytes). Contiguous writes include
+repeated full-context cache replacements; page writes include only 7860 computed
+tokens. This excludes the eager history gathers that still occur on every step.
+Paging alone changed throughput by +2.5%, -5.6% and +4.8% at concurrency 1/2/4:
+metadata preparation and eager gathers can offset savings at this scale. Small
+speed differences need repeated measurements before drawing stronger conclusions.
+
+Prefix-enabled cases each reused 5232 input tokens across nine hits, reducing
+persistent writes further to 30.8 MiB. Relative to contiguous storage, observed
+throughput rose 16.0%, 26.7% and 35.6%; mean TTFT fell about 49–52%. This benefit
+comes mainly from skipped prefill, not a faster decode attention kernel. There
+were no evictions or preemptions in these measurements; tiny CUDA tests separately
+force these conditions and verify output/RNG consistency and ownership cleanup.
+
+The 54 MiB fixed pool slightly increased peak allocation at concurrency 1 and 2.
+Paging provides bounded ownership, reuse and a kernel-ready address mapping; it
+does not promise lower total VRAM for every workload. The next compute stage
+should remove eager gathers and quadratic attention temporaries while preserving
+the same packed batch, block-table and slot-mapping contracts. No temporary
+comparison scripts or per-run result files are retained in the repository.

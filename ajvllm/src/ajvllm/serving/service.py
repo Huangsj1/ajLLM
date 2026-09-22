@@ -9,6 +9,7 @@ import torch
 
 from ajvllm import Engine, EngineExecutionError, SamplingParams
 from ajvllm.runtime.budget import MemoryBudget
+from ajvllm.runtime.inference import InferenceRuntime
 
 
 class ServiceBusy(RuntimeError):
@@ -49,8 +50,7 @@ class RequestStream:
 class EngineService:
     def __init__(
         self,
-        engine: Engine,
-        budget: MemoryBudget | None = None,
+        runtime: InferenceRuntime,
         *,
         max_pending_requests=128,
         stream_capacity=128,
@@ -58,11 +58,11 @@ class EngineService:
     ):
         if max_pending_requests < 1 or stream_capacity < 1:
             raise ValueError("queue limits must be positive")
+        self.runtime = runtime
+        engine = runtime.engine
         self.profile_steps = profile_steps
         engine._sampler.profile_enabled = profile_steps
         engine.runner.profile_enabled = profile_steps
-        self.engine = engine
-        self.budget = budget
         self.max_pending_requests = max_pending_requests
         self.stream_capacity = stream_capacity
         self.commands = asyncio.Queue(maxsize=max_pending_requests)
@@ -76,6 +76,7 @@ class EngineService:
         model = engine.runner.model
         self.metadata = {
             "resolved_engine": asdict(engine.config),
+            "kv_cache": engine.runner.memory_stats(),
             "model_config": asdict(model.config),
             "dtype": str(model.dtype),
             "device": str(model.device),
@@ -88,12 +89,22 @@ class EngineService:
             "memory": self.budget.snapshot() if self.budget else None,
         }
 
+    @property
+    def engine(self) -> Engine:
+        return self.runtime.engine
+
+    @property
+    def budget(self) -> MemoryBudget | None:
+        return self.runtime.budget
+
     async def start(self):
         if self.task is None:
             self.task = asyncio.create_task(self._run())
         return self
 
-    async def submit(self, request_id: str, token_ids, params: SamplingParams) -> RequestStream:
+    async def submit(
+        self, request_id: str, token_ids, params: SamplingParams, *, cache_salt: str = ""
+    ) -> RequestStream:
         if self.closing or self.failure or self.task is None:
             raise RuntimeError("service is not running")
         if request_id in self.reserved_ids:
@@ -103,7 +114,7 @@ class EngineService:
         self.reserved_ids.add(request_id)
         reply = asyncio.get_running_loop().create_future()
         try:
-            self.commands.put_nowait(Command("add", request_id, (tuple(token_ids), params), reply))
+            self.commands.put_nowait(Command("add", request_id, (tuple(token_ids), params, cache_salt), reply))
             return await asyncio.shield(reply)
         except asyncio.CancelledError:
             await self.cancel(request_id)
@@ -137,8 +148,8 @@ class EngineService:
                 command.reply.set_result(None)
                 return False
             if command.kind == "add":
-                tokens, params = command.payload
-                self.engine.add_request(command.request_id, tokens, params)
+                tokens, params, cache_salt = command.payload
+                self.engine.add_request(command.request_id, tokens, params, cache_salt=cache_salt)
                 stream = RequestStream(self, command.request_id, self.stream_capacity)
                 self.streams[command.request_id] = stream
                 command.reply.set_result(stream)
@@ -171,16 +182,12 @@ class EngineService:
             self.reserved_ids.discard(output.request_id)
 
     def _step(self):
-        if self.budget:
-            self.budget.before_step(self.engine)
         if self.profile_steps:
             torch.cuda.synchronize(self.engine.runner.model.device)
         started = time.perf_counter()
         try:
-            outputs = self.engine.step()
+            outputs = self.runtime.step()
         except EngineExecutionError as exc:
-            if self.budget and isinstance(exc.__cause__, torch.cuda.OutOfMemoryError):
-                self.budget.on_oom()
             outputs = list(exc.outputs)
         phases = {item.phase.value for item in self.engine.last_batch.requests}
         if phases and self.profile_steps:
@@ -189,8 +196,6 @@ class EngineService:
             measurement = self.step_timing[kind]
             measurement["steps"] += 1
             measurement["total_s"] += time.perf_counter() - started
-        if self.budget:
-            self.budget.after_step(self.engine)
         return outputs
 
     async def _run(self):
@@ -214,6 +219,7 @@ class EngineService:
                     self.stats = {
                         **self.metadata,
                         "engine": asdict(self.engine.metrics),
+                        "kv_cache": self.engine.runner.memory_stats(),
                         "stage_seconds": dict(self.engine.runner.stage_seconds)
                         | dict(self.engine._sampler.stage_seconds),
                         "transfer_bytes": self.engine._sampler.transfer_bytes,

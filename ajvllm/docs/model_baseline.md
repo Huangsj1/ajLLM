@@ -3,8 +3,7 @@
 ## Implemented model
 
 The CUDA baseline reads local Qwen2.5 dense config and safetensors, implements
-RMSNorm, RoPE, GQA, SwiGLU and the causal LM head, and maintains per-request layer
-KV tensors. It supports full prefill, repeated prefill chunks, one-token decode,
+RMSNorm, RoPE, GQA, SwiGLU and the causal LM head, and supports contiguous reference KV tensors and a paged CUDA pool. It supports full prefill, repeated prefill chunks, one-token decode,
 and mixed request batches. The local checkpoint is Qwen2.5-0.5B-Instruct: 24 layers,
 896 hidden features, 14 query heads, two KV heads, and a 151936-entry vocabulary.
 All dimensions come from configuration. Both generation-config EOS IDs are used.
@@ -35,16 +34,16 @@ and paged kernels are planned behind the same packed model interface.
 | Queries for attention | `[B, query_heads, Qmax, head_dim]` |
 | Packed keys and values | `[B, kv_heads, Kmax, head_dim]` |
 | Causal/padding mask | `[B, 1, Qmax, Kmax]`, constructed once per batch |
-| Stored KV | Per request/layer `[kv_heads, actual_context_length, head_dim]` |
+| Stored KV | Paged pool `[layers, 2, blocks, block_size, kv_heads, head_dim]`; contiguous reference also available |
 | LM head output | `[sampling_ready_requests, vocab_size]` |
 
-For each layer, Q/K/V are projected for all T tokens together. Cached tensors are
-copied into padded batch buffers, and new K/V are scattered to their absolute
-positions. Query heads sharing one KV head are folded into the query dimension
+For each layer, Q/K/V are projected for all T tokens together. The paged backend scatters new K/V into physical slots and gathers padded
+contexts from block tables; the contiguous reference packs cached tensors and
+constructs replacement caches. Query heads sharing one KV head are folded into the query dimension
 for batched QK/PV multiplications; K/V are no longer replicated with
 `repeat_interleave`. Scores are reshaped back to query-head layout for causal
 masking and softmax. The result is gathered back to T packed rows before the output
-projection and MLP. Python loops only move cache data and assemble metadata; they
+projection and MLP. Python loops only manage cache ownership and assemble metadata; they
 do not evaluate a model or attention function per request.
 
 For request r with cached length C and new query offset i, key j is visible when
@@ -77,11 +76,14 @@ rebuilds correct values.
 
 ## KV ownership and validation boundaries
 
-Each forward constructs replacement contiguous K/V tensors without mutating its
-input caches. Per-request outputs own independent storage; retaining one request
-cannot keep an entire previous batch alive through a tensor view. Terminal events
-release its tensors. PyTorch may keep freed storage reserved; `cache_bytes` counts
-live KV tensors, not allocator reservations.
+Serving uses `KVCacheManager` for reference-counted blocks and full-prefix reuse.
+The model receives device block tables and slot mappings through `ModelBatch.paged`;
+attention writes only new KV and returns no replacement caches. Forward failures
+never publish incomplete blocks. Terminal events release references; cached pages
+may remain available for reuse. `cache_bytes` counts physical pages with active
+references, while `pool_bytes` measures the fixed allocation. Neither is the
+allocator's reserved-byte metric. The contiguous backend retains independent
+per-request replacement tensors as a numerical reference.
 
 The engine validates user token IDs, context limits, request IDs and sampling
 settings at admission. The loader validates external checkpoint structure. The
@@ -96,9 +98,10 @@ all-token comparisons; there is no single-tensor path in the production model.
 
 ## Scope and numerical limits
 
-Contiguous KV allocation/copying and padded eager attention are still expensive.
-There is no block allocator, prefix sharing, PagedAttention, FlashAttention, CUDA
-Graph, quantization, or tensor parallelism yet. Batch token budget counts real
+Paged storage removes persistent full-history replacement copies and supports prefix
+sharing, but eager gathers and padded attention remain expensive. Native
+PagedAttention, FlashAttention, CUDA Graph, quantization and tensor parallelism
+are still future work. Batch token budget counts real
 input tokens, whereas memory policy also accounts for padded attention workspace
 and the general sampler's score, sorting, probability and history buffers.
 The service uses conservative capacity estimates and real CUDA warmup/peak
