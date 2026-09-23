@@ -1,5 +1,8 @@
-# Planned component: kernels
+# Native Triton inference kernels
 
-Reserved for the later implementation stages described in
-[the architecture](../../../docs/architecture/architecture.md).
-This directory does not contain an implemented backend yet.
+`attention.py` implements paged online-softmax prefill and partitioned decode
+with LSE merging. `elementwise.py` implements RMSNorm, residual + RMSNorm,
+SwiGLU, and Qwen split-half RoPE fused with paged KV writes.
+
+See [architecture](../../../docs/architecture/architecture.md#stage-3-compute-algorithms)
+for layout contracts, launch policy and numerical limits.

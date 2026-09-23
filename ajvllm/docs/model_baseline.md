@@ -22,9 +22,10 @@ and [reference implementation](https://github.com/huggingface/transformers/blob/
 invokes the model once. Prefill chunks and decode tokens share packed projections,
 attention, and MLP operations. An empty schedule does not launch the model.
 
-See [architecture](architecture/architecture.md) for scheduling and future kernel boundaries.
-The eager attention backend still pads mixed query/context lengths; variable-length
-and paged kernels are planned behind the same packed model interface.
+See [architecture](architecture/architecture.md) for scheduling and compute kernels.
+The eager oracle pads mixed query/context lengths. The Triton backend reads paged
+KV directly using ragged query tiles and split decode, without dense masks or
+context gathers. The table below describes the retained eager reference.
 
 | Data | Shape / meaning |
 | --- | --- |
@@ -99,9 +100,9 @@ all-token comparisons; there is no single-tensor path in the production model.
 ## Scope and numerical limits
 
 Paged storage removes persistent full-history replacement copies and supports prefix
-sharing, but eager gathers and padded attention remain expensive. Native
-PagedAttention, FlashAttention, CUDA Graph, quantization and tensor parallelism
-are still future work. Batch token budget counts real
+sharing. Stage 3 adds paged FlashAttention, split decode and elementwise fusions;
+eager remains an explicit reference backend. CUDA Graph, quantization and tensor
+parallelism are still future work. Batch token budget counts real
 input tokens, whereas memory policy also accounts for padded attention workspace
 and the general sampler's score, sorting, probability and history buffers.
 The service uses conservative capacity estimates and real CUDA warmup/peak

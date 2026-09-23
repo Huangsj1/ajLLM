@@ -62,13 +62,13 @@ class Scheduler:
         return request
 
     def _attach(self, rid):
-        '''attach a request to the KV cache, and retain any prefix blocks'''
+        """attach a request to the KV cache, and retain any prefix blocks"""
         if self.kv_cache is not None and rid not in self.kv_cache.states:
             request = self.requests[rid]
             request.num_computed_tokens = self.kv_cache.attach(rid, request.token_ids, request.cache_salt)
 
     def _preempt(self, rid):
-        '''preempt a running request, releasing its kv blocks and moving it back to the waiting queue'''
+        """preempt a running request, releasing its kv blocks and moving it back to the waiting queue"""
         request = self.requests[rid]
         self.kv_cache.release(rid)
         self.kv_cache.preemptions += 1

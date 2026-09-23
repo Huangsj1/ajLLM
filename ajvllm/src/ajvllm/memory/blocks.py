@@ -5,10 +5,11 @@ from collections import OrderedDict
 
 class BlockManager:
     def __init__(self, num_blocks: int):
-        self.ref_counts = [0] * num_blocks                      # reference counts for each block, indicating how many sequences are using it
-        self.free = OrderedDict.fromkeys(range(num_blocks))     # free blocks' indices, ordered by LRU
-        self.keys: list[bytes | None] = [None] * num_blocks     # mapping from block index to prefix hash, for releasing prefix blocks
-        self.prefixes: dict[bytes, int] = {}                    # mapping from prefix hash to block index, for cached prefix blocks
+        # Reference counts indicate how many sequences use each physical block.
+        self.ref_counts = [0] * num_blocks
+        self.free = OrderedDict.fromkeys(range(num_blocks))  # Free block IDs, ordered by LRU.
+        self.keys: list[bytes | None] = [None] * num_blocks  # Block ID -> prefix hash.
+        self.prefixes: dict[bytes, int] = {}  # Prefix hash -> cached block ID.
         self.evictions = 0
 
     def allocate(self, count: int) -> list[int] | None:

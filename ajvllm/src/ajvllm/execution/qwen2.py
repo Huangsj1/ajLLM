@@ -7,7 +7,9 @@ from pathlib import Path
 
 import torch
 
+from ajvllm.attention.backends.triton import resolve_backend
 from ajvllm.config import EngineConfig, require_int
+from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.batch import KVCache, ModelBatch
 from ajvllm.memory.manager import KVCacheManager
@@ -39,6 +41,7 @@ class Qwen2Runner:
         eos_token_ids: tuple[int, ...] = (),
         *,
         memory_config: MemoryConfig | None = None,
+        compute_config: ComputeConfig | None = None,
         engine_config: EngineConfig | None = None,
     ):
         if model.device.type != "cuda":
@@ -52,6 +55,7 @@ class Qwen2Runner:
         self._caches: dict[str, KVCache] = {}  # original contiguous KV caches
         self.kv_cache: KVCacheManager | None = None  # KV cache manager for paged memory
         memory_config = memory_config or MemoryConfig(backend="contiguous")
+        self.compute_backend = resolve_backend(compute_config or ComputeConfig(backend="eager"), model, memory_config)
         if memory_config.backend == "paged":
             if engine_config is None:
                 raise ValueError("paged runner requires a resolved engine_config")
@@ -157,6 +161,7 @@ class Qwen2Runner:
                 self.model.device,
                 sampling_rows,
                 starts=[item.start_pos for item in batch.requests],
+                optimized=self.compute_backend == "triton",
             )
             if self.kv_cache is not None:
                 inputs.paged = self.kv_cache.batch(
@@ -164,6 +169,7 @@ class Qwen2Runner:
                     inputs.positions,
                     inputs.sequence_ids,
                     inputs.context_lengths,
+                    gather=self.compute_backend != "triton",
                 )
         try:
             with self._stage("model"):

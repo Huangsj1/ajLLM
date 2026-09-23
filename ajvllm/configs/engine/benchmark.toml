@@ -13,3 +13,6 @@ block_size = 16
 # Omit num_blocks to fit the resolved sequence/context capacity.
 enable_prefix_cache = true
 cache_namespace = "local"
+
+[compute]
+backend = "auto" # Triton paged kernels for FP16/BF16 on SM80+; eager reference otherwise.

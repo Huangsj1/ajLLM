@@ -64,19 +64,22 @@ remaining prefill budget. It executes **one packed mixed `ModelBatch` forward pe
 Prefill chunks and decode tokens share the same model call. Embeddings, QKV/output projections,
 MLPs, and selected output logits operate on packed tensors. Eager attention uses
 batched matrix multiplications with padding masks and per-request causal offsets.
-Grouped QK/PV matmuls share K/V without replicating them for every query head.
+The eager oracle uses grouped QK/PV matmuls without replicating KV. The default
+BF16 paged path uses native Triton attention with direct block-table reads.
 The memory manager owns reference-counted pages and prefix hashes; attention uses
 batched scatter/gather without separate model or attention forwards. RoPE tables are precomputed and indexed.
 
 Stage 2b implements block allocation, prefix caching, copy-on-write and preemption
-with recomputation. Native PagedAttention and FlashAttention kernels are still
-planned; padded attention workspace and eager context gathers still have costs. All sampling policies
+with recomputation. Stage 3 implements paged FlashAttention prefill, partitioned
+Flash Decode, and fused RMSNorm/residual, RoPE/cache writes and SwiGLU.
+Set `[compute] backend = "eager"` to retain the original numerical oracle. All sampling policies
 use one batched CUDA tensor pipeline, including penalties, masks, temperature,
 top-k/top-p and random selection. Only selected results return to the host.
 
 Public imports remain `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Configuration lives in `config/`, lifecycle types in `requests/`, tokenizer/chat
-handling in `tokenization/`, and runtime memory policy in `runtime/`. Memory algorithms live in `memory/`; kernel, quantization and distributed
+handling in `tokenization/`, and runtime memory policy in `runtime/`. Memory algorithms live in `memory/`, native Triton kernels in `kernels/`, and
+backend metadata/selection in `attention/backends/`. Quantization and distributed
 directories remain reserved.
 
 See [architecture](docs/architecture/architecture.md), [model execution](docs/model_baseline.md),

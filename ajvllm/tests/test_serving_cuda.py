@@ -12,6 +12,7 @@ import uvicorn
 from test_qwen2_cuda import pair, tiny_config
 
 from ajvllm import Engine, EngineConfig, SamplingParams
+from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.qwen2 import Qwen2Runner
 from ajvllm.runtime.inference import InferenceRuntime
@@ -22,13 +23,14 @@ from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 pytestmark = pytest.mark.cuda
 
 
-@pytest.fixture(params=["contiguous", "paged"])
+@pytest.fixture(params=["contiguous", "paged", "triton"])
 def runner(request):
     assert torch.cuda.is_available()
     model, _ = pair(tiny_config())
     runner = Qwen2Runner(
         model,
-        memory_config=MemoryConfig(backend=request.param, block_size=4),
+        compute_config=ComputeConfig(backend="triton" if request.param == "triton" else "eager"),
+        memory_config=MemoryConfig(backend="paged" if request.param == "triton" else request.param, block_size=4),
         engine_config=EngineConfig(max_model_len=128, max_num_seqs=3),
     )
     return runner

@@ -81,6 +81,7 @@ dependencies = [
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
+    { name = "triton" },
     { name = "uvicorn" },
     { name = "vllm" },
 ]
@@ -110,6 +111,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.9.0", index = "https://download.pytorch.org/whl/cu130" },
     { name = "tqdm", specifier = ">=4.67" },
     { name = "transformers", specifier = ">=4.56" },
+    { name = "triton", specifier = ">=3.6.0" },
     { name = "uvicorn", specifier = ">=0.30" },
     { name = "vllm", specifier = ">=0.12.0" },
 ]

@@ -1,10 +1,12 @@
-"""Eager RMSNorm, rotary embeddings, dense GQA attention, and SwiGLU."""
+"""Qwen2 layers with eager reference math and native Triton inference fusions."""
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 from ajvllm.execution.batch import ModelBatch
+from ajvllm.kernels.attention import paged_attention
+from ajvllm.kernels.elementwise import rms_norm, rope_and_cache, swiglu
 from ajvllm.memory.contiguous import update_layer
 from ajvllm.memory.types import LayerKV
 from ajvllm.modeling.qwen2.config import Qwen2Config
@@ -16,7 +18,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(width))
         self.eps = eps
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, optimized=False) -> torch.Tensor:
+        if optimized:
+            return rms_norm(x, self.weight, self.eps)
         normalized = x.float() * torch.rsqrt(x.float().square().mean(dim=-1, keepdim=True) + self.eps)
         return normalized.to(x.dtype) * self.weight
 
@@ -24,10 +28,13 @@ class RMSNorm(nn.Module):
 def rotary_factors(
     positions: torch.Tensor, config: Qwen2Config, dtype: torch.dtype
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    # shape = (head_dim/2,)
     frequencies = config.rope_theta ** (
         -torch.arange(0, config.head_dim, 2, dtype=torch.float32, device=positions.device) / config.head_dim
     )
+    # shape = (num_positions, head_dim/2), each position's angle for each frequency
     angles = positions.float()[:, None] * frequencies[None, :]
+    # shape = (num_positions, head_dim), each position's cos/sin for each frequency, repeated for the two halves of the head dimension
     angles = torch.cat((angles, angles), dim=-1)
     return angles.cos().to(dtype), angles.sin().to(dtype)
 
@@ -56,6 +63,11 @@ class Attention(nn.Module):
         q = self.q_proj(x).view(count, config.num_attention_heads, config.head_dim)
         k = self.k_proj(x).view(count, config.num_key_value_heads, config.head_dim)
         v = self.v_proj(x).view(count, config.num_key_value_heads, config.head_dim)
+        if batch.attention_metadata is not None:
+            # rope qk, store kv to kv cache
+            q = rope_and_cache(q, k, v, factors, batch.paged, layer_index)
+            packed = paged_attention(q, batch.paged, layer_index, batch.attention_metadata)
+            return self.o_proj(packed.reshape(count, config.hidden_size)), ()
         factors = tuple(factor[:, None, :] for factor in factors)
         q, k = apply_rotary(q, *factors), apply_rotary(k, *factors)
         queries = x.new_zeros(batch.num_requests, config.num_attention_heads, batch.max_query_len, config.head_dim)
@@ -92,8 +104,9 @@ class MLP(nn.Module):
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+    def forward(self, x: torch.Tensor, *, optimized=False) -> torch.Tensor:
+        gate, up = self.gate_proj(x), self.up_proj(x)
+        return self.down_proj(swiglu(gate, up) if optimized else F.silu(gate) * up)
 
 
 class DecoderLayer(nn.Module):
@@ -107,7 +120,14 @@ class DecoderLayer(nn.Module):
     def forward(
         self, x: torch.Tensor, factors: tuple[torch.Tensor, torch.Tensor], batch: ModelBatch, layer_index: int
     ) -> tuple[torch.Tensor, tuple[LayerKV, ...]]:
-        attention, present = self.self_attn(self.input_layernorm(x), factors, batch, layer_index)
+        optimized = batch.attention_metadata is not None
+        attention, present = self.self_attn(self.input_layernorm(x, optimized=optimized), factors, batch, layer_index)
+        if optimized:
+            # calculate residual and norm in one kernel to avoid extra memory allocation and copyS
+            norm, residual = rms_norm(
+                attention, self.post_attention_layernorm.weight, self.post_attention_layernorm.eps, x
+            )
+            return residual + self.mlp(norm, optimized=True), present
         x = x + attention
         # return AttentionLayerOutput, current full kv cache
         return x + self.mlp(self.post_attention_layernorm(x)), present

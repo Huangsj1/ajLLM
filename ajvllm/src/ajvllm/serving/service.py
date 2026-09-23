@@ -76,6 +76,7 @@ class EngineService:
         model = engine.runner.model
         self.metadata = {
             "resolved_engine": asdict(engine.config),
+            "compute_backend": engine.runner.compute_backend,
             "kv_cache": engine.runner.memory_stats(),
             "model_config": asdict(model.config),
             "dtype": str(model.dtype),

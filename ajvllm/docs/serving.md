@@ -95,10 +95,11 @@ worst-case cache/workspace space for `max_num_seqs * max_model_len`.
 
 The estimate includes:
 
-- A fixed physical KV pool for the paged backend, plus per-layer gather workspace.
-- Conservative GQA workspace headroom for eager attention.
+- A fixed physical KV pool for the paged backend.
+- Triton split-decode partial outputs/LSE, or eager per-layer gather workspace.
+- Conservative GQA workspace headroom only for eager attention.
 - Three times full-context KV storage only for the contiguous comparison backend.
-- Padded attention scores/probabilities, scaling with `B * heads * Qmax * Kmax`.
+- Padded attention scores/probabilities only for eager, scaling with `B * heads * Qmax * Kmax`.
 - Packed projection/MLP activations and sampling logits.
 
 If the requested capacity does not fit, startup reduces the active sequence cap,
@@ -116,7 +117,7 @@ leave headroom. It never exceeds the configured/safe ceiling. A low-traffic serv
 may use far less than the specified fraction; it does not create artificial work
 to consume memory.
 
-Startup probes small prefill and decode inputs. The memory estimate reserves
+Startup probes small prefill and decode inputs. The eager memory estimate reserves
 mixed-batch attention workspace: every scheduled row can inherit the longest
 prefill query and context dimensions. All admitted requests' persistent KV is
 still reserved, including when the aggregate prefill token cap is small.
@@ -194,3 +195,21 @@ before capacity resolution and KV allocation. The runner constructs its manager
 with resolved capacity, then both cache backends warm up through `runner.execute`.
 `MemoryBudget` remains a runtime policy independent of HTTP and Qwen2 internals;
 backend-specific workspace estimates live in `execution/capacity.py`.
+
+## Compute backend
+
+```toml
+[compute]
+backend = "auto" # "eager" for comparisons, "triton" to require native kernels
+```
+
+Auto selects Triton for paged FP16/BF16 on SM80+ and head dimensions <=256;
+FP32 and contiguous storage use eager by default. Explicit Triton also supports
+FP32 for numerical checks. `/health.compute_backend` reports the resolved choice.
+The same setting works for offline generation. No per-request model split occurs:
+one mixed `ModelBatch` contains both prefill and decode tokens.
+
+Triton JIT compilation happens on first use of a kernel variant. Startup warms
+representative prefill/decode, but a new head/dtype/partition variant may still
+compile later. Exclude compilation from steady-state measurements by warming the
+actual workload, and measure cold-start latency separately when it matters.

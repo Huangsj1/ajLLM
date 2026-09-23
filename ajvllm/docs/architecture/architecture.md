@@ -13,13 +13,13 @@ Scheduling policies operate on token counts and block ownership rather than tens
 | 1: framework (implemented here) | Request lifecycle, sampling, runner protocol, synchronous engine, streaming token outputs, continuous batching, token budgets, chunked prefill, cancellation, metrics, persistent serving | CUDA integration tests prove scheduling invariants, batched execution, and live request handling |
 | 2a: model baseline (implemented) | Native Qwen2.5 weight loader, tokenizer adapter, eager dense/GQA forward, simple contiguous per-request KV storage | Full vs incremental and chunked logits agree with a trusted Qwen2 implementation on tiny and real checkpoints |
 | 2b: memory (implemented) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
-| 3: compute (planned) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
+| 3: compute (implemented) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
 | 4: advanced (planned) | CUDA Graphs, quantization, tensor parallelism, prefill/decode disaggregation | Backend parity, distributed correctness, and workload-specific performance evidence |
 
 The native backend now executes each logical scheduler batch as one packed mixed model
 forward, caches RoPE factors, and serves live HTTP/SSE requests. Synthetic CPU
 artifacts have been removed. See the [model guide](../model_baseline.md) and
-[serving guide](../serving.md). Paged storage and prefix reuse are implemented; optimized attention kernels remain planned.
+[serving guide](../serving.md). Paged storage, prefix reuse and native Triton inference kernels are implemented.
 
 ## Repository layout
 
@@ -36,8 +36,8 @@ src/ajvllm/
   workflows/             CUDA text generation and persistent server entry points
   modeling/qwen2/        native eager dense/GQA model and checkpoint loader
   memory/                block ownership, paged CUDA storage, prefix index, contiguous reference
-  attention/backends/    planned eager/paged attention interfaces
-  kernels/               planned Torch/Triton/CUDA kernels
+  attention/backends/    compact ragged metadata and compute-backend selection
+  kernels/               Triton paged prefill/decode and fused elementwise operations
   runtime/               adaptive CUDA memory budget; graph capture remains planned
   quantization/          planned quantized linear and KV representations
   distributed/           planned TP collectives and KV transfer
@@ -196,8 +196,8 @@ future optimization behind this interface.
 
 The native CUDA baseline, loader, tokenizer, runner, and GPU acceptance tests are
 implemented. See the [baseline guide](../model_baseline.md) for interfaces, commands,
-precision results, and limitations. The design below describes the supported path;
-paged storage and optimized execution remain future work.
+precision results, and limitations. The design below describes the original eager
+reference; paged storage and optimized execution are implemented in Stages 2b/3.
 
 All scheduled packed request tokens traverse embedding -> decoder layers -> final RMSNorm -> LM head in one forward. Each
 layer uses pre-norm residual attention with RoPE, Q/K/V projections and output
@@ -249,8 +249,8 @@ The old path copied each request's entire historical KV into replacement storage
 on every step. Paged writes now scatter only newly computed tokens into their
 physical slots. The eager attention adapter still gathers padded contexts into a
 per-layer temporary tensor; it masks invalid slots to zero, including recycled
-uninitialized values. Native PagedAttention reads, fused cache writes and eliminating
-the remaining gather/padding belong to Stage 3.
+uninitialized values. The Stage 3 Triton backend bypasses these gathers and masks with direct paged
+reads and fused RoPE/cache writes; the eager adapter remains the numerical oracle.
 
 Prefix caching uses SHA-256 chained over the parent hash and each complete block's
 token IDs. The root includes the configured namespace and request `cache_salt`.
@@ -294,26 +294,101 @@ checkpoint measurements and their limitations are recorded in
 The ownership and hashing design follows [vLLM prefix caching](https://docs.vllm.ai/en/latest/design/prefix_caching/).
 The eager block-table reference prepares the interface for
 [vLLM-style paged attention](https://docs.vllm.ai/en/latest/design/paged_attention/),
-but does not implement that optimized kernel yet.
+with the native implementation described below.
 
 ## Stage 3: compute algorithms
 
-- FlashAttention prefill: tile Q/K/V, maintain online softmax maximum and normalizer,
-  accumulate weighted values without materializing the quadratic score matrix.
-  Support causal masks, chunk offsets, variable lengths, and GQA.
-- PagedAttention: gather K/V via logical-to-physical block tables and write newly
-  computed slots exactly once. First verify against the eager paged reference;
-  the [vLLM attention design](https://docs.vllm.ai/en/latest/design/paged_attention/)
-  is a useful layout/kernel reference, not a mandatory tensor layout.
-- Flash Decode: split a long KV sequence among programs for one/few query tokens;
-  merge partial outputs using their log-sum-exp values to preserve normalization.
-- Fuse RMSNorm, residual additions, RoPE, and SwiGLU after attention is correct.
-  Select a backend by phase, shape, dtype, device capability, and layout.
+Implemented native Triton forward kernels; model execution never calls vLLM,
+Transformers or PyTorch SDPA as an attention implementation. Eager attention stays
+available for numerical diagnosis and controlled comparisons. Both paths retain
+one mixed packed `ModelBatch` and one model forward per scheduler step.
 
-Keep an eager numerical oracle. Cover uneven head/block sizes, all supported
-lengths, large logits, mixed prefill/decode, and float32/bfloat16/float16 tolerances.
-Benchmark TTFT and inter-token latency separately; a faster prefill kernel may
-not improve decode. Kernel changes must preserve scheduler token accounting.
+### Backend and metadata
+
+`[compute] backend = "auto"` selects Triton for paged FP16/BF16 inference on SM80+
+with head dimensions up to 256. `eager` explicitly selects the original path.
+`triton` explicitly supports FP16/BF16/FP32 under these hardware/layout constraints;
+unsupported explicit selections fail at startup. Auto keeps FP32 and contiguous
+storage on eager. Floating-point kernels require even head dimensions as already
+validated by Qwen2 config. Compilation/runtime failures are not silently hidden
+by a fallback after cache mutation. The backend is reported in `/health`.
+
+`AttentionMetadata` records packed query starts, context lengths, exact prefill
+tiles and single-query request rows once per scheduler batch. Triton batches omit
+the dense causal mask and paged `read_slots`/validity buffers. The manager still
+owns block tables and packed write-slot mappings. Query/head padding is restricted
+to small masked kernel tiles; a decode row never inherits a long prefill's query
+matrix. Prefill/decode specialization happens inside each attention layer, not by
+splitting full-model inputs. Linear projections, norms and MLPs remain packed.
+
+### Paged FlashAttention prefill
+
+`kernels/attention.py::_prefill` streams KV tiles directly from physical pages.
+Logical offset n reads `table[row, n // block_size] * block_size + n % block_size`.
+Query head h uses KV head `h // (num_query_heads / num_kv_heads)`, without repeating
+KV tensors. A query's absolute position is `context_length - query_length + q`;
+this handles full prefill, prefix hits and multiple chunks with the same kernel.
+Programs cover actual per-request query tiles, including non-power-of-two tails.
+
+Each tile maintains FP32 row maximum m, normalizer l and weighted output a.
+For score tile S, update `m' = max(m, rowmax(S))`, `p = exp(S - m')`,
+`l' = exp(m - m') * l + rowsum(p)` and
+`a' = exp(m - m') * a + p @ V`. Store `a / l` after the final causal tile.
+There is no context-sized score/probability allocation or dense KV gather.
+FP16/BF16 dot products use tensor cores; explicit FP32 uses IEEE dot precision.
+Head dimensions above 128 use smaller key tiles and one pipeline stage to fit
+Ampere shared memory. An SM86 test exposed an oversized FP32 D=256 tile and
+motivated this shape-specific launch policy.
+
+### Paged decode and Flash Decode
+
+`_decode` handles rows with one query token, including a one-token prefill tail.
+Short contexts use one streaming program per request/head and write final output
+directly. At maximum decode context >=1024, the backend uses 256-token partitions.
+Each program emits its normalized partial output and FP32 log-sum-exp. `_merge`
+weights partial outputs by `exp(lse_partition - logsumexp(all_lse))`. Empty
+partitions contribute zero output and negative-infinity LSE, so ragged requests
+can share the launch grid safely. The split workspace scales with request count,
+heads, partitions and head dimension, rather than a padded query-by-context matrix.
+The partition threshold is a conservative initial policy, not an exhaustive
+autotuning result for every GPU/model combination.
+
+### Elementwise fusions
+
+`kernels/elementwise.py` implements row-wise RMSNorm, residual-add + RMSNorm,
+SwiGLU, and Qwen split-half RoPE fused with new K/V slot writes. Each scheduled
+K/V token is written once; cached historical KV is never rewritten. Residual and
+normalization intermediates preserve the eager activation-dtype rounding points.
+Rotary factors are still indexed from the model's precomputed tables. Checkpoint
+parameters, names and projections are unchanged.
+
+The RMSNorm/SwiGLU/rotary kernels and online-softmax recurrence were adapted from
+`../ajllm/src/ajllm/modeling/cuda_kernels.py` and `flash_attention.py`. Training
+backward paths were not copied. Qwen's split-half RoPE differs from ajllm's adjacent
+pair layout; ragged paging, GQA mapping, absolute chunk offsets, decode partitions
+and LSE merging are implemented here. Algorithm references are the
+[Triton fused-attention tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
+and [vLLM paged-attention design](https://docs.vllm.ai/en/latest/design/paged_attention/).
+
+### Capacity, JIT and validation
+
+`Qwen2MemoryEstimate` uses the resolved backend. Triton retains the physical pool,
+packed activation/sampling reserves and split-decode workspace, but removes the
+eager quadratic attention and dense KV gather terms. Startup peak measurements
+and runtime budget control remain enabled. Warmup compiles the shapes it executes;
+first use of another dtype/head/split variant can still incur JIT latency.
+Block-table width and SwiGLU token count are runtime values to avoid recompiling
+for every context or batch length. Short decode avoids a redundant merge launch.
+
+CUDA tests cover mixed/chunked batches, noncontiguous physical pages, odd page
+sizes, head dimensions 8/16/48/64/128/256, 7:1 GQA, large logits, long-context
+split decode with empty partitions, prefix reuse, memory-pressure replay and live
+HTTP arrivals/cancellation/failure. A structural test rejects dense KV gather and
+asserts one model forward with no dense causal mask. FP32/FP16/BF16 kernels are
+compared with eager/FP32 attention oracles; reduced-precision floating-point
+reordering can change logits or sampled tokens and is not bitwise equivalence.
+Bounded real-model parity and performance results are in
+[benchmarking](../benchmarking.md#stage-3-compute-comparison).
 
 ## Stage 4: advanced execution
 

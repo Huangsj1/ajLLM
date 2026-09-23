@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from ajvllm import EngineConfig, SamplingParams
+from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
@@ -42,6 +43,7 @@ def main() -> None:
         device=args.device,
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
+        compute_config=ComputeConfig(**settings.get("compute", {})),
     )
     engine = runtime.engine
     runner = engine.runner

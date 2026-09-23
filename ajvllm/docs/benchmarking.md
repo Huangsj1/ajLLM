@@ -180,3 +180,81 @@ does not promise lower total VRAM for every workload. The next compute stage
 should remove eager gathers and quadratic attention temporaries while preserving
 the same packed batch, block-table and slot-mapping contracts. No temporary
 comparison scripts or per-run result files are retained in the repository.
+
+## Stage 3 compute comparison
+
+Use `[memory] backend = "paged"` and compare `[compute] backend = "eager"` against
+`"triton"` (the default `"auto"` resolves to Triton for the local BF16 checkpoint).
+Restart between runs; `/health.compute_backend` records the resolved choice.
+Disable prefix caching to isolate compute savings, then measure prefix reuse
+separately. Warm the actual input/output shapes before timing: Triton JIT cost is
+cold-start work and may otherwise dominate a short trace. The default one-request
+client warmup does not necessarily exercise all mixed or split-decode variants.
+
+Bounded local measurements used RTX 3080 Ti, Qwen2.5-0.5B-Instruct BF16, two CPU
+threads and synchronized stage profiling. Each backend/concurrency used a fresh
+process with fixed scheduling: max context 1152, sequence cap 4, token budget 512,
+per-request prefill chunk 128 and aggregate prefill cap 480. Both used the same
+54 MiB paged pool (288 blocks of 16 tokens), with prefix caching disabled and no
+adaptive budget controller in the comparison. This prevents backend-dependent
+capacity resolution from changing the workload. Slice the first four `long.jsonl`
+rows to 256/512/768/1024 tokens, cycle them over 12 measured requests, and request
+16 outputs with temperature 0.8, top-p 0.9, seed 0 and ignore EOS. An excluded
+four-request pass and a small runner probe warm the kernel paths before each run.
+
+| Concurrency | Eager tokens/s | Triton tokens/s | Speedup | Eager / Triton TTFT (s) | Eager / Triton TPOT (s) | Eager / Triton peak allocated MiB |
+| --- | ---: | ---: | ---: | --- | --- | --- |
+| 1 | 23.72 | 48.64 | 2.05x | 0.1627 / 0.0739 | 0.0341 / 0.0170 | 1051.3 / 1038.3 |
+| 2 | 40.51 | 75.30 | 1.86x | 0.2137 / 0.1187 | 0.0359 / 0.0191 | 1069.1 / 1048.2 |
+| 4 | 68.28 | 125.83 | 1.84x | 0.2196 / 0.1238 | 0.0385 / 0.0221 | 1106.4 / 1066.9 |
+
+All six reported cases completed 12/12 requests with no failures. Each wrote
+7860 KV tokens and had no prefix hits, so the throughput gain does not come from
+skipping input computation. Total profiled model time fell from 7.108/4.076/2.387 s
+to 3.073/1.909/1.115 s at concurrency 1/2/4. Pure-decode step means fell from
+0.0331/0.0342/0.0397 s to 0.0160/0.0175/0.0194 s. Scheduler batch timing can differ
+with concurrent HTTP arrivals, so mixed-step counts need not match exactly.
+These are bounded observations, not guarantees for the much larger default trace.
+Most resident memory here is weights and the fixed pool; smaller attention
+workspace therefore gives a modest total allocated-memory reduction at these sizes.
+
+An initial implementation specialized block-table width and SwiGLU token count
+at compile time. Its first concurrency-4 trace showed JIT stalls and only 49.61
+tokens/s. Making these dimensions runtime values removed the excessive variants;
+short-context decode also now avoids a separate merge launch. The table reports
+the corrected implementation after warmup, not a mixture of old and new kernels.
+
+### Attention-only measurements
+
+A separate bounded CUDA-event microbenchmark used BF16, 14 query heads, two KV
+heads, head dimension 64, page size 16 and shuffled physical page IDs. It compared
+the eager gather/grouped-matmul/FP32-softmax reference with native paged attention;
+Q/K/V were already computed. Three warmups preceded 20 timed calls; the table
+shows median elapsed GPU event time and peak incremental allocated tensor memory.
+Metadata, persistent KV and inputs were allocated before measuring. These timings
+include launch gaps but exclude projections, RoPE/cache writes, MLPs and sampling.
+
+| Workload: query lengths / context lengths | Eager ms | Triton ms | Eager / Triton temporary MiB |
+| --- | ---: | ---: | --- |
+| Chunk prefill: `[512]` / `[2048]` | 0.9994 | 0.1431 | 141.875 / 0.875 |
+| Mixed: `[128,1,1,1]` / `[2048,4096,3072,1024]` | 1.5985 | 0.1700 | 288.875 / 0.391 |
+| Decode: `[1,1,1,1]` / `[4096,3072,2048,1024]` | 0.4229 | 0.0922 | 12.889 / 0.229 |
+
+On the same decode case, forcing a single partition took 0.2120 ms with 0.0068 MiB
+output workspace. Splitting uses more small temporary buffers but exposes enough
+parallel work to outweigh its merge overhead in this measurement. This does not
+establish an optimal threshold on other GPUs. The large mixed/prefill workspace
+reduction comes from eliminating query padding, dense KV gather and materialized
+scores/probabilities; physical KV pool capacity itself is unchanged.
+
+Tiny CUDA validation covers FP32/FP16/BF16, odd page/head sizes, long cached-prefix
+chunks, empty decode partitions, 7:1 GQA, large logits, prefix reuse, preemption,
+one-forward/no-gather invariants, and persistent service behavior. A separate
+single-checkpoint FP32 comparison measured maximum logit differences of
+`3.4333e-5` (prefill), `3.0995e-5` (mixed) and `3.4154e-5` (decode), within
+`atol=3e-4, rtol=3e-5`. Reduced-precision scheduling/backend changes are not
+promised to generate bitwise-identical logits or sampled text.
+
+No concurrency-8 stress run was used. Tests used a 15% allocator cap; real-model
+comparisons used 40%. Temporary experiment scripts were removed; the reusable
+benchmark client and datasets remain the supported comparison workflow.

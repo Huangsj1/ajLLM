@@ -8,10 +8,10 @@ import torch
 @dataclass
 class PagedBatch:
     storage: "PagedKVStorage"
-    block_tables: torch.Tensor
-    slot_mapping: torch.Tensor      # slot index in the storage tensor for each request token, shape: (num_requests, max_context_len)
-    read_slots: torch.Tensor
-    valid: torch.Tensor
+    block_tables: torch.Tensor  # physical block indices for each request, padded with 0s to the max width
+    slot_mapping: torch.Tensor  # Physical slot per packed scheduled token, shape [T].
+    read_slots: torch.Tensor | None
+    valid: torch.Tensor | None
 
     def update(self, layer: int, key: torch.Tensor, value: torch.Tensor):
         keys, values = self.storage.layer(layer)

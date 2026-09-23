@@ -10,6 +10,7 @@ import torch
 import uvicorn
 
 from ajvllm import EngineConfig
+from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.serving.http import create_app
@@ -42,6 +43,7 @@ def main():
         device=args.device,
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
+        compute_config=ComputeConfig(**settings.get("compute", {})),
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     service = EngineService(runtime, max_pending_requests=args.max_pending_requests, profile_steps=args.profile_steps)

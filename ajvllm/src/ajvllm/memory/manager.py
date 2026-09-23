@@ -13,8 +13,8 @@ from ajvllm.memory.storage import PagedBatch, PagedKVStorage
 
 @dataclass
 class SequenceState:
-    blocks: list[int] = field(default_factory=list)     # list of block indices allocated to this sequence
-    tokens: tuple[int, ...] = ()                        # tokens already computed for this sequence
+    blocks: list[int] = field(default_factory=list)  # list of block indices allocated to this sequence
+    tokens: tuple[int, ...] = ()  # tokens already computed for this sequence
     hashes: list[bytes] = field(default_factory=list)
     salt: str = ""
     pending_hit_tokens: int = 0
@@ -54,7 +54,7 @@ class KVCacheManager:
         return hashlib.sha256(parent + json.dumps(tokens, separators=(",", ":")).encode()).digest()
 
     def attach(self, request_id, tokens, salt="") -> int:
-        '''make a sequenceState for this request, and return the number of tokens already computed for this request'''
+        """make a sequenceState for this request, and return the number of tokens already computed for this request"""
         if request_id in self.states:
             return len(self.states[request_id].tokens)
         state = SequenceState(salt=salt)
@@ -143,21 +143,26 @@ class KVCacheManager:
     def clear_prefix_cache(self):
         self.blocks.clear_prefixes()
 
-    def batch(self, request_ids, positions, sequence_ids, contexts) -> PagedBatch:
-        '''
+    def batch(self, request_ids, positions, sequence_ids, contexts, *, gather=True) -> PagedBatch:
+        """
         suppose block_size=4;
-        suppose 3 requests: A prefill 6 tokens [A0 A1 A2 A3 A4 A5],  B prefill 3 tokens [B0 B1 B2], C decode 1 token [C0 C1 C2 C3 C4] + [C5];
+        suppose 3 requests: A prefill [A0 A1 A2 A3 A4 A5], 
+                            B prefill [B0 B1 B2],
+                            C decode [C5] with cached [C0 C1 C2 C3 C4];
         suppose block_A = [2,5], block_B = [7], block_C = [1,6]
 
-        input: request_ids=[A0 A1 A2 A3 A4 A5 | B0 B1 B2 | C5], positions=[0 1 2 3 4 5 | 0 1 2 | 5], sequence_ids=[0 0 0 0 0 0 | 1 1 1 | 2], contexts=[6,3,6]
+        input: request_ids=[A0 A1 A2 A3 A4 A5 | B0 B1 B2 | C5], 
+                positions=[0 1 2 3 4 5 | 0 1 2 | 5], 
+                sequence_ids=[0 0 0 0 0 0 | 1 1 1 | 2], 
+                contexts=[6,3,6]
 
-        variable: 
-            width = 2, 
+        variable:
+            width = 2,
             tables = [[2,5], [7,0], [1,6]],
             slots = [8 9 10 11 20 21 | 28 29 30 | 25],
             read_slots = [[8 9 10 11 20 21], [28 29 30 31 * *], [4, 5, 6, 7, 24, 25]],
             valid = [[1 1 1 1 1 1], [1 1 1 0 0 0], [1 1 1 1 1 1]]
-        '''
+        """
         device = self.storage.tensor.device
         # max number of blocks needed for any request
         width = (max(contexts) + self.block_size - 1) // self.block_size
@@ -168,6 +173,8 @@ class KVCacheManager:
         tables = torch.tensor(tables, device=device, dtype=torch.long)
         # each token's physical slot in the storage tensor: block_index * block_size + position_in_block
         slots = tables[sequence_ids, positions // self.block_size] * self.block_size + positions % self.block_size
+        if not gather:  # triton
+            return PagedBatch(self.storage, tables, slots, None, None)
         offsets = torch.arange(max(contexts), device=device)
         # each request's all physical slots for reading, padded with 0s to the max width
         read_slots = tables[:, offsets // self.block_size] * self.block_size + offsets % self.block_size

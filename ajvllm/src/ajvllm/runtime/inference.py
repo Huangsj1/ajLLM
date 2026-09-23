@@ -5,7 +5,9 @@ from dataclasses import dataclass
 import torch
 
 from ajvllm import Engine, EngineExecutionError
+from ajvllm.attention.backends.triton import resolve_backend
 from ajvllm.config import MemoryConfig
+from ajvllm.config.compute import ComputeConfig
 from ajvllm.execution.capacity import Qwen2MemoryEstimate
 from ajvllm.execution.qwen2 import Qwen2Runner, read_eos_token_ids
 from ajvllm.modeling.qwen2.weights import load_qwen2
@@ -18,14 +20,21 @@ class InferenceRuntime:
     budget: MemoryBudget | None = None
 
     @classmethod
-    def from_model(cls, model, config, *, memory_config=None, eos_token_ids=(), **budget_options):
+    def from_model(cls, model, config, *, memory_config=None, compute_config=None, eos_token_ids=(), **budget_options):
         memory_config = memory_config or MemoryConfig()
+        compute_config = ComputeConfig(backend=resolve_backend(compute_config or ComputeConfig(), model, memory_config))
         estimate = Qwen2MemoryEstimate(
-            model.config, model.model.embed_tokens.weight.element_size(), config, memory_config
+            model.config, model.model.embed_tokens.weight.element_size(), config, memory_config, compute_config.backend
         )
         # Measure weights/static buffers before allocating KV; plan capacity first.
         budget = MemoryBudget(model.device, config, estimate=estimate, **budget_options)
-        runner = Qwen2Runner(model, eos_token_ids, memory_config=memory_config, engine_config=budget.config)
+        runner = Qwen2Runner(
+            model,
+            eos_token_ids,
+            memory_config=memory_config,
+            engine_config=budget.config,
+            compute_config=compute_config,
+        )
         budget.warmup(runner.probe)
         engine = Engine(runner, budget.config)
         engine.set_token_budget(budget.stats.token_budget)

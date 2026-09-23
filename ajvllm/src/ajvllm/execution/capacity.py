@@ -1,4 +1,4 @@
-"""Workspace estimate for the eager Qwen2 backend, excluding loaded model weights."""
+"""Workspace estimates for eager and Triton Qwen2 backends, excluding loaded model weights."""
 
 from dataclasses import dataclass
 
@@ -12,6 +12,7 @@ class Qwen2MemoryEstimate:
     element_size: int
     engine_config: EngineConfig
     memory_config: MemoryConfig
+    compute_backend: str = "eager"
 
     def __call__(self, slots: int, tokens: int) -> int:
         cfg = self.model_config
@@ -37,6 +38,12 @@ class Qwen2MemoryEstimate:
         # Mixed batches pad every request to the largest query/context dimensions,
         # including decode rows. Reserve that workspace even when prefill is capped.
         attention = min(slots, tokens) * cfg.num_attention_heads * query * context * (3 * size + 4)
+        if self.compute_backend == "triton":
+            kv = pool
+            workspace_reserve = 0
+            # FP32 split outputs/LSE, bounded by one decode row per sequence.
+            splits = (context + 255) // 256
+            attention = slots * cfg.num_attention_heads * splits * (cfg.head_dim + 1) * 4
         activations = tokens * (8 * cfg.hidden_size + 4 * cfg.intermediate_size) * size
         # General CUDA sampling keeps FP32 scores/probabilities/CDFs, history
         # buffers, int64 sorted IDs and sorting workspace on device.
