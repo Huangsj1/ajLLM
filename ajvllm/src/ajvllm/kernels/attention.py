@@ -123,7 +123,7 @@ def _decode(
         normalizer = normalizer * alpha + tl.sum(p, 0)
         m = new_m
     if SPLITS == 1:
-        tl.store(Out + (token * HQ + head) * D + d, acc / normalizer, d < D)
+        tl.store(Out + (token * HQ + head) * D + d, acc / tl.maximum(normalizer, 1.0e-20), d < D)
     else:
         index = (request * HQ + head) * SPLITS + part
         tl.store(Partial + index * D + d, acc / tl.maximum(normalizer, 1.0e-20), d < D)
@@ -147,8 +147,9 @@ def _merge(
     s, d = tl.arange(0, BS), tl.arange(0, BD)
     index = (request * HQ + head) * SPLITS + s
     lse = tl.load(LSE + index, s < SPLITS, float("-inf"))
-    weights = tl.exp(lse - tl.max(lse, 0))
-    weights /= tl.sum(weights, 0)
+    maximum = tl.max(lse, 0)
+    weights = tl.exp(lse - tl.where(maximum == float("-inf"), 0.0, maximum))
+    weights /= tl.maximum(tl.sum(weights, 0), 1.0e-20)
     values = tl.load(Partial + index[:, None] * D + d[None, :], (s[:, None] < SPLITS) & (d[None, :] < D), 0)
     result = tl.sum(values * weights[:, None], 0)
     token = tl.load(Starts + tl.load(Rows + request))
@@ -162,11 +163,13 @@ def paged_attention(q, paged, layer, metadata):
     k, v = paged.storage.layer(layer)
     hq, d = q.shape[1:]
     hk = k.shape[1]
-    # args = (max_num_blocks_for_one_request, block_size, num_query_heads, num_kv_heads, head_dim, next_power_of_2(head_dim))
+    # args = (max_num_blocks_for_one_request, block_size, num_query_heads, num_kv_heads, head_dim,
+    # next_power_of_2(head_dim))
     args = (paged.block_tables.shape[1], paged.storage.block_size, hq, hk, d, max(16, triton.next_power_of_2(d)))
     # 1. prefill
     if metadata.prefill_tiles.shape[0]:
-        # grid = (num_prefill_tiles, num_heads), each program processes one tile's one head(one prefill request may have multiple tiles)
+        # grid = (num_prefill_tiles, num_heads), each program processes one tile's one head(one prefill request may
+        # have multiple tiles)
         _prefill[(metadata.prefill_tiles.shape[0], hq)](
             q,
             k,

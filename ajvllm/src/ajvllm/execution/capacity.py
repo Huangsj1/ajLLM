@@ -13,6 +13,7 @@ class Qwen2MemoryEstimate:
     engine_config: EngineConfig
     memory_config: MemoryConfig
     compute_backend: str = "eager"
+    graph_reserve_bytes: int = 0
 
     def __call__(self, slots: int, tokens: int) -> int:
         cfg = self.model_config
@@ -48,4 +49,4 @@ class Qwen2MemoryEstimate:
         # General CUDA sampling keeps FP32 scores/probabilities/CDFs, history
         # buffers, int64 sorted IDs and sorting workspace on device.
         logits = slots * cfg.vocab_size * 64
-        return kv + workspace_reserve + attention + activations + logits
+        return kv + workspace_reserve + attention + activations + logits + self.graph_reserve_bytes

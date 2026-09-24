@@ -258,3 +258,102 @@ promised to generate bitwise-identical logits or sampled text.
 No concurrency-8 stress run was used. Tests used a 15% allocator cap; real-model
 comparisons used 40%. Temporary experiment scripts were removed; the reusable
 benchmark client and datasets remain the supported comparison workflow.
+
+## Stage 4 graphs and quantization
+
+Compare four independent settings, retaining Triton + paged KV throughout:
+
+| Mode | `[graphs] enabled` | `[quantization] mode` |
+| --- | --- | --- |
+| Baseline | false | `"none"` |
+| Graph | true | `"none"` |
+| W8A16 | false | `"w8a16"` |
+| Both | true | `"w8a16"` |
+
+The report includes graph capture/replay/fallback deltas and quantization metadata.
+Graph retention is persistent memory, so account for it separately from fixed KV
+capacity and model storage. Compare after warmup, but inspect `graphs.counters.captures`:
+concurrent arrivals can produce a bucket absent from the warmup trace. The client
+records this rather than hiding capture time.
+
+### Bounded local four-way comparison
+
+RTX 3080 Ti, local Qwen2.5-0.5B-Instruct BF16, two CPU threads, synchronized stage
+profiling and a 40% allocator cap. Each cell used a fresh process and fixed scheduling
+without adaptive budgeting: context 640, max sequences 4, token budget 256, prefill
+chunk 64, aggregate prefill cap 240. All four modes used the same 30 MiB KV pool
+with block size 16 and prefix caching disabled. Graphs used batch buckets 1/2/4,
+max eight graphs and a 128 MiB conservative retention allowance.
+
+The first four `long.jsonl` rows were tokenized and truncated to 128/256/384/512
+tokens. Eight requests cycled these rows with 24 output tokens, temperature 0.8,
+top-p 0.9, seed 0 and ignore EOS. A runner probe and four excluded requests warmed
+the paths before measurement. All 12 reported cases completed 8/8 requests.
+These settings differ from Stage 3 and the default long benchmark; compare within
+this table rather than interpreting cross-table changes as another speedup.
+
+| Concurrency | Baseline tokens/s | Graph tokens/s | W8A16 tokens/s | Both tokens/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 47.63 | 100.29 | 48.28 | 92.67 |
+| 2 | 80.57 | 135.36 | 84.32 | 145.10 |
+| 4 | 152.26 | 222.77 | 138.86 | 212.51 |
+
+| Concurrency | Baseline TPOT ms | Graph TPOT ms | W8A16 TPOT ms | Both TPOT ms |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 18.29 | 7.07 | 18.21 | 7.10 |
+| 2 | 20.00 | 10.27 | 19.27 | 9.47 |
+| 4 | 19.48 | 12.48 | 21.12 | 12.73 |
+
+| Concurrency | Baseline / graph peak allocated MiB | W8A16 / both peak allocated MiB |
+| --- | --- | --- |
+| 1 | 1014.25 / 1036.58 | 664.66 / 684.99 |
+| 2 | 1024.21 / 1048.28 | 674.62 / 697.27 |
+| 4 | 1042.91 / 1067.55 | 692.68 / 715.33 |
+
+Graph-only throughput increased 2.11x/1.68x/1.46x at concurrency 1/2/4. The gain
+primarily reduces repeated model launch overhead during decode; prefill/mixed
+batches still use normal execution, so TTFT gains are smaller. Graph-only replay
+counts were 184/83/42, with 40/37/22 fallback forwards. No new graph was captured
+in these three measured cases. The combined concurrency-2 case captured one
+additional bucket during measurement; its reported time includes that cold cost.
+Graphs increased measured allocated peaks by roughly 22–25 MiB, while conservative
+retention counters can be much larger because each entry reserves workspace headroom.
+
+W8A16 converted 168 decoder projections. Model parameters plus static buffers fell
+from 950.29 MiB to 610.20 MiB (35.8%); the original floating model still has to fit
+during loading. Embeddings/head/norms and KV remain unquantized. W8A16 alone did
+not show a consistent speedup: its concurrency-4 throughput was about 8.8% lower
+than baseline. Combining it with graphs retains the main decode launch benefit
+and lower model residency, but is not uniformly faster than graphs alone.
+These are short observations; small differences need repeated measurements.
+
+### Quantization numerical and quality checks
+
+Native kernels are checked against an explicit CUDA dequantize + linear oracle,
+including zero channels, odd dimensions, optional bias, GEMV/GEMM and FP16/BF16.
+These checks isolate implementation errors from the intentional weight approximation.
+Graph tests also cover quantized weights, padded rows, split decode and changed pages.
+
+A separate teacher-forced check used the first 65 tokens of each of the first four
+long-dataset prompts (256 next-token predictions). The same BF16 model was evaluated
+before and after conversion, with fixed input tokens and eager attention to isolate
+projection changes. Results:
+
+| Metric | Result |
+| --- | ---: |
+| Next-token argmax agreement | 95.31% |
+| Mean absolute logit error | 0.1362 |
+| Maximum absolute logit error | 6.09375 |
+| Mean KL(original probabilities \| quantized probabilities) | 0.01987 |
+| Original / W8A16 mean next-token NLL | 3.9735 / 3.9557 |
+
+This small, structurally similar text sample is a local regression diagnostic,
+not a task-quality certification. The slightly lower NLL is not evidence that
+quantization improves quality, and the maximum error shows that individual logits
+can change substantially despite high top-1 agreement. Generated text is not
+expected to match the unquantized model exactly. Evaluate the intended task corpus
+before choosing a deployment precision policy.
+
+Tests used tiny CUDA models with a 15% allocator cap; no concurrency-8 stress test
+was run. Temporary comparison/quality scripts were removed after recording these
+results. The reusable dataset and benchmark workflow remain unchanged in purpose.

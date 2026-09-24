@@ -12,9 +12,11 @@ import uvicorn
 from test_qwen2_cuda import pair, tiny_config
 
 from ajvllm import Engine, EngineConfig, SamplingParams
+from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.qwen2 import Qwen2Runner
+from ajvllm.quantization.linear import quantize_model
 from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.serving.http import create_app
 from ajvllm.serving.service import EngineService, ServiceBusy
@@ -23,14 +25,19 @@ from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 pytestmark = pytest.mark.cuda
 
 
-@pytest.fixture(params=["contiguous", "paged", "triton"])
+@pytest.fixture(params=["contiguous", "paged", "triton", "advanced"])
 def runner(request):
     assert torch.cuda.is_available()
-    model, _ = pair(tiny_config())
+    model, _ = pair(tiny_config(), torch.bfloat16 if request.param == "advanced" else torch.float32)
+    if request.param == "advanced":
+        quantize_model(model, QuantizationConfig(mode="w8a16"))
     runner = Qwen2Runner(
         model,
-        compute_config=ComputeConfig(backend="triton" if request.param == "triton" else "eager"),
-        memory_config=MemoryConfig(backend="paged" if request.param == "triton" else request.param, block_size=4),
+        graph_config=GraphConfig(enabled=request.param == "advanced", batch_sizes=(1, 2, 4)),
+        compute_config=ComputeConfig(backend="triton" if request.param in ("triton", "advanced") else "eager"),
+        memory_config=MemoryConfig(
+            backend="paged" if request.param in ("triton", "advanced") else request.param, block_size=4
+        ),
         engine_config=EngineConfig(max_model_len=128, max_num_seqs=3),
     )
     return runner

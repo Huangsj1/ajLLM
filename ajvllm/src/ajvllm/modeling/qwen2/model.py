@@ -31,8 +31,10 @@ class Qwen2ForCausalLM(nn.Module):
         self.model = Decoder(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.tie_weights()
-        self.register_buffer("rope_cos", torch.empty(0), persistent=False)  # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
-        self.register_buffer("rope_sin", torch.empty(0), persistent=False)  # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
+        # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
+        self.register_buffer("rope_cos", torch.empty(0), persistent=False)
+        # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
+        self.register_buffer("rope_sin", torch.empty(0), persistent=False)
         self._init_rope()
 
     def _init_rope(self) -> None:

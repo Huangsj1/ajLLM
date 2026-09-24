@@ -213,3 +213,39 @@ Triton JIT compilation happens on first use of a kernel variant. Startup warms
 representative prefill/decode, but a new head/dtype/partition variant may still
 compile later. Exclude compilation from steady-state measurements by warming the
 actual workload, and measure cold-start latency separately when it matters.
+
+## CUDA Graphs and weight quantization
+
+Both optimizations are off by default and are independent:
+
+```toml
+[graphs]
+enabled = true
+batch_sizes = [1, 2, 4, 8]
+max_graphs = 8
+memory_limit_mb = 128
+
+[quantization]
+mode = "w8a16" # "none" keeps original weights
+```
+
+Graphs require `[compute] backend = "triton"`, or `auto` resolving to Triton,
+and paged KV. One-token sampling-ready batches use bounded batch/context buckets;
+other shapes keep the usual mixed Triton forward. The first encounter of a new
+bucket warms/captures it, adding cold latency. Cache limits cause ordinary forward
+fallback. The graph retention allowance is reserved during startup memory planning;
+actual graph pools can raise idle allocated/reserved VRAM. Padding has invalid KV
+slots and cannot overwrite active requests' pages.
+
+W8A16 requires CUDA SM80+ and FP16/BF16 model dtype. Conversion quantizes only
+decoder projections; embeddings, LM head, norms, activations and KV keep their
+original dtype. The full floating model loads before conversion, so quantization
+does not yet make an otherwise unloadable checkpoint fit. Restart to change model,
+quantization, graph or cache settings; hot conversion with existing graphs/caches
+is unsupported. Offline generation uses the same configuration and runtime.
+
+`/health.graphs` exposes captures/replays/fallbacks and a conservative retained-byte
+budget; this is distinct from exact allocated or reserved bytes. `/health.quantization`
+reports converted layers, weight/scale/activation/KV dtypes and model storage bytes
+(including static buffers, excluding KV/graphs/workspaces). The benchmark report
+records graph counter deltas and quantization metadata alongside existing metrics.

@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 
 from ajvllm import EngineConfig, SamplingParams
+from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.runtime.inference import InferenceRuntime
@@ -44,6 +45,8 @@ def main() -> None:
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
         compute_config=ComputeConfig(**settings.get("compute", {})),
+        graph_config=GraphConfig(**settings.get("graphs", {})),
+        quantization_config=QuantizationConfig(**settings.get("quantization", {})),
     )
     engine = runtime.engine
     runner = engine.runner

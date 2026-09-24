@@ -9,12 +9,15 @@ import torch
 
 from ajvllm.attention.backends.triton import resolve_backend
 from ajvllm.config import EngineConfig, require_int
+from ajvllm.config.advanced import GraphConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.batch import KVCache, ModelBatch
 from ajvllm.memory.manager import KVCacheManager
 from ajvllm.modeling.qwen2.model import Qwen2ForCausalLM
 from ajvllm.modeling.qwen2.weights import load_qwen2
+from ajvllm.quantization.linear import quantization_stats
+from ajvllm.runtime.graphs import DecodeGraphs
 from ajvllm.scheduling.batch import Phase, ScheduledRequest, SchedulerOutput
 
 
@@ -42,6 +45,7 @@ class Qwen2Runner:
         *,
         memory_config: MemoryConfig | None = None,
         compute_config: ComputeConfig | None = None,
+        graph_config: GraphConfig | None = None,
         engine_config: EngineConfig | None = None,
     ):
         if model.device.type != "cuda":
@@ -70,6 +74,11 @@ class Qwen2Runner:
                 max_model_len=engine_config.max_model_len,
                 max_num_seqs=engine_config.max_num_seqs,
             )
+        graph_config = graph_config or GraphConfig()
+        if graph_config.enabled and self.compute_backend != "triton":
+            raise ValueError("CUDA graphs require the Triton paged backend")
+        self.graphs = DecodeGraphs(model, graph_config, self.context_limit) if graph_config.enabled else None
+        self.quantization = quantization_stats(model)
         self._cache_written_tokens = 0
         self.profile_enabled = False
         self.stage_seconds = {key: 0.0 for key in ("prepare", "model")}
@@ -173,7 +182,7 @@ class Qwen2Runner:
                 )
         try:
             with self._stage("model"):
-                output = self.model(inputs)
+                output = self.graphs.execute(inputs) if self.graphs is not None else self.model(inputs)
         finally:
             if self.kv_cache is not None:
                 self.kv_cache.storage.record()

@@ -16,3 +16,12 @@ cache_namespace = "local"
 
 [compute]
 backend = "auto" # Triton paged kernels for FP16/BF16 on SM80+; eager reference otherwise.
+
+[graphs]
+enabled = false
+batch_sizes = [1, 2, 4, 8]
+max_graphs = 8
+memory_limit_mb = 128
+
+[quantization]
+mode = "none" # "w8a16" quantizes decoder projections; activations/KV stay FP16/BF16.

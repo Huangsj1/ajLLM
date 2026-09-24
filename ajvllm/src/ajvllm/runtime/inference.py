@@ -7,10 +7,12 @@ import torch
 from ajvllm import Engine, EngineExecutionError
 from ajvllm.attention.backends.triton import resolve_backend
 from ajvllm.config import MemoryConfig
+from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.execution.capacity import Qwen2MemoryEstimate
 from ajvllm.execution.qwen2 import Qwen2Runner, read_eos_token_ids
 from ajvllm.modeling.qwen2.weights import load_qwen2
+from ajvllm.quantization.linear import quantize_model
 from ajvllm.runtime.budget import MemoryBudget
 
 
@@ -20,11 +22,29 @@ class InferenceRuntime:
     budget: MemoryBudget | None = None
 
     @classmethod
-    def from_model(cls, model, config, *, memory_config=None, compute_config=None, eos_token_ids=(), **budget_options):
+    def from_model(
+        cls,
+        model,
+        config,
+        *,
+        memory_config=None,
+        compute_config=None,
+        graph_config=None,
+        quantization_config=None,
+        eos_token_ids=(),
+        **budget_options,
+    ):
         memory_config = memory_config or MemoryConfig()
+        graph_config = graph_config or GraphConfig()
+        quantize_model(model, quantization_config or QuantizationConfig())
         compute_config = ComputeConfig(backend=resolve_backend(compute_config or ComputeConfig(), model, memory_config))
         estimate = Qwen2MemoryEstimate(
-            model.config, model.model.embed_tokens.weight.element_size(), config, memory_config, compute_config.backend
+            model.config,
+            model.model.embed_tokens.weight.element_size(),
+            config,
+            memory_config,
+            compute_config.backend,
+            graph_config.reserve_bytes,
         )
         # Measure weights/static buffers before allocating KV; plan capacity first.
         budget = MemoryBudget(model.device, config, estimate=estimate, **budget_options)
@@ -34,6 +54,7 @@ class InferenceRuntime:
             memory_config=memory_config,
             engine_config=budget.config,
             compute_config=compute_config,
+            graph_config=graph_config,
         )
         budget.warmup(runner.probe)
         engine = Engine(runner, budget.config)

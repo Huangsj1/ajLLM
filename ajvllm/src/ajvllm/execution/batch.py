@@ -41,7 +41,7 @@ class ModelBatch:
     def build(
         cls,
         sequences: Sequence[Sequence[int] | torch.Tensor],
-        caches: Sequence[KVCache | None],
+        caches: Sequence[KVCache | None],       # None when use paged KV cache
         device: torch.device,
         sample_requests: Sequence[int],
         *,

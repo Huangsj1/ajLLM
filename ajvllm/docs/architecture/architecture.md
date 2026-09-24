@@ -14,7 +14,8 @@ Scheduling policies operate on token counts and block ownership rather than tens
 | 2a: model baseline (implemented) | Native Qwen2.5 weight loader, tokenizer adapter, eager dense/GQA forward, simple contiguous per-request KV storage | Full vs incremental and chunked logits agree with a trusted Qwen2 implementation on tiny and real checkpoints |
 | 2b: memory (implemented) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
 | 3: compute (implemented) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
-| 4: advanced (planned) | CUDA Graphs, quantization, tensor parallelism, prefill/decode disaggregation | Backend parity, distributed correctness, and workload-specific performance evidence |
+| 4a/4b: advanced (implemented) | Bounded decode CUDA Graphs and W8A16 weight-only quantization | Graph replay parity, quantized-kernel parity, measured quality/memory/latency |
+| 4c: disaggregation (planned) | Prefill/decode workers and KV handoff | Transfer correctness, ownership/lifetime safety and workload-specific benefit |
 
 The native backend now executes each logical scheduler batch as one packed mixed model
 forward, caches RoPE factors, and serves live HTTP/SSE requests. Synthetic CPU
@@ -38,9 +39,9 @@ src/ajvllm/
   memory/                block ownership, paged CUDA storage, prefix index, contiguous reference
   attention/backends/    compact ragged metadata and compute-backend selection
   kernels/               Triton paged prefill/decode and fused elementwise operations
-  runtime/               adaptive CUDA memory budget; graph capture remains planned
-  quantization/          planned quantized linear and KV representations
-  distributed/           planned TP collectives and KV transfer
+  runtime/               adaptive memory budget, shared execution and bounded decode graphs
+  quantization/          per-channel W8A16 linear modules and conversion
+  distributed/           reserved for prefill/decode KV handoff
   serving/               async engine service and HTTP/SSE; disaggregation remains planned
 benchmarks/              reusable datasets; service latency, throughput and memory measurements
 tests/                   framework tests and CUDA model acceptance tests
@@ -392,23 +393,89 @@ Bounded real-model parity and performance results are in
 
 ## Stage 4: advanced execution
 
-**CUDA Graphs:** capture stable tensor addresses with bucketed batch/token shapes,
-update input/metadata buffers before replay, mask padding, and fall back to eager
-for unsupported shapes. Never allocate dynamic KV pages inside capture. Verify
-padding cannot write live cache slots. See [vLLM graph design](https://docs.vllm.ai/en/latest/design/cuda_graphs/).
+### CUDA Graphs (implemented)
 
-**Quantization:** introduce explicit weight/activation/KV dtype and scale metadata.
-Start with one format and a dequantized reference, then a native quantized GEMM.
-Specify per-tensor/channel/group scaling and calibration requirements. Validate
-logit error, task quality, memory use, and latency independently; quantization is
-not expected to preserve sampled tokens exactly.
+`runtime/graphs.py::DecodeGraphs` owns static inputs, captured outputs and CUDA
+graphs. The runner delegates model execution after the scheduler reserves KV pages;
+request admission, allocation, prefix publication, sampling and RNG advancement stay
+outside capture. `GraphConfig` is independent of compute/quantization settings.
+Graph execution requires the Triton paged backend and is opt-in.
 
-**Tensor parallelism:** shard Q/K/V and MLP gate/up projections by output channels;
-shard attention output and MLP down projections by input channels, then reduce.
-Shard or replicate KV heads according to divisibility, handle vocabulary-parallel
-embedding/logits, and synchronize the sampling decision across ranks. Test uneven
-or unsupported head/vocabulary layouts with explicit validation. Compare TP=1
-and multi-rank outputs, failure handling, and checkpoint sharding.
+The capture key is `(batch_bucket, context_bucket)`. Batch buckets default to
+1/2/4/8; context buckets round up to powers of two starting at 128 and clamp to
+the engine limit. Every real row must contain exactly one sampling-ready token.
+This includes ordinary decode and eligible one-token prompt tails. Other shapes,
+including multi-token prefill/mixed batches or partial prefills with no logits,
+use the normal Triton forward. No whole-model prefill/decode split is introduced.
+
+Static buffers hold token IDs, absolute positions, contexts, block tables and
+physical write slots. Before replay the runtime copies current metadata and zeros
+unused rows. Padded rows have context zero and slot -1: the fused cache writer masks
+negative slots, and decode/merge return finite zero attention for empty partitions.
+Padding therefore neither reads real context nor writes live cache pages. Block
+ownership can change between replays; the captured KV pool address stays fixed.
+Returned logits are cloned from graph outputs so later replays cannot mutate a
+previous caller's results.
+
+Two uncaptured warmup forwards initialize kernels/BLAS on a dedicated stream before
+capture. They repeat the same new-token slot writes without committing tokens or
+sampling; writes are idempotent for the fixed input and current history. Events
+order capture/replay, KV reuse and output copies across warmup and service streams.
+Graph construction does not allocate logical KV pages. Model forward temporaries
+are allocated in PyTorch's graph-private pool during capture and reused on replay.
+Capture failures propagate through existing engine cleanup; they do not silently
+retry potentially advanced requests.
+
+`max_graphs` and `memory_limit_mb` bound retention. A conservative estimate rejects
+new shapes before capture when headroom is insufficient; observed reserved/allocated
+growth can reject a capture afterward. This is a retention budget, not a hard
+bound on temporary capture-time allocations. The process memory estimator reserves
+the entire configured graph allowance in addition to weights, KV and workspace.
+Rejected shapes fall back to normal execution, with no eviction/recapture churn.
+Graphs live for the runner's lifetime; weights, quantization and KV pool must not
+be replaced after capture. `/health.graphs` reports captures, replays, fallbacks,
+cached graph count and conservative retained-budget bytes. First capture is cold
+latency and should be excluded from steady-state benchmark results.
+
+The capture/lifetime approach follows [PyTorch CUDA Graph guidance](https://pytorch.org/docs/stable/notes/cuda.html#cuda-graphs)
+and [vLLM graph dispatch](https://docs.vllm.ai/en/latest/design/cuda_graphs/).
+Full mixed/prefill capture remains a possible extension, not a requirement for
+this decode optimization. CUDA tests cover padding, changed token/page metadata,
+context bucket transitions, split decode, cross-stream replay, cache limits,
+retained-logit ownership, capture failures and combined quantized service requests.
+
+### W8A16 quantization (implemented)
+
+`quantization/linear.py::Int8Linear` replaces decoder Q/K/V/O and gate/up/down
+projections. For output channel j, `scale[j] = max(abs(W[j])) / 127` and
+`qweight[j] = round(W[j] / scale[j]).clamp(-127, 127)`. Zero rows use scale 1.
+Weights are INT8, scales FP32, and there is no zero point. Activations, bias and
+KV remain FP16/BF16. Embeddings, tied/untied LM head and norms retain their original
+precision. This is post-training abs-max weight quantization without calibration;
+it does not implement activation outlier handling, GPTQ/AWQ, INT4 or quantized KV.
+
+The loader still reads the existing floating-point checkpoint. Runtime conversion
+runs before memory calibration, runner construction and graph capture, releasing
+original projection parameters. Conversion uses slices of at most 128 output rows
+to bound FP32 scratch, but the original full model must first fit on the GPU.
+Pre-quantized checkpoint import/export and hot model conversion are not supported.
+Scale/weight buffers are explicit in the module state; `/health.quantization`
+reports scheme, dtypes, converted layer count and model storage bytes.
+
+`kernels/quantization.py` supplies two native paths: a small-row reduction kernel
+for <=8 activation rows, and tiled GEMM for larger batches. Both load INT8 weights,
+dequantize within the kernel and accumulate in FP32. GEMM uses FP16/BF16 tensor-core
+dots after tile dequantization; it is not an INT8-activation matmul. No full floating
+weight matrix is materialized by production forward. `Int8Linear.reference`
+explicitly dequantizes on CUDA only as a numerical oracle.
+
+Graph and quantization switches are independent and can be combined. Quantization
+reduces model residency but does not promise faster prefill/decode: conversion and
+GEMM tiling can offset lower weight traffic. Validation separates kernel agreement
+with the dequantized oracle from loss/next-token agreement with original weights.
+Floating-point rounding and weight approximation can change sampled text. Bounded
+local quality, memory and latency measurements are recorded in
+[benchmarking](../benchmarking.md#stage-4-graphs-and-quantization).
 
 **Prefill/decode disaggregation:** a router selects separate workers; prefill
 produces KV plus position/model/layout metadata and a well-defined first-token

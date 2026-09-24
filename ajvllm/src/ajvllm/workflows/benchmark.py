@@ -200,6 +200,15 @@ def run_benchmark(
             "pool_bytes": after.get("kv_cache", {}).get("pool_bytes", 0),
             "peak_used_bytes": after.get("kv_cache", {}).get("peak_used_bytes", 0),
         },
+        "graphs": {
+            "enabled": after.get("graphs", {}).get("enabled", False),
+            "counters": {
+                key: after.get("graphs", {}).get(key, 0) - before.get("graphs", {}).get(key, 0)
+                for key in ("captures", "replays", "fallbacks")
+            },
+            "retained_budget_bytes": after.get("graphs", {}).get("retained_budget_bytes", 0),
+        },
+        "quantization": after.get("quantization", {}),
         "stage_seconds": {
             key: value - before.get("stage_seconds", {}).get(key, 0.0)
             for key, value in after.get("stage_seconds", {}).items()
@@ -273,6 +282,8 @@ def main():
     if not report["server_steps"]:
         print("Step timings unavailable; start the server with --profile-steps to enable them.")
     print("KV cache:", json.dumps(report["kv_cache"]))
+    print("CUDA graphs:", json.dumps(report["graphs"]))
+    print("Quantization:", json.dumps(report["quantization"]))
     print("Stage totals (s):", json.dumps(report["stage_seconds"]))
     print(f"Sample metadata transfer: {report['transfer_bytes'] / 1024**2:.3f} MiB")
     print(f"Report: {args.output}")

@@ -77,6 +77,7 @@ class EngineService:
         self.metadata = {
             "resolved_engine": asdict(engine.config),
             "compute_backend": engine.runner.compute_backend,
+            "quantization": engine.runner.quantization,
             "kv_cache": engine.runner.memory_stats(),
             "model_config": asdict(model.config),
             "dtype": str(model.dtype),
@@ -86,6 +87,7 @@ class EngineService:
         }
         self.stats = {
             **self.metadata,
+            "graphs": self.engine.runner.graphs.snapshot() if self.engine.runner.graphs else {"enabled": False},
             "profile_steps": self.profile_steps,
             "memory": self.budget.snapshot() if self.budget else None,
         }
@@ -234,6 +236,9 @@ class EngineService:
                         "step_timing": {key: dict(value) for key, value in self.step_timing.items()}
                         if self.profile_steps
                         else {},
+                        "graphs": self.engine.runner.graphs.snapshot()
+                        if self.engine.runner.graphs
+                        else {"enabled": False},
                         "active_requests": self.engine.num_unfinished_requests,
                         "token_budget": self.engine.token_budget,
                         "memory": self.budget.snapshot() if self.budget else None,

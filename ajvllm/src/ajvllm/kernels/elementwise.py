@@ -93,8 +93,8 @@ def _rope_cache(
         slot = tl.load(Slots + t)
         target = (slot * HK + head) * D + d
         # store rotated k to k cache, and unrotated v to v cache
-        tl.store(KC + target, a + b, d < D)
-        tl.store(VC + target, tl.load(V + base + d, d < D, 0), d < D)
+        tl.store(KC + target, a + b, (d < D) & (slot >= 0))
+        tl.store(VC + target, tl.load(V + base + d, d < D, 0), (d < D) & (slot >= 0))
 
 
 def rope_and_cache(q, k, v, factors, paged, layer):

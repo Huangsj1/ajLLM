@@ -79,8 +79,9 @@ top-k/top-p and random selection. Only selected results return to the host.
 Public imports remain `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Configuration lives in `config/`, lifecycle types in `requests/`, tokenizer/chat
 handling in `tokenization/`, and runtime memory policy in `runtime/`. Memory algorithms live in `memory/`, native Triton kernels in `kernels/`, and
-backend metadata/selection in `attention/backends/`. Quantization and distributed
-directories remain reserved.
+backend metadata/selection in `attention/backends/`. Optional W8A16 conversion lives
+in `quantization/`, bounded decode CUDA Graphs in `runtime/graphs.py`; distributed
+KV handoff remains planned.
 
 See [architecture](docs/architecture/architecture.md), [model execution](docs/model_baseline.md),
 [serving](docs/serving.md), and [benchmarking](docs/benchmarking.md)
@@ -95,3 +96,8 @@ output tokens per request. Reports include TTFT, decode duration, TPOT, throughp
 and GPU utilization, saved under `benchmarks/results/`.
 See [benchmarking](docs/benchmarking.md) for memory expectations, comparison settings,
 and sampling controls.
+
+Stage 4 options are independent: set `[graphs] enabled = true` for decode graph
+replay and `[quantization] mode = "w8a16"` for INT8 decoder projection weights with
+FP16/BF16 activations. Both default to off. See the serving guide for memory/capture
+limits and the benchmark guide for measured speed and quantization-quality tradeoffs.

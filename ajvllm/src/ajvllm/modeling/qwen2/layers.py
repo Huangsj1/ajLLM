@@ -34,7 +34,8 @@ def rotary_factors(
     )
     # shape = (num_positions, head_dim/2), each position's angle for each frequency
     angles = positions.float()[:, None] * frequencies[None, :]
-    # shape = (num_positions, head_dim), each position's cos/sin for each frequency, repeated for the two halves of the head dimension
+    # shape = (num_positions, head_dim), each position's cos/sin for each frequency, repeated for the two halves of
+    # the head dimension
     angles = torch.cat((angles, angles), dim=-1)
     return angles.cos().to(dtype), angles.sin().to(dtype)
 

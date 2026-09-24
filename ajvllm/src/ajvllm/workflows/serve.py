@@ -10,6 +10,7 @@ import torch
 import uvicorn
 
 from ajvllm import EngineConfig
+from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.runtime.inference import InferenceRuntime
@@ -44,6 +45,8 @@ def main():
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
         compute_config=ComputeConfig(**settings.get("compute", {})),
+        graph_config=GraphConfig(**settings.get("graphs", {})),
+        quantization_config=QuantizationConfig(**settings.get("quantization", {})),
         gpu_memory_utilization=args.gpu_memory_utilization,
     )
     service = EngineService(runtime, max_pending_requests=args.max_pending_requests, profile_steps=args.profile_steps)

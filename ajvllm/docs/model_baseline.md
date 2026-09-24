@@ -10,8 +10,9 @@ All dimensions come from configuration. Both generation-config EOS IDs are used.
 
 The loader supports single and indexed sharded safetensors, validates tensor
 names/shapes once at load time, and preserves tied embedding/head storage.
-Parameters are constructed on meta and populated on CUDA. MoE, quantization,
-scaled RoPE, and sliding-window variants are rejected explicitly. Transformers
+Parameters are constructed on meta and populated on CUDA. MoE, pre-quantized
+checkpoint formats, scaled RoPE and sliding-window variants are rejected explicitly.
+Optional runtime W8A16 conversion quantizes decoder projections after loading. Transformers
 is used for tokenization and as an independent model oracle, never for native
 execution. See the [official Qwen config](https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/blob/main/config.json)
 and [reference implementation](https://github.com/huggingface/transformers/blob/v4.57.6/src/transformers/models/qwen2/modeling_qwen2.py).
@@ -101,8 +102,9 @@ all-token comparisons; there is no single-tensor path in the production model.
 
 Paged storage removes persistent full-history replacement copies and supports prefix
 sharing. Stage 3 adds paged FlashAttention, split decode and elementwise fusions;
-eager remains an explicit reference backend. CUDA Graph, quantization and tensor
-parallelism are still future work. Batch token budget counts real
+eager remains an explicit reference backend. Stage 4 adds optional decode CUDA
+Graphs and per-channel W8A16 projections; prefill/decode disaggregation remains
+future work. Batch token budget counts real
 input tokens, whereas memory policy also accounts for padded attention workspace
 and the general sampler's score, sorting, probability and history buffers.
 The service uses conservative capacity estimates and real CUDA warmup/peak
