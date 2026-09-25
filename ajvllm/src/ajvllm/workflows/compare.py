@@ -294,7 +294,7 @@ def plot_report(report, target, engines=("ajvllm", "vllm")):
     ]
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     for ax, (title, metric) in zip(axes.flat, panels, strict=True):
-        for engine, color in zip(engines, ("#167d9a", "#db7433"), strict=True):
+        for engine, color in zip(engines, ("#167d9a", "#db7433", "#698537")[: len(engines)], strict=True):
             groups = [
                 [
                     metric(r)

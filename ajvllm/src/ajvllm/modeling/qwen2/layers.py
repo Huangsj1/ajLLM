@@ -61,9 +61,14 @@ class Attention(nn.Module):
         # x.shape = (sum(lengths), hidden_size)
         count = x.shape[0]
         # Projections and RoPE operate on ALL packed tokens in one operation.
-        q = self.q_proj(x).view(count, config.num_attention_heads, config.head_dim)
-        k = self.k_proj(x).view(count, config.num_key_value_heads, config.head_dim)
-        v = self.v_proj(x).view(count, config.num_key_value_heads, config.head_dim)
+        if hasattr(self, "qkv_proj"):
+            kv_width = config.num_key_value_heads * config.head_dim
+            q, k, v = self.qkv_proj(x).split((config.hidden_size, kv_width, kv_width), dim=-1)
+        else:
+            q, k, v = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        q = q.view(count, config.num_attention_heads, config.head_dim)
+        k = k.view(count, config.num_key_value_heads, config.head_dim)
+        v = v.view(count, config.num_key_value_heads, config.head_dim)
         if batch.attention_metadata is not None:
             # rope qk, store kv to kv cache
             q = rope_and_cache(q, k, v, factors, batch.paged, layer_index)
@@ -106,7 +111,11 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor, *, optimized=False) -> torch.Tensor:
-        gate, up = self.gate_proj(x), self.up_proj(x)
+        gate, up = (
+            self.gate_up_proj(x).chunk(2, dim=-1)
+            if hasattr(self, "gate_up_proj")
+            else (self.gate_proj(x), self.up_proj(x))
+        )
         return self.down_proj(swiglu(gate, up) if optimized else F.silu(gate) * up)
 
 

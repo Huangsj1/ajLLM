@@ -3,7 +3,7 @@
 import asyncio
 import json
 from contextlib import asynccontextmanager
-from dataclasses import asdict
+from dataclasses import fields
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -62,7 +62,9 @@ def create_app(service: EngineService, tokenizer: Qwen2Tokenizer) -> FastAPI:
         return tokenizer.encode(body.prompt)
 
     def serialize(output):
-        data = asdict(output)
+        # RequestOutput is immutable and contains only scalars and tuples.
+        # Recursive asdict would copy every prompt token for every SSE event.
+        data = {field.name: getattr(output, field.name) for field in fields(output)}
         for key in ("arrival_time", "first_token_time", "finish_time"):
             data.pop(key)
         return data | {"text": tokenizer.decode(output.output_token_ids), "timing": request_timing(output)}

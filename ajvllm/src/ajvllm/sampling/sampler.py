@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 
+from ajvllm.execution.transfer import upload
 from ajvllm.kernels.sampling import sample_sorted, update_history
 from ajvllm.requests import Request
 
@@ -21,7 +22,7 @@ class Sample:
 class History:
     owner: weakref.ReferenceType
     signature: tuple
-    buffer: torch.Tensor    # shape (3, vocab), including: seen, counts, stopped
+    buffer: torch.Tensor  # shape (3, vocab), including: seen, counts, stopped
     generated: int = 0
 
 
@@ -86,12 +87,12 @@ class Sampler:
                 )
             )
         if updates:
-            update_history(torch.tensor(updates, device=device, dtype=torch.int64))
+            update_history(upload(updates, device=device, dtype=torch.int64))
         return (
             # sampling parameters, shape (batch, 5)
-            torch.tensor(parameters, device=device, dtype=torch.float32),
+            upload(parameters, device=device, dtype=torch.float32),
             # metadata, shape (batch, 3), including: history buffer pointer, min_tokens flag, top_k
-            torch.tensor(metadata, device=device, dtype=torch.int64),
+            upload(metadata, device=device, dtype=torch.int64),
         )
 
     @torch.inference_mode()

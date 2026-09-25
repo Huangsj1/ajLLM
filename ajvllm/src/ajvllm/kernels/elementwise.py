@@ -44,10 +44,10 @@ def rms_norm(x, weight, eps, residual=None):
 
 
 @triton.jit
-def _swiglu(G, U, Y, N, B: tl.constexpr):
+def _swiglu(G, U, Y, N, WIDTH: tl.constexpr, GS: tl.constexpr, US: tl.constexpr, B: tl.constexpr):
     i = tl.program_id(0) * B + tl.arange(0, B)
-    g = tl.load(G + i, i < N, 0).to(tl.float32)
-    u = tl.load(U + i, i < N, 0).to(tl.float32)
+    g = tl.load(G + i // WIDTH * GS + i % WIDTH, i < N, 0).to(tl.float32)
+    u = tl.load(U + i // WIDTH * US + i % WIDTH, i < N, 0).to(tl.float32)
     silu = (g / (1.0 + tl.exp(-g))).to(G.dtype.element_ty).to(tl.float32)
     tl.store(Y + i, silu * u, i < N)
 
@@ -55,13 +55,30 @@ def _swiglu(G, U, Y, N, B: tl.constexpr):
 def swiglu(gate, up):
     out = torch.empty_like(gate)
     # grid = (ceil(all_tokens_num * dff / 256),)
-    _swiglu[(triton.cdiv(gate.numel(), 256),)](gate, up, out, gate.numel(), 256)
+    _swiglu[(triton.cdiv(gate.numel(), 256),)](
+        gate, up, out, gate.numel(), gate.shape[-1], gate.stride(0), up.stride(0), 256
+    )
     return out
 
 
 @triton.jit
 def _rope_cache(
-    Q, K, V, C, S, Slots, Out, KC, VC, HQ: tl.constexpr, HK: tl.constexpr, D: tl.constexpr, B: tl.constexpr
+    Q,
+    K,
+    V,
+    C,
+    S,
+    Slots,
+    Out,
+    KC,
+    VC,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    QS: tl.constexpr,
+    KS: tl.constexpr,
+    VS: tl.constexpr,
+    B: tl.constexpr,
 ):
     t, h = tl.program_id(0), tl.program_id(1)
     d = tl.arange(0, B)
@@ -72,7 +89,7 @@ def _rope_cache(
     s = tl.load(S + t * D + d, d < D, 0).to(tl.float32)
     # query head
     if h < HQ:
-        base = (t * HQ + h) * D
+        base = t * QS + h * D
         # x means current token current head's query, shape = (head_dim,)
         x = tl.load(Q + base + d, d < D, 0).to(tl.float32)
         # z = rotate half x, shape = (head_dim,)
@@ -80,11 +97,11 @@ def _rope_cache(
         a = (x * c).to(Q.dtype.element_ty).to(tl.float32)
         b = (z * sign * s).to(Q.dtype.element_ty).to(tl.float32)
         # store rotated query to output
-        tl.store(Out + base + d, a + b, d < D)
+        tl.store(Out + (t * HQ + h) * D + d, a + b, d < D)
     # kv head
     else:
         head = h - HQ
-        base = (t * HK + head) * D
+        base = t * KS + head * D
         x = tl.load(K + base + d, d < D, 0).to(tl.float32)
         z = tl.load(K + base + partner, d < D, 0).to(tl.float32)
         a = (x * c).to(K.dtype.element_ty).to(tl.float32)
@@ -94,7 +111,7 @@ def _rope_cache(
         target = (slot * HK + head) * D + d
         # store rotated k to k cache, and unrotated v to v cache
         tl.store(KC + target, a + b, (d < D) & (slot >= 0))
-        tl.store(VC + target, tl.load(V + base + d, d < D, 0), (d < D) & (slot >= 0))
+        tl.store(VC + target, tl.load(V + t * VS + head * D + d, d < D, 0), (d < D) & (slot >= 0))
 
 
 def rope_and_cache(q, k, v, factors, paged, layer):
@@ -114,7 +131,10 @@ def rope_and_cache(q, k, v, factors, paged, layer):
         q.shape[1],
         k.shape[1],
         q.shape[2],
-        triton.next_power_of_2(q.shape[2]),     # head_dim
+        q.stride(0),
+        k.stride(0),
+        v.stride(0),
+        triton.next_power_of_2(q.shape[2]),  # head_dim
         enable_fp_fusion=False,
     )
     return out

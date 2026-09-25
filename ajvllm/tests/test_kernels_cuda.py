@@ -212,3 +212,29 @@ def test_runtime_auto_selection_and_workspace_estimate():
     assert contiguous.compute_backend == "eager"
     with pytest.raises(ValueError, match="paged KV"):
         Qwen2Runner(model, compute_config=ComputeConfig(backend="triton"), engine_config=cfg)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@torch.inference_mode()
+def test_packed_projections_preserve_logits_and_storage(dtype):
+    from copy import deepcopy
+
+    from ajvllm.execution.batch import ModelBatch
+    from ajvllm.modeling.qwen2.projections import pack_projections
+
+    model, _ = pair(tiny_config(), dtype)
+    packed = deepcopy(model)
+    original_bytes = sum(p.numel() * p.element_size() for p in packed.parameters())
+    pack_projections(packed)
+    pack_projections(packed)  # Preparing a shared runner twice must be harmless.
+    assert sum(p.numel() * p.element_size() for p in packed.parameters()) == original_bytes
+    assert not hasattr(packed.model.layers[0].self_attn, "q_proj")
+    assert not hasattr(packed.model.layers[0].mlp, "gate_proj")
+    batch = ModelBatch.build([[1, 2, 3], [4, 5]], [None, None], model.device, [0, 1])
+    tolerance = {torch.float32: 2e-6, torch.float16: 0.002, torch.bfloat16: 0.025}[dtype]
+    torch.testing.assert_close(packed(batch).logits, model(batch).logits, atol=tolerance, rtol=1e-4)
+    # Split gate/up views are non-contiguous for more than one row.
+    x = torch.randn(17, model.config.hidden_size, device=model.device, dtype=dtype)
+    expected = model.model.layers[0].mlp(x)
+    actual = packed.model.layers[0].mlp(x, optimized=True)
+    torch.testing.assert_close(actual, expected, atol=tolerance, rtol=1e-3)

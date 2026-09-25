@@ -7,6 +7,7 @@ from itertools import accumulate
 import torch
 
 from ajvllm.attention.backends.triton import AttentionMetadata
+from ajvllm.execution.transfer import upload
 from ajvllm.memory.storage import PagedBatch
 from ajvllm.memory.types import KVCache  # re-export for existing reference callers
 
@@ -41,7 +42,7 @@ class ModelBatch:
     def build(
         cls,
         sequences: Sequence[Sequence[int] | torch.Tensor],
-        caches: Sequence[KVCache | None],       # None when use paged KV cache
+        caches: Sequence[KVCache | None],  # None when use paged KV cache
         device: torch.device,
         sample_requests: Sequence[int],
         *,
@@ -58,20 +59,20 @@ class ModelBatch:
         offsets = list(accumulate(lengths))
         # packed token positions of all requests, used for RoPE and attention masking,
         #  e.g. for 3 requests with lengths [2, 3, 1] and starts [0, 5, 2], positions = [0,1, 5,6,7, 2]
-        positions = torch.tensor(
+        positions = upload(
             [start + i for start, length in zip(starts, lengths, strict=True) for i in range(length)], device=device
         )
         # packed token request IDs of all requests, used for packing/unpacking attention caches,
         #  e.g. for 3 requests with lengths [2, 3, 1], sequence_ids = [0,0, 1,1,1, 2]
-        sequence_ids = torch.tensor([row for row, length in enumerate(lengths) for _ in range(length)], device=device)
+        sequence_ids = upload([row for row, length in enumerate(lengths) for _ in range(length)], device=device)
         # packed token local query offsets of all requests
         #  e.g. for 3 requests with lengths [2, 3, 1], query_offsets = [0,1, 0,1,2, 0]
-        query_offsets = torch.tensor([i for length in lengths for i in range(length)], device=device)
+        query_offsets = upload([i for length in lengths for i in range(length)], device=device)
         # padding token positions for causal attention masking, shape = (num_requests, max_query_len)
         #  e.g. for 3 requests with lengths [2, 3, 1], query_positions = [[0,1,2], [5,6,7], [2,3,4]]
         mask = None
         if not optimized:
-            query_positions = torch.tensor(starts, device=device)[:, None] + torch.arange(max(lengths), device=device)
+            query_positions = upload(starts, device=device)[:, None] + torch.arange(max(lengths), device=device)
             # all keys positions for causal attention masking
             #  e.g. for 3 requests with contexts [2, 8, 3], keys = [0,1,2,3,4,5,6,7]
             keys = torch.arange(max(contexts), device=device)
@@ -81,7 +82,11 @@ class ModelBatch:
             )
         batch = cls(
             # packed token IDs of all requests, shape = (sum(lengths),)
-            torch.cat([torch.as_tensor(tokens, dtype=torch.long, device=device) for tokens in sequences]),
+            (
+                torch.cat([torch.as_tensor(tokens, device=device, dtype=torch.long) for tokens in sequences])
+                if any(isinstance(tokens, torch.Tensor) for tokens in sequences)
+                else upload([token for tokens in sequences for token in tokens], device=device)
+            ),
             positions,
             sequence_ids,
             query_offsets,
@@ -89,7 +94,7 @@ class ModelBatch:
             contexts,
             tuple(caches),
             # sample indices of all requests, shape = (num_sample_requests,)
-            torch.tensor([offsets[row] - 1 for row in sample_requests], dtype=torch.long, device=device),
+            upload([offsets[row] - 1 for row in sample_requests], dtype=torch.long, device=device),
             mask[:, None, :, :]
             if mask is not None
             else None,  # shape = (num_requests, 1, max_query_len, max_context_len)

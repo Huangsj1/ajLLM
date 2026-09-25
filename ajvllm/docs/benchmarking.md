@@ -626,3 +626,135 @@ the new unnormalized scan can differ from the old normalized FP32 scan; the
 boundary oracle uses higher precision. This is not a promise of bitwise historical
 sample sequences. Temporary baseline and experiment scripts were removed after
 recording the results; reusable datasets and the comparison workflow remain.
+
+## Decode profiling and optimization (2026-09-25)
+
+The new comparison uses the user's expanded configuration: concurrency
+1/2/4/8/16, token budget 5000, BF16 Qwen2.5-0.5B-Instruct, CUDA Graphs enabled,
+128/256/512/1024-token inputs, and 64 generated tokens. Prefix caching and
+quantization are disabled. Temperature is 0.8, top-p is 0.9, and seeds are request
+indices. Both engines receive the same saved token inputs, context limit 1088,
+maximum 16 sequences and 204 MiB KV pool. The service memory policy is 40%; this
+is not a hard allocator limit. CPU math libraries use two threads.
+
+Each concurrency now measures **48 requests**, following excluded warmup, in
+three fresh processes per implementation. Baseline, intermediate optimization
+and vLLM were initially interleaved across three repetitions. A second profiling
+pass identified KV accounting scans; the final optimized implementation was then
+measured in three additional fresh processes. Thus the final measurements are
+subsequent rather than fully interleaved with the controls. The report retains
+both phases and the baseline git revision. All 2160 requests in the final
+three-way comparison succeeded, as did the 720 intermediate measurements.
+No native graphs were captured inside the final measured intervals.
+
+### What the profiles showed
+
+The experiment uses both PyTorch CPU/CUDA timelines and Python cProfile;
+`--profile-steps` alone inserts synchronization and cannot explain GPU idle gaps.
+Runner diagnostics use a 512-token context, eight warmup steps, 32 timed decode
+steps and four separate profiled steps. Engine diagnostics use 16 requests,
+40 cProfile steps, a separate four-step CUDA trace and 20 synchronized stage
+measurements. These are attribution experiments, not substitutes for HTTP timing.
+
+- **Synchronous metadata uploads:** four baseline batch-8 runner steps contained
+  64 `cudaStreamSynchronize` calls. Small `torch.tensor(..., device="cuda")`
+  uploads waited for preceding stream work. Pinned, nonblocking uploads remove
+  those calls; CPU token lists are flattened before one batch upload. Attention
+  metadata, block tables and sampler parameters use the same transfer helper.
+  Compact sampled IDs/logprobs still return to the CPU once per step.
+- **Fragmented projections:** each decoder layer issued seven linear calls.
+  Packing Q/K/V and gate/up reduces this to four, or 168 to 96 calls across the
+  24 layers, excluding the unchanged LM head. Kernels now accept the row strides
+  of packed projection views instead of requiring contiguous copies. Runtime
+  preparation releases the original projection parameters; W8A16 keeps its
+  existing execution path.
+- **Repeated pool scans:** scheduler admission and runner reservation both
+  scanned all 1088 block reference counts for every request. Forty batch-16
+  steps executed 1,393,920 generator iterations just for peak occupancy. Used
+  blocks now equal total blocks minus free blocks in constant time. The cProfile
+  run shrank from about 1.46 million calls to 66,521; cProfile disproportionately
+  penalizes those Python iterations, so its elapsed-time ratio is not a claimed
+  production speedup. Sharing, COW and prefix-cache ownership are unchanged.
+- **Streaming copies:** recursively copying immutable request outputs walked
+  the entire prompt on every SSE event. Shallow field extraction preserves the
+  existing JSON schema. An isolated 1024-prompt/64-output serialization setup
+  measured about 0.066 ms versus 0.0016 ms per field-extraction call, excluding
+  JSON encoding and token decoding.
+
+The initial runner-only diagnostic improved from 3.63/4.58/4.44/5.33 ms at
+batch 1/4/8/16 to 2.49/2.79/2.91/3.10 ms after transfers and projection packing,
+before removing pool scans. These single diagnostic runs include host scheduling
+noise; the repeated end-to-end measurements below are the performance evidence.
+
+### Final service results
+
+Values are means over the three repetitions. TPOT uses first-to-last token
+arrival divided by generated tokens minus one; throughput includes request
+startup, prefill and drain.
+
+| Concurrency | Before tokens/s | After tokens/s | Gain | vLLM tokens/s | TPOT ms: before / after / vLLM |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 1 | 168.46 | 214.60 | 27.4% | 337.28 | 5.69 / 4.44 / 2.68 |
+| 2 | 278.79 | 347.43 | 24.6% | 514.31 | 6.74 / 5.38 / 3.35 |
+| 4 | 480.41 | 622.17 | 29.5% | 950.53 | 7.64 / 5.79 / 3.51 |
+| 8 | 810.26 | 1068.43 | 31.9% | 1790.21 | 8.66 / 6.39 / 3.35 |
+| 16 | 1164.16 | 1589.55 | 36.5% | 2743.70 | 11.88 / 8.44 / 4.17 |
+
+![Decode optimization and vLLM comparison](../benchmarks/results/decode/comparison.png)
+
+At concurrency 16, mean TTFT changed from 126.66 to 108.14 ms (vLLM: 107.33 ms),
+and mean per-run p95 request latency from 0.904 to 0.661 s (vLLM: 0.377 s).
+Sampled GPU utilization increased from 45.8% to 55.9%, versus vLLM's 94.1%.
+The optimized measured runs peaked at 3581 MiB of device memory. GPU monitoring
+is sampled every 250 ms and includes desktop/allocator usage; it is neither an
+exact allocation peak nor a measure of achieved FLOPS. Error bars show
+repeat-level standard deviations, not confidence intervals. These short,
+closed-loop workloads do not establish production saturation behavior.
+
+### Remaining gap and priorities
+
+The optimization improves throughput by 24.6–36.5%, but vLLM remains faster:
+about 1.48–1.73x in throughput and 1.61–2.02x in TPOT across these runs.
+Similar HTTP TTFT does not establish equal prefill kernel speed: it also includes
+admission, scheduling, tokenization and response handling. Likewise, GPU busy
+percentage cannot alone distinguish compute efficiency from gaps between work.
+
+In the final batch-16 CUDA trace, kernel durations averaged approximately
+1.96 ms for linear algebra, 0.56 ms for attention, 0.63 ms for sort/transform/CDF
+sampling, and 0.30 ms for other kernels, including RNG and elementwise work.
+These sums exclude GPU idle gaps and are from our engine only; they do not
+measure which vLLM kernels account for its advantage. Separate synchronized
+stage times were 0.52 ms preparation, 3.28 ms model, 1.36 ms sampling and 0.08 ms
+compact transfer. Do not add them to predict asynchronous production latency.
+A normal `.cpu()` call also waits for queued model/sampling work, so its cProfile
+duration is not the cost of transferring a few token IDs.
+
+The next profiling priorities are small-batch GEMM/LM-head efficiency, consolidated
+persistent metadata uploads into graph inputs, and batched request-independent
+RNG/sampling launches. Overlapping output handling and scheduling with GPU work
+requires an explicit asynchronous engine design: the present loop waits for
+sampled CPU IDs before constructing the next batch. HTTP still serializes full
+prompt/output fields and decodes accumulated output on each event; a versioned
+delta-streaming protocol is another candidate, not silently introduced here.
+Attention tuning remains useful, but the measured 0.56 ms does not explain the
+whole remaining service gap. These are priorities for measurement, not claimed
+speedups or features already implemented.
+
+The [report](../benchmarks/results/decode/report.json) includes per-request
+arrivals, intermediate measurements, health/capacity checks, source hashes,
+versions and profiler tables. A compressed
+[CPU/CUDA trace](../benchmarks/results/decode/engine-trace.json.gz) preserves the
+final four-step engine profile. Architecture changes are described in the
+[decode overhead section](architecture/architecture.md#decode-launch-and-transfer-overhead).
+193 CUDA regression cases passed, including independent packed-projection parity,
+strided SwiGLU, graph replay/padding/cross-stream behavior, quantization, prefix
+sharing/preemption, sampler edge cases and live HTTP handling. Temporary experiment
+scripts and the baseline source copy were removed after recording results.
+
+Reproduce the optimized-versus-vLLM workload with:
+
+```bash
+uv run ajvllm-compare --graphs --concurrency 1 2 4 8 16 \
+  --requests 48 --max-tokens 64 --token-budget 5000 --repeats 3 \
+  --output benchmarks/results/compare-decode
+```

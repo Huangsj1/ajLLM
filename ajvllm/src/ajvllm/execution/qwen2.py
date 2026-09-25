@@ -15,6 +15,7 @@ from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.batch import KVCache, ModelBatch
 from ajvllm.memory.manager import KVCacheManager
 from ajvllm.modeling.qwen2.model import Qwen2ForCausalLM
+from ajvllm.modeling.qwen2.projections import pack_projections
 from ajvllm.modeling.qwen2.weights import load_qwen2
 from ajvllm.quantization.linear import quantization_stats
 from ajvllm.runtime.graphs import DecodeGraphs
@@ -60,6 +61,8 @@ class Qwen2Runner:
         self.kv_cache: KVCacheManager | None = None  # KV cache manager for paged memory
         memory_config = memory_config or MemoryConfig(backend="contiguous")
         self.compute_backend = resolve_backend(compute_config or ComputeConfig(backend="eager"), model, memory_config)
+        if self.compute_backend == "triton":
+            pack_projections(model)
         if memory_config.backend == "paged":
             if engine_config is None:
                 raise ValueError("paged runner requires a resolved engine_config")

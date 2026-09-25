@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import torch
 
 from ajvllm.config import MemoryConfig
+from ajvllm.execution.transfer import upload
 from ajvllm.memory.blocks import BlockManager
 from ajvllm.memory.storage import PagedBatch, PagedKVStorage
 
@@ -107,7 +108,7 @@ class KVCacheManager:
             self.blocks.release(old)
             self.cow_copies += 1
         state.blocks.extend(allocated)
-        self.peak_used_blocks = max(self.peak_used_blocks, sum(ref > 0 for ref in self.blocks.ref_counts))
+        self.peak_used_blocks = max(self.peak_used_blocks, len(self.blocks.ref_counts) - len(self.blocks.free))
         return True
 
     def fork(self, source, target):
@@ -146,14 +147,14 @@ class KVCacheManager:
     def batch(self, request_ids, positions, sequence_ids, contexts, *, gather=True) -> PagedBatch:
         """
         suppose block_size=4;
-        suppose 3 requests: A prefill [A0 A1 A2 A3 A4 A5], 
+        suppose 3 requests: A prefill [A0 A1 A2 A3 A4 A5],
                             B prefill [B0 B1 B2],
                             C decode [C5] with cached [C0 C1 C2 C3 C4];
         suppose block_A = [2,5], block_B = [7], block_C = [1,6]
 
-        input: request_ids=[A0 A1 A2 A3 A4 A5 | B0 B1 B2 | C5], 
-                positions=[0 1 2 3 4 5 | 0 1 2 | 5], 
-                sequence_ids=[0 0 0 0 0 0 | 1 1 1 | 2], 
+        input: request_ids=[A0 A1 A2 A3 A4 A5 | B0 B1 B2 | C5],
+                positions=[0 1 2 3 4 5 | 0 1 2 | 5],
+                sequence_ids=[0 0 0 0 0 0 | 1 1 1 | 2],
                 contexts=[6,3,6]
 
         variable:
@@ -170,7 +171,7 @@ class KVCacheManager:
         tables = [
             self.states[rid].blocks[:width] + [0] * max(0, width - len(self.states[rid].blocks)) for rid in request_ids
         ]
-        tables = torch.tensor(tables, device=device, dtype=torch.long)
+        tables = upload(tables, device=device)
         # each token's physical slot in the storage tensor: block_index * block_size + position_in_block
         slots = tables[sequence_ids, positions // self.block_size] * self.block_size + positions % self.block_size
         if not gather:  # triton
@@ -183,7 +184,7 @@ class KVCacheManager:
         return PagedBatch(self.storage, tables, slots, read_slots, valid)
 
     def snapshot(self):
-        used = sum(ref > 0 for ref in self.blocks.ref_counts)
+        used = len(self.blocks.ref_counts) - len(self.blocks.free)
         block_bytes = self.storage.nbytes // len(self.blocks.ref_counts)
         return {
             "backend": "paged",

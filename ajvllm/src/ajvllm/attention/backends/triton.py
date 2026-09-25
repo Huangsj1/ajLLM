@@ -5,16 +5,17 @@ from itertools import accumulate
 
 import torch
 
+from ajvllm.execution.transfer import upload
 from ajvllm.kernels.attention import PREFILL_TILE
 
 
 @dataclass
 class AttentionMetadata:
-    starts: torch.Tensor            # start indices of each request in the packed token buffer
-    contexts: torch.Tensor          # context lengths of each request
-    prefill_tiles: torch.Tensor     # (row, start) pairs for each prefill tile
-    decode_rows: torch.Tensor       # rows of requests that are single-token decode requests
-    max_decode_context: int         # maximum context length of all decode requests
+    starts: torch.Tensor  # start indices of each request in the packed token buffer
+    contexts: torch.Tensor  # context lengths of each request
+    prefill_tiles: torch.Tensor  # (row, start) pairs for each prefill tile
+    decode_rows: torch.Tensor  # rows of requests that are single-token decode requests
+    max_decode_context: int  # maximum context length of all decode requests
 
     @classmethod
     def build(cls, lengths, contexts, device):
@@ -23,10 +24,10 @@ class AttentionMetadata:
             (row, start) for row, length in enumerate(lengths) if length > 1 for start in range(0, length, PREFILL_TILE)
         ]
         return cls(
-            torch.tensor([0, *accumulate(lengths)], device=device, dtype=torch.int32),
-            torch.tensor(contexts, device=device, dtype=torch.int32),
-            torch.tensor(tiles, device=device, dtype=torch.int32).reshape(-1, 2),
-            torch.tensor(decode, device=device, dtype=torch.int32),
+            upload([0, *accumulate(lengths)], device=device, dtype=torch.int32),
+            upload(contexts, device=device, dtype=torch.int32),
+            upload(tiles, device=device, dtype=torch.int32).reshape(-1, 2),
+            upload(decode, device=device, dtype=torch.int32),
             max((contexts[row] for row in decode), default=0),
         )
 

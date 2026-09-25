@@ -396,7 +396,8 @@ SwiGLU, and Qwen split-half RoPE fused with new K/V slot writes. Each scheduled
 K/V token is written once; cached historical KV is never rewritten. Residual and
 normalization intermediates preserve the eager activation-dtype rounding points.
 Rotary factors are still indexed from the model's precomputed tables. Checkpoint
-parameters, names and projections are unchanged.
+loading retains the original parameter names; runtime projection packing is
+described below.
 
 The RMSNorm/SwiGLU/rotary kernels and online-softmax recurrence were adapted from
 `../ajllm/src/ajllm/modeling/cuda_kernels.py` and `flash_attention.py`. Training
@@ -405,6 +406,39 @@ pair layout; ragged paging, GQA mapping, absolute chunk offsets, decode partitio
 and LSE merging are implemented here. Algorithm references are the
 [Triton fused-attention tutorial](https://triton-lang.org/main/getting-started/tutorials/06-fused-attention.html)
 and [vLLM paged-attention design](https://docs.vllm.ai/en/latest/design/paged_attention/).
+
+### Decode launch and transfer overhead
+
+CUDA profiling exposed synchronous small metadata uploads in every decode step.
+`execution/transfer.py` stages CPU metadata in pinned memory and submits copies
+with `non_blocking=True`. Model inputs, attention metadata, block tables and
+sampler parameters use this path; CPU token lists are flattened before a single
+upload instead of uploading one tensor per request. PyTorch's pinned allocator
+tracks pending copies, so staging allocations can be released without reusing
+host memory before DMA completes. The compact sampled-token D2H dependency is
+still required by the synchronous engine loop.
+
+`modeling/qwen2/projections.py` packs floating-point Q/K/V into one linear and
+MLP gate/up into another once when preparing a Triton runner, before graph
+capture. This reduces decoder linear calls from seven to four per layer (168 to
+96 for the 24-layer local model), without keeping duplicate weights. Safetensors
+loading still uses the original checkpoint layout; the prepared inference model
+has packed runtime parameter names. Existing W8A16 modules keep their quantized
+path. RoPE/cache-write and SwiGLU kernels read explicit projection row strides,
+so split views need no `.contiguous()` copies. Fusion changes GEMM accumulation
+order and is numerically validated, not guaranteed bitwise identical.
+
+KV reservation previously scanned all physical reference counts to update peak
+occupancy, once per request in both scheduler admission and runner reservation.
+Used physical blocks are exactly `len(ref_counts) - len(free)`, including shared
+and cached pages, so reservation and occupancy snapshots now calculate this in
+constant time without adding a second mutable counter. Reference-count ownership,
+transactional allocation and copy-on-write semantics are unchanged.
+
+Streaming output serialization reads immutable `RequestOutput` fields directly,
+avoiding recursive `dataclasses.asdict` copies of the entire prompt on every
+token event. The HTTP response schema remains unchanged. Matched service timings
+and the remaining bottlenecks are recorded in [benchmarking](../benchmarking.md).
 
 ### Capacity, JIT and validation
 
