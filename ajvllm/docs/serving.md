@@ -1,4 +1,4 @@
-# Persistent GPU serving and adaptive token budgeting
+# Persistent GPU serving and profiled KV capacity
 
 ## Start and send requests
 
@@ -82,64 +82,91 @@ and terminates remaining work instead of leaving futures hanging.
 
 ## Memory policy
 
-`gpu_memory_utilization` is a ceiling on this process's GPU memory share, not SM
-compute utilization and not a command to fill VRAM. The startup controller uses
-CUDA free/total memory and current allocated bytes, subtracts a 512 MiB reserve,
-and limits the target to currently available capacity. Existing display/other
-process allocations are therefore considered. Model loading itself occurs before
-calibration; a model too large to load still fails at load time.
+`--gpu-memory-utilization` determines the process memory target used to size the
+paged KV pool. Engine limits (`max_num_seqs`, `max_num_batched_tokens`, context,
+and prefill caps) remain exactly as configured at startup and during execution.
+There is no adaptive budget growth/reduction. If the fixed workload cannot fit,
+startup fails with instructions to adjust the configuration; it never silently
+reduces concurrency or tokens. Model loading itself precedes profiling.
 
-Token budget and KV capacity are distinct constraints. A small decode budget can
-still have many long-lived requests consuming KV, so admission also reserves
-worst-case cache/workspace space for `max_num_seqs * max_model_len`.
+Startup loads/quantizes/packs weights, then constructs a disposable runner with a
+small pool sufficient for the profiling inputs. It executes balanced and
+concentrated maximum-prefill shapes, the maximum sampling row count and decode,
+including generic CUDA sampling with penalties/masks. The measured allocation
+peak includes this temporary pool, so its bytes are subtracted. The temporary
+runner and pool are synchronized and released before allocating the final pool.
+No CUDA Graph references may survive from the temporary pool: profiling uses
+normal forward execution, and graphs are captured lazily with the final pool.
 
-The estimate includes:
+The pool is rounded down to whole blocks using:
 
-- A fixed physical KV pool for the paged backend.
-- Triton split-decode partial outputs/LSE, or eager per-layer gather workspace.
-- Conservative GQA workspace headroom only for eager attention.
-- Three times full-context KV storage only for the contiguous comparison backend.
-- Padded attention scores/probabilities only for eager, scaling with `B * heads * Qmax * Kmax`.
-- Packed projection/MLP activations and sampling logits.
+```text
+workspace = max(measured_peak - temporary_pool - baseline,
+                conservative_workspace_bound)
+non_KV_peak = baseline + workspace + observed_non_Torch_growth
+KV_bytes <= min(total_VRAM * utilization, available_capacity)
+            - non_KV_peak - graph_allowance - safety_reserve
+```
 
-If the requested capacity does not fit, startup reduces the active sequence cap,
-then the token-budget ceiling. It rejects a target that cannot fit even one
-full-context request. The resolved configuration is printed so these reductions
-are visible. The configured `max_model_len` is never silently shortened.
+The safety reserve defaults to 512 MiB. The workspace bound covers unobserved
+long-context split-decode/eager attention, mixed-batch shapes, sorting scratch,
+and penalty histories of resident requests. Profiling a finite collection of
+shapes alone is not a guarantee of the worst possible allocator peak. The memory
+target is not a hard CUDA reservation; external allocations can still race startup
+or exhaust memory later. An unexpected runtime OOM terminates/releases the affected
+batch through normal engine error handling and leaves fixed budgets unchanged.
 
-The server uses TOML `max_num_batched_tokens` as the requested initial budget;
-there is no separate startup-budget CLI option. The memory estimate first lowers
-it to a safe ceiling. CUDA warmup then records the allocation peak and halves the
-budget on OOM or a peak above the target. Runtime starts with the resulting budget.
-Every eight successful saturated steps,
-it can double the budget if both measured memory and the conservative estimate
-leave headroom. It never exceeds the configured/safe ceiling. A low-traffic service
-may use far less than the specified fraction; it does not create artificial work
-to consume memory.
+Omitting `memory.num_blocks` selects this automatic pool sizing. An explicit
+value remains useful for controlled comparisons and pressure tests; it must fit
+the profiled target and at least one maximum-context request. `max_num_seqs` no
+longer multiplies `max_model_len` to determine a paged pool. More sequences can
+still increase sampling/history/workspace demand, which profiling accounts for.
+The contiguous reference backend uses conservative full-context workspace sizing
+and does not allocate a paged pool. Both online and offline CLIs use this startup.
 
-Startup probes small prefill and decode inputs. The eager memory estimate reserves
-mixed-batch attention workspace: every scheduled row can inherit the longest
-prefill query and context dimensions. All admitted requests' persistent KV is
-still reserved, including when the aggregate prefill token cap is small.
+Startup output and `/health.memory` report weights, model buffers, baseline,
+measured peak, temporary pool, measured/reserved workspace, non-Torch growth,
+graph/safety reserves, final pool and block count, with MiB/GiB display fields.
+These are startup measurements; `/health.allocator` reports current allocations.
 
-Before each step, the controller rechecks available memory (including PyTorch's
-reusable reserved blocks). It reduces budget if needed. High observed peaks reduce
-future budgets; an unexpected CUDA OOM fails/releases the affected batch and lowers
-the next budget rather than silently replaying potentially advanced state. If even
-the minimum budget no longer covers reserved capacity, the service fails clearly.
-External GPU allocations can still race these checks; this is a conservative
-heuristic, not a hard GPU reservation or a guarantee against every OOM.
+## Admission and preemption
 
-`GET /health` exposes target, baseline, warmup peak, observed peak, current budget,
-ceiling, and admitted sequence cap. Measurements use PyTorch allocated bytes;
-`nvidia-smi` also includes allocator reservations and driver/display allocations.
-The configured input-token ceiling remains independent of prompt/output length.
-Adaptive budgeting currently requires chunked prefill. The offline CLI uses the same startup calibration and per-step budget adaptation
-through `InferenceRuntime`.
+New requests wait in FIFO order when there are insufficient pages for their
+complete known prompt (or recompute history), plus one growth token when possible.
+Those pages are reserved at admission, so chunked prefills cannot overcommit the
+pool by allocating only their first small chunk. Future `max_tokens` capacity is
+not all reserved upfront. Waiting requests do not pin reusable prefix pages.
 
-The separation of decode priority, chunked prefill, and memory capacity is informed
-by [vLLM optimization guidance](https://docs.vllm.ai/en/latest/configuration/optimization/).
-The paged estimator accounts for the fixed pool separately from attention workspace.
+Running sequences have priority. If they cannot allocate another page as they
+grow, emergency recompute preemption remains necessary, even with no new arrivals.
+The scheduler does not evict running work merely because a new prompt cannot fit.
+
+An optional conservative short-request policy is enabled by default:
+
+```toml
+[engine]
+short_request_preemption = true
+```
+
+Only the oldest waiter is considered, after at least eight scheduling steps.
+A running victim must have a longer cached context and enough exclusively owned
+pages to make admission possible. Its remaining output allowance must exceed
+`4 * (waiting_known_tokens + waiting_remaining_output) + victim_cached_tokens`.
+The last term charges for eventual recompute. Switches are at least 32 steps
+apart, and a request can be voluntarily displaced only once; it rejoins the FIFO
+queue to protect progress. This heuristic uses `max_tokens` as an upper bound,
+not a prediction of EOS, and is not vLLM's default policy. Disable it for pure
+FIFO admission plus emergency pressure preemption.
+
+`/health.kv_cache` separates `admission_waits` (failed memory-admission attempts),
+`policy_preemptions`, `pressure_preemptions`, and total `preemptions`. Slot-bound
+waiting alone does not increment the memory-admission counter. Prefix sharing
+and preserved request RNG state continue to work across recompute.
+
+The separation of waiting admission from running-request pressure follows the
+[vLLM scheduler design](https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/sched/scheduler.py).
+Residual-memory pool sizing follows the
+[vLLM worker profiling approach](https://docs.vllm.ai/en/v0.17.1/api/vllm/v1/worker/gpu_worker/).
 
 ## Metrics and validation
 
@@ -167,12 +194,12 @@ backend = "paged" # "contiguous" selects the comparison backend
 block_size = 16
 enable_prefix_cache = true
 cache_namespace = "local"
-# num_blocks = 288 # Optional; otherwise derived from resolved sequence/context capacity.
+# num_blocks = 288 # Optional explicit override; otherwise sized from profiled free capacity.
 ```
 
 A pool must fit one maximum-context request. Reducing an explicit `num_blocks`
-can trigger scheduler preemption and replay; this trades recomputation for a lower
-fixed KV allocation. It does not reduce the padded attention workspace by itself.
+increases admission waiting and may require recompute if running contexts grow
+beyond available pages. It does not reduce the padded attention workspace by itself.
 Changing these settings requires restarting the server.
 
 `POST /generate` accepts optional `cache_salt` (default empty string). Requests
@@ -190,11 +217,11 @@ allocator segments and is distinct from all these cache ownership metrics.
 Counters expose prefix hits/tokens, evictions, COW copies, preemptions and logical
 persistent KV write bytes; these writes exclude temporary attention gathers.
 
-Startup is coordinated by `runtime/inference.py`: loaded weights are measured
-before capacity resolution and KV allocation. The runner constructs its manager
-with resolved capacity, then both cache backends warm up through `runner.execute`.
-`MemoryBudget` remains a runtime policy independent of HTTP and Qwen2 internals;
-backend-specific workspace estimates live in `execution/capacity.py`.
+Startup is coordinated by `runtime/inference.py`; `runtime/profiling.py` owns the
+disposable production-forward probe. `MemoryBudget` computes capacity and exposes
+startup accounting. `KVCacheManager` alone constructs and owns physical storage;
+it receives the resolved block count, never a Qwen2 model. Model-specific
+workspace bounds live in `execution/capacity.py`.
 
 ## Compute backend
 

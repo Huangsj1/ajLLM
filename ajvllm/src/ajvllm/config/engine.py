@@ -16,10 +16,13 @@ class EngineConfig:
     enable_chunked_prefill: bool = True
     max_prefill_chunk_size: int | None = None
     max_prefill_tokens_per_step: int | None = None
+    short_request_preemption: bool = True
 
     def __post_init__(self) -> None:
         for name in ("max_num_seqs", "max_num_batched_tokens", "max_model_len"):
             require_int(name, getattr(self, name), 1)
+        if type(self.short_request_preemption) is not bool:
+            raise ValueError("short_request_preemption must be a boolean")
         if type(self.enable_chunked_prefill) is not bool:
             raise ValueError("enable_chunked_prefill must be a boolean")
         if self.max_prefill_chunk_size is not None:

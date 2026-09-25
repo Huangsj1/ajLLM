@@ -1,130 +1,116 @@
-"""Conservative memory admission plus gradual input-token budget growth."""
+"""Startup memory planning; scheduling limits remain fixed during execution."""
 
-from collections.abc import Callable
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 
 import torch
-
-from ajvllm.config import EngineConfig
 
 
 @dataclass
 class BudgetStats:
     total_bytes: int
     target_bytes: int
-    baseline_bytes: int  # memory used by model weights and static buffers
-    profile_peak_bytes: int = 0  # peak memory observed during warmup
-    observed_peak_bytes: int = 0  # peak memory observed during runtime
-    token_budget: int = 1  # current token budget for the next step
-    token_ceiling: int = 1  # maximum token budget allowed by the memory target
-    max_num_seqs: int = 1  # maximum number of sequences allowed by the memory target
+    baseline_bytes: int
+    model_bytes: int
+    safety_bytes: int       # 512 MB
+    graph_reserve_bytes: int
+    weight_bytes: int = 0
+    buffer_bytes: int = 0
+    non_torch_growth_bytes: int = 0
+    measured_workspace_bytes: int = 0
+    workspace_reserve_bytes: int = 0
+    profile_peak_bytes: int = 0
+    temporary_pool_bytes: int = 0
+    workspace_bytes: int = 0
+    non_kv_peak_bytes: int = 0
+    pool_bytes: int = 0
+    num_blocks: int = 0
+    token_budget: int = 0
+    max_num_seqs: int = 0
 
 
 class MemoryBudget:
-    """A process memory ceiling, not a target GPU compute utilization.
+    """Use measured non-KV demand to size a fixed page pool, never resize budgets."""
 
-    Account for the selected KV backend separately from padded attention workspace.
-    The scheduler enforces physical page capacity within the fixed paged pool.
-    """
-
-    def __init__(
-        self,
-        device,
-        config: EngineConfig,
-        *,
-        gpu_memory_utilization: float = 0.5,
-        estimate: Callable[[int, int], int],
-        safety_bytes: int = 512 * 1024**2,  # 512 MB
-        growth_interval: int = 8,
-    ):
-        if not 0 < gpu_memory_utilization < 1 or growth_interval < 1 or safety_bytes < 0:
-            raise ValueError("invalid memory utilization, safety reserve, or growth interval")
-        if not config.enable_chunked_prefill:
-            raise ValueError("adaptive memory budgeting requires chunked prefill")
-        self.device = device
-        self._estimate = estimate
-        self.safety_bytes = safety_bytes
-        self.growth_interval = growth_interval
-        self.steps = 0
-        self.config = config
+    def __init__(self, model, config, *, gpu_memory_utilization=0.7, safety_bytes=512 * 1024**2, graph_reserve_bytes=0):
+        if not 0 < gpu_memory_utilization < 1 or safety_bytes < 0:
+            raise ValueError("invalid GPU memory utilization or safety reserve")
+        self.device = model.device
+        torch.cuda.synchronize(self.device)
+        torch.cuda.empty_cache()
         free, total = torch.cuda.mem_get_info(self.device)
         baseline = torch.cuda.memory_allocated(self.device)
-        target = int(min(total * gpu_memory_utilization, baseline + free)) - safety_bytes
-        self.stats = BudgetStats(total, target, baseline)
-        # 1. max_num_seqs: the number of sequences that can be admitted without exceeding the memory target
-        slots = config.max_num_seqs
-        while slots > 1 and self.estimate(slots, 1) > target:
-            slots -= 1
-        if self.estimate(slots, 1) > target:
-            raise MemoryError("memory target cannot fit weights, one full-context request, and workspace")
-        # 2. max_num_batched_tokens: tokens admitted without exceeding the memory target.
-        ceiling = config.max_num_batched_tokens
-        while ceiling > 1 and self.estimate(slots, ceiling) > target:
-            ceiling = max(1, ceiling // 2)
-        self.config = replace(config, max_num_seqs=slots, max_num_batched_tokens=ceiling)
-        self.stats.max_num_seqs, self.stats.token_ceiling = slots, ceiling
-        self.stats.token_budget = ceiling
+        self.available_bytes = baseline + free
+        self.initial_free = free
+        self.initial_reserved = torch.cuda.memory_reserved(self.device)
+        model_bytes = sum(t.numel() * t.element_size() for t in (*model.parameters(), *model.buffers()))
+        self.stats = BudgetStats(
+            total,
+            int(total * gpu_memory_utilization),
+            baseline,
+            model_bytes,
+            safety_bytes,
+            graph_reserve_bytes,
+            weight_bytes=sum(t.numel() * t.element_size() for t in model.parameters()),
+            buffer_bytes=sum(t.numel() * t.element_size() for t in model.buffers()),
+            token_budget=config.max_num_batched_tokens,
+            max_num_seqs=config.max_num_seqs,
+        )
 
-    def estimate(self, slots: int, tokens: int) -> int:
-        return self.stats.baseline_bytes + self._estimate(slots, tokens)
+    def check_probe(self, temporary_pool_bytes, workspace_reserve):
+        required = self.stats.baseline_bytes + temporary_pool_bytes + workspace_reserve + self.stats.safety_bytes
+        if required > min(self.stats.target_bytes, self.available_bytes):
+            raise MemoryError(
+                "configured profiling workload cannot fit; lower the fixed token/sequence limits "
+                "or increase gpu_memory_utilization"
+            )
 
-    @torch.inference_mode()
-    def warmup(self, probe) -> None:
-        """Profile admitted capacity, reducing the budget when the probe cannot fit."""
-        while True:
-            try:
-                budget = min(
-                    self.stats.token_budget, self.config.max_prefill_tokens_per_step or self.stats.token_budget
-                )
-                slots = min(self.config.max_num_seqs, budget)
-                chunk = min(self.config.max_model_len, self.config.max_prefill_chunk_size or budget)
-                sequences = [[0] * min(chunk, budget // slots + (row < budget % slots)) for row in range(slots)]
-                torch.cuda.reset_peak_memory_stats(self.device)
-                probe(sequences)
-                torch.cuda.synchronize(self.device)
-                self.stats.profile_peak_bytes = torch.cuda.max_memory_allocated(self.device)
-                if self.stats.profile_peak_bytes <= self.stats.target_bytes:
-                    return
-            except (torch.cuda.OutOfMemoryError, MemoryError):
-                pass
-            if self.stats.token_budget == 1:
-                raise MemoryError("even the minimum warmup exceeds the memory target")
-            self.stats.token_budget = max(1, self.stats.token_budget // 2)
-            torch.cuda.empty_cache()
-
-    def before_step(self, engine) -> None:
+    def record_profile(self, *, profile_peak, temporary_pool_bytes, workspace_reserve):
+        s = self.stats
+        s.profile_peak_bytes = profile_peak
+        s.temporary_pool_bytes = temporary_pool_bytes
+        s.measured_workspace_bytes = max(0, profile_peak - temporary_pool_bytes - s.baseline_bytes)
+        s.workspace_reserve_bytes = workspace_reserve
+        s.workspace_bytes = max(workspace_reserve, s.measured_workspace_bytes)
+        s.non_kv_peak_bytes = s.baseline_bytes + s.workspace_bytes
+        # The graph allowance is separate: the temporary runner never captures graphs.
         free, _ = torch.cuda.mem_get_info(self.device)
-        # Include free blocks held by PyTorch, which mem_get_info counts as unavailable.
-        allocated = torch.cuda.memory_allocated(self.device)
-        reusable = torch.cuda.memory_reserved(self.device) - allocated
-        allowed = min(self.stats.target_bytes, allocated + free + reusable - self.safety_bytes)
-        while (
-            self.stats.token_budget > 1 and self.estimate(self.config.max_num_seqs, self.stats.token_budget) > allowed
-        ):
-            self.stats.token_budget = max(1, self.stats.token_budget // 2)
-        if self.estimate(self.config.max_num_seqs, self.stats.token_budget) > allowed:
-            raise MemoryError("available GPU memory no longer covers the reserved request capacity")
-        engine.set_token_budget(self.stats.token_budget)
-        torch.cuda.reset_peak_memory_stats(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        s.non_torch_growth_bytes = max(0, self.initial_free - free - (reserved - self.initial_reserved))
+        s.non_kv_peak_bytes += s.non_torch_growth_bytes
+        available = reserved + free
+        capacity = min(s.target_bytes, self.available_bytes, available)
+        if s.non_kv_peak_bytes + s.graph_reserve_bytes + s.safety_bytes > capacity:
+            raise MemoryError("measured non-KV demand exceeds the target; adjust fixed budgets or GPU utilization")
+        return capacity
 
-    def after_step(self, engine) -> None:
-        peak = torch.cuda.max_memory_allocated(self.device)
-        self.stats.observed_peak_bytes = max(self.stats.observed_peak_bytes, peak)
-        self.steps += 1
-        budget = self.stats.token_budget
-        if peak > self.stats.target_bytes * 0.9:
-            self.stats.token_budget = max(1, budget // 2)
-        elif self.steps % self.growth_interval == 0 and engine.last_batch.num_scheduled_tokens >= budget:
-            candidate = min(self.stats.token_ceiling, budget * 2)
-            if (
-                peak < self.stats.target_bytes * 0.8
-                and self.estimate(self.config.max_num_seqs, candidate) <= self.stats.target_bytes
-            ):
-                self.stats.token_budget = candidate
+    def resolve(
+        self,
+        *,
+        profile_peak,
+        temporary_pool_bytes,
+        workspace_reserve,
+        block_bytes,
+        minimum_blocks,
+        explicit_blocks=None,
+    ):
+        capacity = self.record_profile(
+            profile_peak=profile_peak, temporary_pool_bytes=temporary_pool_bytes, workspace_reserve=workspace_reserve
+        )
+        s = self.stats
+        remaining = capacity - s.non_kv_peak_bytes - s.graph_reserve_bytes - s.safety_bytes
+        blocks = remaining // block_bytes
+        if explicit_blocks is not None:
+            if explicit_blocks > blocks:
+                raise MemoryError("explicit KV pool exceeds profiled memory capacity")
+            blocks = explicit_blocks
+        if blocks < minimum_blocks:
+            raise MemoryError(
+                "remaining GPU memory cannot fit one maximum-context request; lower fixed budgets "
+                "or max_model_len, or increase gpu_memory_utilization"
+            )
+        s.num_blocks = blocks
+        s.pool_bytes = blocks * block_bytes
+        return blocks
 
-    def on_oom(self) -> None:
-        self.stats.token_budget = max(1, self.stats.token_budget // 2)
-        torch.cuda.empty_cache()
-
-    def snapshot(self) -> dict:
+    def snapshot(self):
         return asdict(self.stats)

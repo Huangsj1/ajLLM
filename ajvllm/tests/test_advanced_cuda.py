@@ -186,11 +186,12 @@ def test_runtime_initialization_quantizes_before_budget_and_captures():
         EngineConfig(max_model_len=64, max_num_seqs=2, max_num_batched_tokens=8, max_prefill_chunk_size=4),
         graph_config=GraphConfig(enabled=True, memory_limit_mb=64, batch_sizes=(1, 2)),
         quantization_config=QuantizationConfig(mode="w8a16"),
+        memory_config=MemoryConfig(num_blocks=16),
     )
     runner = runtime.engine.runner
     assert runner.quantization["model_storage_bytes"] < before
-    assert runtime.budget._estimate.graph_reserve_bytes == 64 * 1024**2
-    assert runner.graphs.captures > 0 and runner.num_active_states == 0
+    assert runtime.budget.stats.graph_reserve_bytes == 64 * 1024**2
+    assert runner.graphs.captures == 0 and runner.num_active_states == 0
     for i in range(2):
         runtime.engine.add_request(str(i), [i + 1] * 9, SamplingParams(max_tokens=4, temperature=0.8, seed=42))
     result = [out for out in runtime.run() if out.finished]
@@ -215,8 +216,8 @@ def test_graph_replay_with_prefixes_and_preemption_preserves_rng():
             graph_config=GraphConfig(enabled=enabled, batch_sizes=(1, 2, 3)),
         )
         engine = Engine(runner, cfg)
-        for i, length in enumerate((13, 11, 15)):
-            engine.add_request(str(i), [i + 1] * length, SamplingParams(max_tokens=4, temperature=0.8, seed=42))
+        for i, length in enumerate((3, 3, 3)):
+            engine.add_request(str(i), [i + 1] * length, SamplingParams(max_tokens=12, temperature=0.8, seed=42))
         finished = {}
         for _ in range(150):
             for out in engine.step():

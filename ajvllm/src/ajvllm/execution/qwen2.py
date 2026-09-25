@@ -75,7 +75,6 @@ class Qwen2Runner:
                 device=model.device,
                 dtype=model.dtype,
                 max_model_len=engine_config.max_model_len,
-                max_num_seqs=engine_config.max_num_seqs,
             )
         graph_config = graph_config or GraphConfig()
         if graph_config.enabled and self.compute_backend != "triton":
@@ -202,7 +201,7 @@ class Qwen2Runner:
         return {batch.requests[index].request_id: row for index, row in zip(sampling_rows, output.logits, strict=True)}
 
     @torch.inference_mode()
-    def probe(self, sequences):
+    def probe(self, sequences, sample=None):
         """Exercise the production execution path without retaining warmup prefixes."""
         if self.num_active_states:
             raise RuntimeError("warmup requires an idle runner")
@@ -212,7 +211,7 @@ class Qwen2Runner:
             manager.enable_prefix_cache = False
         ids = [f"warmup-{row}" for row in range(len(sequences))]
         try:
-            self.execute(
+            logits = self.execute(
                 SchedulerOutput(
                     tuple(
                         ScheduledRequest(rid, tuple(tokens), 0, Phase.PREFILL, True)
@@ -220,8 +219,10 @@ class Qwen2Runner:
                     )
                 )
             )
+            if sample is not None:
+                sample(logits)
             if max(map(len, sequences)) < self.context_limit:
-                self.execute(
+                logits = self.execute(
                     SchedulerOutput(
                         tuple(
                             ScheduledRequest(rid, (0,), len(tokens), Phase.DECODE, True)
@@ -229,6 +230,8 @@ class Qwen2Runner:
                         )
                     )
                 )
+                if sample is not None:
+                    sample(logits)
         finally:
             for rid in ids:
                 self.release(rid)

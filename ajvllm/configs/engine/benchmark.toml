@@ -1,16 +1,16 @@
-# Long-context eager benchmark for a 12 GiB GPU. MemoryBudget may lower capacity.
+# Long-context benchmark for a 12 GiB GPU. Scheduling limits remain fixed.
 [engine]
-max_num_seqs = 8
-max_num_batched_tokens = 5000
-max_model_len = 4096
+max_model_len = 16384
+max_num_batched_tokens = 18000
+max_num_seqs = 32
 enable_chunked_prefill = true
 max_prefill_chunk_size = 512
-max_prefill_tokens_per_step = 4096
+max_prefill_tokens_per_step = 16384
 
 [memory]
 backend = "paged"
 block_size = 16
-# Omit num_blocks to fit the resolved sequence/context capacity.
+# Omit num_blocks to size the pool from profiled available GPU memory.
 enable_prefix_cache = true
 cache_namespace = "local"
 

@@ -22,9 +22,11 @@ class SequenceState:
 
 
 class KVCacheManager:
-    def __init__(self, config: MemoryConfig, *, layers, kv_heads, head_dim, device, dtype, max_model_len, max_num_seqs):
+    def __init__(self, config: MemoryConfig, *, layers, kv_heads, head_dim, device, dtype, max_model_len):
         blocks_per_request = (max_model_len + config.block_size - 1) // config.block_size
-        num_blocks = config.num_blocks or blocks_per_request * max_num_seqs
+        # Runtime always resolves num_blocks from the memory profile. Standalone
+        # runners default to one context, never max_num_seqs times the context.
+        num_blocks = config.num_blocks or blocks_per_request
         if num_blocks < blocks_per_request:
             raise ValueError("KV pool must fit at least one maximum-context request")
         self.storage = storage = PagedKVStorage(
@@ -41,6 +43,9 @@ class KVCacheManager:
         self.hit_tokens = 0
         self.cow_copies = 0
         self.preemptions = 0
+        self.policy_preemptions = 0
+        self.pressure_preemptions = 0
+        self.admission_waits = 0
         self.written_tokens = 0
         self.peak_used_blocks = 0
 
@@ -193,7 +198,7 @@ class KVCacheManager:
             "used_blocks": used,
             "free_blocks": len(self.blocks.free),
             "cached_blocks": len(self.blocks.prefixes),
-            "shared_blocks": sum(ref > 1 for ref in self.blocks.ref_counts),
+            "shared_blocks": self.blocks.shared_blocks,
             "pool_bytes": self.storage.nbytes,
             "used_bytes": used * block_bytes,
             "peak_used_bytes": self.peak_used_blocks * block_bytes,
@@ -202,6 +207,9 @@ class KVCacheManager:
             "evictions": self.blocks.evictions,
             "cow_copies": self.cow_copies,
             "preemptions": self.preemptions,
+            "policy_preemptions": self.policy_preemptions,
+            "pressure_preemptions": self.pressure_preemptions,
+            "admission_waits": self.admission_waits,
             "written_tokens": self.written_tokens,
             "kv_write_bytes": self.written_tokens * block_bytes // self.block_size,
             "cow_copy_bytes": self.cow_copies * block_bytes,

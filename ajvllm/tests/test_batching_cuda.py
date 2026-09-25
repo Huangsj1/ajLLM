@@ -1,6 +1,5 @@
 """Packed computation, scheduler boundaries, and memory policy on a real CUDA model."""
 
-from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
@@ -11,10 +10,8 @@ from test_qwen2_cuda import pair, tiny_config
 from ajvllm import Engine, EngineConfig, EngineExecutionError, SamplingParams
 from ajvllm.config import MemoryConfig
 from ajvllm.execution.batch import ModelBatch
-from ajvllm.execution.capacity import Qwen2MemoryEstimate
 from ajvllm.execution.qwen2 import Qwen2Runner
 from ajvllm.modeling.qwen2.layers import rotary_factors
-from ajvllm.runtime.budget import MemoryBudget
 from ajvllm.scheduling.batch import Phase, ScheduledRequest, SchedulerOutput
 
 pytestmark = pytest.mark.cuda
@@ -200,34 +197,20 @@ def test_failed_batch_releases_all_members_and_waiting_request_survives(models):
     assert list(engine.run())[-1].request_id == "c"
 
 
-def test_memory_warmup_growth_reduction_and_impossible_target(models):
+def test_fixed_budget_and_impossible_startup_target(models):
+    from ajvllm.runtime.inference import InferenceRuntime
+
     model, _ = models
-    runner = Qwen2Runner(model)
     config = EngineConfig(max_model_len=128, max_num_seqs=2, max_num_batched_tokens=8)
-    estimate = Qwen2MemoryEstimate(
-        model.config, model.model.embed_tokens.weight.element_size(), config, MemoryConfig(backend="contiguous")
-    )
-    budget = MemoryBudget(model.device, config, estimate=estimate, growth_interval=1)
-    budget.stats.token_budget = 1
-    budget.warmup(runner.probe)
-    engine = Engine(runner, budget.config)
-    engine.add_request("a", [1] * 40, SamplingParams(max_tokens=1, temperature=0))
-    used = []
-    while engine.has_unfinished_requests:
-        budget.before_step(engine)
-        used.append(engine.token_budget)
-        engine.step()
-        budget.after_step(engine)
-    assert used[:4] == [1, 2, 4, 8] and max(used) <= 8
-    assert budget.stats.profile_peak_bytes > 0 and budget.stats.observed_peak_bytes <= budget.stats.target_bytes
-    budget.on_oom()
-    assert budget.stats.token_budget == 4
-    with pytest.raises(MemoryError):
-        MemoryBudget(model.device, config, estimate=estimate, gpu_memory_utilization=1e-9, safety_bytes=0)
-    with pytest.raises(ValueError):
-        MemoryBudget(
-            model.device, replace(config, enable_chunked_prefill=False, max_num_batched_tokens=128), estimate=estimate
-        )
+    runtime = InferenceRuntime.from_model(model, config, memory_config=MemoryConfig(num_blocks=16))
+    runtime.engine.add_request("a", [1] * 40, SamplingParams(max_tokens=1, temperature=0))
+    while runtime.engine.has_unfinished_requests:
+        runtime.step()
+        assert runtime.engine.token_budget == 8
+    assert runtime.engine.config == config
+    assert runtime.budget.stats.profile_peak_bytes > 0
+    with pytest.raises(MemoryError, match="configured profiling workload"):
+        InferenceRuntime.from_model(model, config, gpu_memory_utilization=1e-9, safety_bytes=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

@@ -56,12 +56,12 @@ def test_pressure_recompute_preserves_tokens_and_rng(model, prefix, temperature,
             ),
         )
         engine = Engine(runner, configs)
-        for index, length in enumerate((13, 11, 15)):
+        for index, length in enumerate((3, 3, 3)):
             engine.add_request(
                 str(index),
                 [index + 1] * length,
                 SamplingParams(
-                    max_tokens=4,
+                    max_tokens=12,
                     temperature=temperature,
                     seed=42,
                     repetition_penalty=1.2 if penalties else 1.0,
@@ -128,6 +128,7 @@ def test_copy_on_write_partial_tail_and_reference_logits(model):
         runner.release(rid)
         runner.release(rid)
     assert all(ref == 0 for ref in manager.blocks.ref_counts)
+    assert manager.snapshot()["shared_blocks"] == 0
 
 
 @torch.inference_mode()
@@ -139,6 +140,7 @@ def test_full_shared_blocks_eviction_and_atomic_reservation(model):
     assert manager.attach("a", (1,) * 9) == 8
     assert manager.attach("b", (1,) * 9) == 8
     assert all(manager.blocks.ref_counts[block] == 2 for block in manager.states["a"].blocks)
+    assert manager.snapshot()["shared_blocks"] == len(manager.states["a"].blocks)
     manager.release("b")
     refs, free = list(manager.blocks.ref_counts), list(manager.blocks.free)
     assert not manager.reserve("a", 40)
@@ -180,6 +182,7 @@ def test_copy_failure_rolls_back_and_fork_only_shares_committed_pages(model, mon
     for rid in ("source", "fork"):
         manager.release(rid)
     assert all(ref == 0 for ref in manager.blocks.ref_counts)
+    assert manager.snapshot()["shared_blocks"] == 0
 
 
 def test_forward_failure_and_cancel_release_pages(model):
@@ -269,27 +272,26 @@ def test_runtime_probe_and_offline_budget_share_execution_path(model, backend, m
 
     monkeypatch.setattr(Qwen2Runner, "execute", execute_recorded)
     config = EngineConfig(max_model_len=32, max_num_seqs=2, max_num_batched_tokens=8, max_prefill_chunk_size=4)
-    runtime = InferenceRuntime.from_model(model, config, memory_config=MemoryConfig(backend=backend, block_size=4))
+    runtime = InferenceRuntime.from_model(
+        model, config, memory_config=MemoryConfig(backend=backend, block_size=4, num_blocks=16)
+    )
     runner = runtime.engine.runner
-    assert len(calls) == 2
+    assert len(calls) == 6
     assert {item.phase for item in calls[0].requests} == {Phase.PREFILL}
     assert {item.phase for item in calls[1].requests} == {Phase.DECODE}
     assert runner.num_active_states == 0
     if runner.kv_cache:
         assert runner.kv_cache.enable_prefix_cache and not runner.kv_cache.blocks.prefixes
         # Weight baseline excludes the pool, which is accounted for exactly once.
-        estimate = runtime.budget._estimate
-        assert estimate(2, 1) >= runner.kv_cache.storage.nbytes
-    runtime.budget.stats.token_budget = 2
+        assert runtime.budget.stats.pool_bytes == runner.kv_cache.storage.nbytes
     runtime.engine.add_request("live", [1] * 9, SamplingParams(max_tokens=2, temperature=0))
     assert list(runtime.run())[-1].finished
-    assert runtime.budget.steps > 0 and runtime.budget.stats.observed_peak_bytes > 0
-    assert runtime.engine.token_budget == 2
+    assert runtime.engine.token_budget == 8
     assert runner.num_active_states == 0
 
     # The controller only plans: constructing it neither executes nor allocates KV.
     calls.clear()
-    MemoryBudget(model.device, config, estimate=runtime.budget._estimate)
+    MemoryBudget(model, config)
     assert not calls and runner.num_active_states == 0
 
 
@@ -316,9 +318,9 @@ def test_probe_failure_releases_state_and_restores_prefix_policy(model, backend)
     assert runner.num_active_states == 0
 
 
-def test_runtime_oom_reduces_budget_without_retrying_failed_requests(model):
+def test_runtime_oom_keeps_fixed_budget_without_retrying_failed_requests(model):
     config = EngineConfig(max_model_len=32, max_num_seqs=2, max_num_batched_tokens=8, max_prefill_chunk_size=4)
-    runtime = InferenceRuntime.from_model(model, config, memory_config=MemoryConfig(block_size=4))
+    runtime = InferenceRuntime.from_model(model, config, memory_config=MemoryConfig(block_size=4, num_blocks=16))
     runtime.engine.add_request("failed", [1] * 9, SamplingParams(max_tokens=2))
 
     def fail(*_):
@@ -331,8 +333,90 @@ def test_runtime_oom_reduces_budget_without_retrying_failed_requests(model):
     finally:
         hook.remove()
     assert error.value.outputs[0].finish_reason == "error"
-    assert runtime.budget.stats.token_budget == 4 and runtime.budget.steps == 0
+    assert runtime.budget.stats.token_budget == 8
     assert runtime.engine.runner.num_active_states == 0
     runtime.engine.add_request("next", [2], SamplingParams(max_tokens=1))
     assert list(runtime.run())[-1].finished
-    assert runtime.engine.token_budget == 4
+    assert runtime.engine.token_budget == 8
+
+
+def test_new_prompt_waits_without_evicting_running_request(model):
+    cfg = EngineConfig(max_model_len=24, max_num_seqs=3, max_num_batched_tokens=7, max_prefill_chunk_size=3)
+    runner = Qwen2Runner(model, engine_config=cfg, memory_config=MemoryConfig(block_size=4, num_blocks=6))
+    engine = Engine(runner, cfg)
+    engine.add_request("first", [1] * 13, SamplingParams(max_tokens=4, temperature=0))
+    engine.step()
+    engine.add_request("second", [2] * 11, SamplingParams(max_tokens=4, temperature=0))
+    while "first" in engine._scheduler.requests:
+        engine.step()
+        assert "second" not in runner.kv_cache.states
+        assert runner.kv_cache.preemptions == 0
+    assert runner.kv_cache.admission_waits > 0
+    assert list(engine.run())[-1].request_id == "second"
+    assert not runner.kv_cache.states
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_short_request_switch_is_bounded_and_preserves_long_request(model, enabled):
+    cfg = EngineConfig(max_model_len=128, max_num_seqs=1, max_num_batched_tokens=16, short_request_preemption=enabled)
+    runner = Qwen2Runner(
+        model, engine_config=cfg, memory_config=MemoryConfig(block_size=4, num_blocks=32, enable_prefix_cache=False)
+    )
+    engine = Engine(runner, cfg)
+    params = SamplingParams(max_tokens=90, temperature=0.8, seed=7)
+    engine.add_request("long", [1] * 16, params)
+    for _ in range(3):
+        engine.step()
+    engine.add_request("short", [2, 3], SamplingParams(max_tokens=2, temperature=0))
+    finished = [out for out in engine.run() if out.finished]
+    assert finished[0].request_id == ("short" if enabled else "long")
+    assert runner.kv_cache.policy_preemptions == int(enabled)
+    assert runner.kv_cache.pressure_preemptions == 0
+    reference = Engine(Qwen2Runner(model), cfg)
+    reference.add_request("long", [1] * 16, params)
+    expected = list(reference.run())[-1].output_token_ids
+    assert next(out for out in finished if out.request_id == "long").output_token_ids == expected
+    assert not runner.kv_cache.states
+
+
+def test_profiled_pool_not_proportional_to_sequence_context_capacity(model):
+    import gc
+    from dataclasses import asdict
+
+    pools = []
+    for slots in (2, 64):
+        cfg = EngineConfig(max_model_len=32, max_num_seqs=slots, max_num_batched_tokens=8)
+        free, total = torch.cuda.mem_get_info(model.device)
+        target = torch.cuda.memory_allocated(model.device) + 32 * 1024**2
+        runtime = InferenceRuntime.from_model(
+            model, cfg, gpu_memory_utilization=target / total, safety_bytes=2 * 1024**2
+        )
+        stats = runtime.budget.stats
+        assert runtime.engine.config == cfg
+        assert stats.pool_bytes + stats.non_kv_peak_bytes + stats.safety_bytes <= stats.target_bytes
+        assert stats.temporary_pool_bytes < stats.pool_bytes
+        assert stats.num_blocks == runtime.engine.runner.kv_cache.snapshot()["num_blocks"]
+        pools.append(asdict(stats))
+        runtime.engine.close()
+        del runtime
+        gc.collect()
+        torch.cuda.empty_cache()
+    assert 0.7 < pools[1]["pool_bytes"] / pools[0]["pool_bytes"] < 1.3
+
+
+def test_waiting_prefixes_do_not_pin_pages_ahead_of_fifo_admission(model):
+    cfg = EngineConfig(max_model_len=24, max_num_seqs=3, max_num_batched_tokens=7, max_prefill_chunk_size=3)
+    runner = Qwen2Runner(model, engine_config=cfg, memory_config=MemoryConfig(block_size=4, num_blocks=6))
+    execute(runner, "cached", [1] * 20)
+    runner.release("cached")
+    engine = Engine(runner, cfg)
+    for rid, token in (("first", 2), ("later", 1)):
+        engine.add_request(rid, [token] * 20, SamplingParams(max_tokens=2, temperature=0))
+    finished = []
+    for _ in range(40):
+        finished.extend(out.request_id for out in engine.step() if out.finished)
+        if not engine.has_unfinished_requests:
+            break
+    assert finished == ["first", "later"]
+    assert runner.kv_cache.preemptions == 0
+    assert all(ref == 0 for ref in runner.kv_cache.blocks.ref_counts)

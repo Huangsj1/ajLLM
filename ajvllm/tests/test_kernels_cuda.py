@@ -137,8 +137,8 @@ def test_triton_pressure_replay_and_prefix_hits(prefix):
             compute_config=ComputeConfig(backend=backend),
         )
         engine = Engine(runner, cfg)
-        for i, n in enumerate((13, 11, 15)):
-            engine.add_request(str(i), [i + 1] * n, SamplingParams(max_tokens=4, temperature=0.8, seed=42))
+        for i, n in enumerate((3, 3, 3)):
+            engine.add_request(str(i), [i + 1] * n, SamplingParams(max_tokens=12, temperature=0.8, seed=42))
         finished = {}
         for _ in range(150):
             for output in engine.step():
@@ -201,13 +201,12 @@ def test_runtime_auto_selection_and_workspace_estimate():
 
     model, _ = pair(tiny_config(), torch.bfloat16)
     cfg = EngineConfig(max_model_len=128, max_num_seqs=2, max_num_batched_tokens=8, max_prefill_chunk_size=4)
-    runtime = InferenceRuntime.from_model(model, cfg, memory_config=MemoryConfig(block_size=4))
+    runtime = InferenceRuntime.from_model(model, cfg, memory_config=MemoryConfig(block_size=4, num_blocks=64))
     assert runtime.engine.runner.compute_backend == "triton"
     assert runtime.engine.runner.num_active_states == 0
     assert runtime.budget.stats.profile_peak_bytes > 0
-    assert runtime.budget._estimate.compute_backend == "triton"
     eager = Qwen2MemoryEstimate(model.config, 2, cfg, MemoryConfig(block_size=4), "eager")
-    assert runtime.budget._estimate(2, 8) < eager(2, 8)
+    assert runtime.budget.stats.workspace_bytes < eager(2, 8)
     contiguous = Qwen2Runner(model, compute_config=ComputeConfig(), engine_config=cfg)
     assert contiguous.compute_backend == "eager"
     with pytest.raises(ValueError, match="paged KV"):

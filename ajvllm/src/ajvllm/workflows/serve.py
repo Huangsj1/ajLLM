@@ -1,4 +1,4 @@
-"""Start a persistent single-GPU inference server with conservative memory budgeting."""
+"""Start a persistent single-GPU inference server with profiled KV capacity and fixed scheduling limits."""
 
 import argparse
 import json
@@ -52,7 +52,8 @@ def main():
     service = EngineService(runtime, max_pending_requests=args.max_pending_requests, profile_steps=args.profile_steps)
     print(
         json.dumps(
-            {"resolved_engine": asdict(runtime.engine.config), "memory": memory_display(runtime.budget.snapshot())}
+            {"resolved_engine": asdict(runtime.engine.config), "memory": memory_display(runtime.budget.snapshot())},
+            indent=2,
         ),
         flush=True,
     )

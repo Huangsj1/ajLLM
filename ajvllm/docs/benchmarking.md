@@ -758,3 +758,71 @@ uv run ajvllm-compare --graphs --concurrency 1 2 4 8 16 \
   --requests 48 --max-tokens 64 --token-budget 5000 --repeats 3 \
   --output benchmarks/results/compare-decode
 ```
+
+## Profiled KV pool and admission validation
+
+The memory runtime now keeps configured scheduling limits fixed and sizes the KV
+pool from the memory target after subtracting non-KV demand and reserves. A bounded
+local Qwen2.5-0.5B BF16 validation on the RTX 3080 Ti used utilization 0.3,
+`max_num_seqs=64`, context 4096, token budget 256, prefill chunk 64, and a 128 MiB
+CUDA Graph allowance. Startup reported:
+
+| Component | Size |
+| --- | ---: |
+| Model weights | 942.29 MiB |
+| Model buffers (RoPE) | 8.00 MiB |
+| Baseline CUDA allocations | 959.15 MiB |
+| Temporary profiling pool | 12.00 MiB |
+| Measured profiling peak, including temporary pool | 1.58 GiB |
+| Measured incremental workspace | 648.13 MiB |
+| Conservative workspace bound | 610.05 MiB |
+| Observed non-Torch growth | 16.00 MiB |
+| Graph allowance / safety reserve | 128 / 512 MiB |
+| Final pool | 1.39 GiB, 7589 blocks of 16 tokens |
+
+The larger measured workspace was used. The old sequence-times-context rule
+would allocate 3 GiB of KV for this configuration. The new pool provides 121424
+cached-token slots shared among requests and reusable prefixes; it does not
+promise that all 64 requests can simultaneously reach 4096 tokens. HTTP tests at
+concurrency 1/4/8 completed 12 requests each, with 96/256-token prompts and eight
+sampled output tokens. Token budget and sequence limit stayed at 256/64. All
+requests completed, prefix reuse and graph replay worked, and all request-owned
+pages were released. The final pool stayed unchanged. Device-wide sampled memory
+peaked at 4146 MiB, including the desktop and allocator reservations; this is not
+an isolated process allocation peak. These are functional checks, not throughput
+comparisons with vLLM.
+
+A separate small-pool work-count comparison used the same local BF16 model,
+three prompts of 48/40/56 tokens, eight output tokens each, temperature 0.8,
+top-p 0.9 and seed 7. The pool held only 64 token slots, with token budget 24 and
+prefill chunks of eight. Prefix caching and graphs were off. The old scheduler
+was loaded from the pre-change git source; all other components were identical.
+
+| Counter | Previous admission | New admission |
+| --- | ---: | ---: |
+| Completed requests / generated tokens | 3 / 24 | 3 / 24 |
+| Scheduled prefill tokens | 312 | 144 |
+| Scheduled decode tokens | 21 | 21 |
+| Preemptions | 12 | 0 |
+| Failed memory-admission attempts | not tracked | 25 |
+| Engine steps | 37 | 39 |
+
+New admission eliminated 168 recomputed prefill tokens (53.8% of the previous
+prefill work), while serializing more of this constrained workload. The slightly
+higher step count means this is not a claim of a proportional throughput gain.
+Stochastic output tokens differed for one request when batching/recompute paths
+changed; this experiment is not a bitwise-equivalence test. A follow-up using one
+FP32 CUDA checkpoint produced identical sampled outputs for all three requests;
+request 0's first-logit maximum/mean absolute differences were 4.12e-5/6.85e-6,
+versus 1.03125/0.16229 in BF16. This supports numerical sensitivity to the changed
+batch/recompute path rather than a cache-position or RNG-state mismatch in this
+case. Independent CUDA numerical and RNG-preservation regressions cover admission,
+pressure replay, prefix sharing and short-request switching.
+
+198 CUDA regression cases passed. New coverage includes fixed limits on startup
+and OOM, automatic pool capacity independent of sequence-times-context sizing,
+waiting rather than eviction for new prompts, genuine decode-growth pressure,
+FIFO prefix ownership without speculative pinning, and optional short-request
+preemption with long-request completion and preserved sampling state. Temporary
+profiling servers, baseline adapters and experiment scripts are removed after
+validation; the existing datasets and reusable workflows remain.

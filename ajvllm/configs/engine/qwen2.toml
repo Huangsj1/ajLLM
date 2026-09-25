@@ -1,4 +1,4 @@
-# Paged KV with eager attention; startup calibrates capacity for the available GPU.
+# Paged KV with fixed scheduling limits; startup profiles available GPU capacity.
 [engine]
 max_num_seqs = 8                       # Scheduler max total batch sequence size
 max_num_batched_tokens = 5000           # Scheduler max total budget
@@ -10,7 +10,7 @@ max_prefill_tokens_per_step = 4096      # aggregate prefill cap within the share
 [memory]
 backend = "paged"
 block_size = 16
-# Omit num_blocks to fit the resolved sequence/context capacity.
+# Omit num_blocks to size the pool from profiled available GPU memory.
 enable_prefix_cache = true
 cache_namespace = "local"
 

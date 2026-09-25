@@ -48,13 +48,20 @@ class Scheduler:
         self._last_decode_id: str | None = None
         self._last_prefill_id: str | None = None
         self.token_budget = config.max_num_batched_tokens
+        self.steps = 0
+        self.waiting_since = {}
+        self.short_preempted = set()    # requests preempted by short-request switching, to avoid re-adding them to the schedule
+        self.last_short_preemption = -32
 
     def add(self, request: Request) -> None:
         self.requests[request.request_id] = request
         self.waiting.append(request.request_id)
+        self.waiting_since[request.request_id] = self.steps
 
     def remove(self, request_id: str) -> Request:
         request = self.requests.pop(request_id)
+        self.waiting_since.pop(request_id, None)
+        self.short_preempted.discard(request_id)
         if request_id in self.running:
             self.running.remove(request_id)
         else:
@@ -76,8 +83,57 @@ class Scheduler:
         request.status = RequestStatus.WAITING
         self.running.remove(rid)
         self.waiting.append(rid)
+        self.waiting_since[rid] = self.steps
+
+    def _remaining(self, request):
+        return min(
+            request.sampling_params.max_tokens - len(request.output_token_ids),
+            self.config.max_model_len - request.num_tokens,
+        )
+
+    def _short_request_switch(self):
+        """Conservative remaining-work heuristic, with recompute cost and anti-thrashing bounds."""
+        cache = self.kv_cache
+        if (
+            cache is None
+            or not self.config.short_request_preemption
+            or not self.waiting
+            or self.steps - self.last_short_preemption < 32
+        ):
+            return
+        rid = self.waiting[0]  # Never bypass an older waiter to select a newer short job.
+        candidate = self.requests[rid]
+        age = self.steps - self.waiting_since[rid]
+        if age < 8:
+            return
+        needed = (min(self.config.max_model_len, candidate.num_tokens + 1) + cache.block_size - 1) // cache.block_size
+        if len(self.running) < self.config.max_num_seqs and needed <= len(cache.blocks.free):
+            return
+        work = candidate.num_tokens + self._remaining(candidate)
+        victims = []
+        for running_id in self.running:
+            request = self.requests[running_id]
+            if running_id in self.short_preempted or request.num_computed_tokens <= candidate.num_tokens:
+                continue
+            # max_tokens is an upper bound, not a prediction of EOS. Require a large
+            # advantage even after charging all cached tokens for future recompute.
+            if self._remaining(request) <= 4 * work + request.num_computed_tokens:
+                continue
+            state = cache.states[running_id]
+            freed = sum(cache.blocks.ref_counts[b] == 1 for b in state.blocks)
+            if needed <= len(cache.blocks.free) + freed:
+                victims.append((self._remaining(request), running_id))
+        if victims:
+            victim = max(victims)[1]
+            self._preempt(victim)
+            self.short_preempted.add(victim)
+            cache.policy_preemptions += 1
+            self.last_short_preemption = self.steps
 
     def schedule(self) -> SchedulerOutput:
+        self.steps += 1
+        # if a short request is waiting for a long time because of the lack of available blocks, preempt a running request to free up space for it
+        self._short_request_switch()
         budget = self.token_budget
         items = []
         # track requests that have been preempted in this scheduling step, to avoid re-adding them to the schedule
@@ -92,8 +148,20 @@ class Scheduler:
                 return False
             self._attach(rid)
             start = request.num_computed_tokens
+            count = min(count, request.num_tokens - start)
             if self.kv_cache is not None:
-                # if cannot reserve the required blocks, preempt a running request and retry
+                if request.status == RequestStatus.WAITING:
+                    # Admit only when the entire known prompt/recompute history and
+                    # one growth token fit. Allocate those pages now so other new
+                    # chunked prefills cannot consume the promised capacity.
+                    end = min(self.config.max_model_len, request.num_tokens + bool(self._remaining(request)))
+                    if not self.kv_cache.reserve(rid, end):
+                        self.kv_cache.admission_waits += 1
+                        self.kv_cache.release(rid)
+                        request.num_computed_tokens = 0
+                        return False
+                # Running sequences may still exhaust the pool as they grow. This
+                # emergency path is necessary even with no new arrivals.
                 while not self.kv_cache.reserve(rid, start + count):
                     protected = {item.request_id for item in items} | {rid}
                     victim = next(
@@ -101,12 +169,14 @@ class Scheduler:
                     )
                     if victim is None:
                         if rid in self.running:
+                            self.kv_cache.pressure_preemptions += 1
                             self._preempt(rid)
                             preempted.add(rid)
                         else:
                             self.kv_cache.release(rid)
                             request.num_computed_tokens = 0
                         return False
+                    self.kv_cache.pressure_preemptions += 1
                     self._preempt(victim)
                     preempted.add(victim)
             items.append(
@@ -117,6 +187,7 @@ class Scheduler:
             if request.status == RequestStatus.WAITING:
                 # Newly admitted candidates always follow the FIFO waiting prefix.
                 self.waiting.remove(rid)
+                self.waiting_since.pop(rid, None)
                 self.running.append(rid)
                 request.status = RequestStatus.RUNNING
             return True
@@ -141,8 +212,8 @@ class Scheduler:
             # Reserve at least one token for each candidate before admitting more.
             admission_count = min(slots, max(0, prefill_budget - len(prefills)))
             candidates = prefills + list(islice(waiting, admission_count))
-            # attach firstly to ensure that any prefix blocks are retained before allocating new blocks for the prefill
-            for rid in candidates:
+            # Do not speculatively pin prefix pages for waiting requests.
+            for rid in prefills:
                 self._attach(rid)
             demands = [
                 min(
@@ -156,15 +227,20 @@ class Scheduler:
             candidates = prefills + list(islice(waiting, slots))
             counts = []
             for rid in candidates:
-                self._attach(rid)
+                if rid in self.running:
+                    self._attach(rid)
                 count = self.requests[rid].num_tokens - self.requests[rid].num_computed_tokens
                 if count > prefill_budget:
                     break  # Whole prompts only, with FIFO head-of-line blocking.
                 counts.append(count)
                 prefill_budget -= count
         for rid, count in zip(candidates, counts):
-            if count and append(rid, count, Phase.PREFILL):
-                self._last_prefill_id = rid
+            if count:
+                was_waiting = self.requests[rid].status == RequestStatus.WAITING
+                if append(rid, count, Phase.PREFILL):
+                    self._last_prefill_id = rid
+                elif was_waiting:
+                    break
         if self.kv_cache is not None:
             for rid in self.waiting:
                 self.kv_cache.release(rid)

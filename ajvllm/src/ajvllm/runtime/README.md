@@ -1,5 +1,6 @@
-# GPU runtime policy
+# GPU runtime
 
-Implemented: conservative KV/workspace capacity estimates, real CUDA warmup,
-measured peak tracking, and gradual token-budget growth/reduction in `budget.py`.
-CUDA Graph capture/replay remains planned. See [serving](../../../docs/serving.md).
+Startup profiling uses a disposable KV pool, then sizes final pages from the GPU
+memory target minus non-KV demand and reserves. Engine budgets remain fixed.
+`inference.py` coordinates both offline and HTTP execution; `graphs.py` captures
+only against the final pool. See [serving](../../../docs/serving.md).

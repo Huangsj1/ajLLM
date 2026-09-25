@@ -38,7 +38,7 @@ src/ajvllm/
   memory/                block ownership, paged CUDA storage, prefix index, contiguous reference
   attention/backends/    compact ragged metadata and compute-backend selection
   kernels/               Triton paged prefill/decode and fused elementwise operations
-  runtime/               adaptive memory budget, shared execution and bounded decode graphs
+  runtime/               startup memory profiling, shared execution and bounded decode graphs
   quantization/          per-channel W8A16 linear modules and conversion
   serving/               async engine service and HTTP/SSE
 benchmarks/              reusable datasets; service metrics and serial vLLM comparison artifacts
@@ -142,10 +142,10 @@ Completed slots are available on the next step, giving continuous batching.
 Rotation prevents decode starvation if the budget is smaller than the active
 request count. Prefills use residual capacity and can be delayed behind decodes;
 finite output/context limits guarantee eventual progress for a finite workload.
-The server may lower or raise the current budget from observed GPU memory and
-conservative full-context admission estimates; see the serving guide.
-This is an explicit educational decode-first policy, not a verbatim copy of the
-current vLLM V1 scheduling policy. Priority scheduling and aging remain extensions.
+The runtime keeps configured budgets fixed. Waiting prompts must pass page
+admission before their first chunk, while running contexts retain emergency
+preemption on growth. A bounded short-request switch is described below. This is
+an explicit educational policy, not a verbatim copy of vLLM V1.
 
 Without chunking, a prefill must fit entirely in the current residual budget;
 startup requires budget >= maximum context length to avoid impossible admissions.
@@ -553,7 +553,7 @@ decode-first mixed batches, FIFO admission, rotating decodes, slot reuse,
 per-step token limits, terminal reasons, independent RNG, input validation,
 runner contract failures, and release on every terminal path. Finite workloads compare outputs across budgets/chunk sizes and assert eventual
 drain. Service tests add in-flight arrivals, TCP/SSE disconnects, backpressure,
-shutdown, and adaptive memory budgeting.
+shutdown, and fixed-budget startup memory profiling.
 
 Engine metrics count iterations, scheduled prefill/decode input tokens, generated
 tokens, and finished/cancelled/failed requests. Outputs include arrival, first-token,
@@ -585,60 +585,80 @@ CUDA sampling, and compact result transfer. Normal execution adds no profiling
 synchronizations. Allocated/reserved memory is reported separately from device-wide
 nvidia-smi memory. See [benchmarking](../benchmarking.md) for metric definitions.
 
-### Runtime and memory ownership refinement
+### Startup profiling, KV capacity and scheduling ownership
 
-The previous `MemoryBudget` both inspected Qwen2 internals and initialized the
-runner's KV manager. Its warmup bypassed the runner for contiguous storage, and
-offline generation did not apply runtime budget adjustments. These responsibilities
-are now separated:
+The previous runtime derived KV capacity from `max_num_seqs * max_model_len` and
+adapted sequence/token limits to memory feedback. This over-reserved space for
+hypothetical full-length requests and conflated compute admission with storage.
+The runtime now preserves engine configuration and sizes the pool after profiling.
 
 ```mermaid
 flowchart TD
-    R[InferenceRuntime startup] --> W[Load model weights]
-    W --> E[Qwen2MemoryEstimate: backend workspace and KV capacity]
-    E --> B[MemoryBudget: resolve sequence and token limits]
-    B --> Q[Construct Qwen2Runner with resolved configuration]
-    Q --> M[KVCacheManager constructs and owns PagedKVStorage]
-    Q --> P[runner.probe: SchedulerOutput to runner.execute]
-    P --> C[Engine ready]
-    C --> S[InferenceRuntime.step: budget checks, engine step, feedback]
-    S --> H[HTTP service]
-    S --> O[Offline generation]
+    R[InferenceRuntime] --> W[Load, quantize and pack weights]
+    W --> B[MemoryBudget: target and baseline]
+    B --> P[Disposable runner and small temporary KV pool]
+    P --> F[Prefill, decode and generic CUDA sampling probes]
+    F --> E[Measured peak plus conservative workspace bounds]
+    E --> D[Release temporary runner and pool]
+    D --> C[Resolve remaining memory into whole KV blocks]
+    C --> Q[Final Qwen2Runner and KVCacheManager]
+    Q --> G[Lazy graphs reference only the final pool]
+    Q --> S[Engine with fixed token and sequence limits]
+    S --> H[HTTP service or offline runtime]
 ```
 
-`runtime/budget.py` remains in `runtime/`: process memory headroom, warmup peak
-feedback and token-budget adaptation are execution policies, not KV ownership or
-HTTP concerns. The controller receives an estimate callable; it does not import
-a model, runner, KV manager or attention layout. Its constructor only resolves
-capacity; explicit `warmup(probe)` performs device work after runner construction.
-The initial budget comes from the configured token ceiling, reduced as necessary.
+`runtime/profiling.py` builds balanced/concentrated prefill probes respecting
+prefill caps, plus the maximum sampling row count and decode. `runner.probe`
+constructs ordinary `SchedulerOutput` objects and uses `runner.execute` for both
+cache backends. Its optional consumer exercises the generic CUDA sampler with
+penalties/masks; requests and histories are discarded afterward. Prefill probes
+cover maximum scheduled activations, not all possible full cached contexts.
+`Qwen2MemoryEstimate.workspace` bounds unobserved long-context attention, mixed
+shapes, sampling scratch and histories without including a hypothetical paged pool.
 
-`execution/capacity.py` contains `Qwen2MemoryEstimate`, the eager backend's
-model-specific workspace estimate. It uses architecture dimensions, element size
-and immutable engine/memory settings, without retaining model weights or a runner.
-It excludes loaded weights/static buffers, which the controller measures once
-before the KV pool exists. Runtime estimates include the resolved pool capacity
-once, avoiding double counting.
+`MemoryBudget` records baseline/model weights/buffers, measured peak, temporary
+pool, non-Torch growth and workspace reserves. Final pool capacity is the target
+minus non-KV peak, graph allowance and safety reserve, rounded down to whole
+blocks and bounded by available memory. Measured workspace excludes the disposable
+pool and is compared with the workspace bound. Fixed limits that cannot fit fail
+startup; no automatic halving or growth remains. Explicit `num_blocks` overrides
+are validated against this capacity. The final pool must fit one maximum-context
+request. Direct paged runners without an explicit capacity default to one context,
+not the product of sequence and context limits; normal runtimes always resolve an
+explicit capacity first. Direct runners without memory configuration still use
+the contiguous numerical reference backend.
 
-`runtime/inference.py` coordinates startup for both CLIs: load weights, plan
-capacity, construct the runner with `memory_config` and resolved `engine_config`,
-then warm up. This order preserves constructor-time KV initialization without
-allocating an uncalibrated maximum pool. Direct fixed-capacity callers can pass
-these two configurations to `Qwen2Runner` themselves. There is no post-construction
-`configure_memory` operation. Omitting memory configuration on a direct runner
-keeps the contiguous numerical baseline.
+KV construction remains inside `KVCacheManager`, with dimensions/dtype/device and
+a block count rather than a model dependency. The temporary pool is never used
+for graph capture; graph buffers reference only the final pool. `InferenceRuntime`
+coordinates startup and delegates steps directly to the engine. Runtime OOM uses
+existing batch failure/release semantics without changing budgets or replaying
+advanced sampling state. `EngineService` retains the runtime and exposes memory
+accounting in startup output and health; it does not own a second memory policy.
 
-`KVCacheManager` receives cache policy, capacity and tensor dimensions/device/dtype;
-it derives block count, validates single-request capacity and constructs the
-physical pool itself. It never receives a Qwen2 model. `Qwen2Runner.probe` constructs
-prefill and decode `SchedulerOutput` objects for both backends. Only prefix-publication
-suppression is backend-specific; cleanup always uses `runner.release`, including
-failed warmup attempts. The manager's prefix policy is restored in `finally`.
+Waiting admission reserves pages for the complete known prompt/recompute history
+plus one growth token, capped at `max_model_len`. It does not reserve the full
+future generation allowance. Insufficient capacity leaves the FIFO head waiting;
+waiting prefix lookups do not retain pages ahead of admission. Running requests
+reserve growth pages first and may still require emergency preemption if the pool
+fills, even without arrivals. This prevents new prompt admission from evicting
+productive work while retaining a progress mechanism for growing contexts.
 
-`InferenceRuntime.step/run` applies budget checks and successful-step feedback in
-both online and offline execution. CUDA OOM lowers the next budget and propagates
-the engine's existing failure outputs; it never retries advanced requests silently.
-`EngineService` receives the existing `InferenceRuntime` directly and retains no
-separate engine/budget state. The HTTP service owns transport queues, cancellation
-and profiling, while the
-model-independent `Engine.step/run` remains available for fixed-budget tests.
+The optional `short_request_preemption` heuristic considers only the oldest
+waiter after eight steps. A victim must have a longer cached context and enough
+exclusive pages to admit it. Remaining output must exceed four times the waiter's
+known tokens plus remaining output, plus the victim's cached tokens as recompute
+cost. A global 32-step cooldown and at most one voluntary displacement per request
+bound switching; displaced work rejoins FIFO. Generation allowances are upper
+bounds, not EOS predictions. Near-complete jobs are protected by the cost test.
+This local heuristic is not claimed to reproduce vLLM's default scheduler.
+
+Counters distinguish failed memory admissions, policy switches and pressure
+preemptions. Shared-block counts update only on reference-count transitions
+1-to-2 and 2-to-1, so per-step health snapshots do not scan the larger pool. CUDA regressions cover fixed limits, explicit/automatic capacity,
+probe cleanup, prefix ownership, chunked admission, growth-pressure replay and
+short-request switching with preserved RNG. The serving guide documents settings,
+accounting and policy thresholds; benchmarking records the bounded real-model
+validation. The underlying waiting/running distinction and residual-memory sizing
+were checked against the installed vLLM 0.23.0 scheduler and worker, as well as
+[vLLM memory guidance](https://docs.vllm.ai/en/latest/configuration/optimization/).
