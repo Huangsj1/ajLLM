@@ -357,3 +357,272 @@ before choosing a deployment precision policy.
 Tests used tiny CUDA models with a 15% allocator cap; no concurrency-8 stress test
 was run. Temporary comparison/quality scripts were removed after recording these
 results. The reusable dataset and benchmark workflow remain unchanged in purpose.
+
+## Reproducible comparison with vLLM
+
+`ajvllm-compare` owns both HTTP servers and starts them **serially** on one GPU.
+Stop any other inference server before running it. The workflow never terminates
+an unrelated server. Default concurrency is 1/2/4; it does not run concurrency 8.
+The installed vLLM 0.23.0 completion API is used, including streamed token IDs.
+
+```bash
+uv run ajvllm-compare --output benchmarks/results/compare-eager
+uv run ajvllm-compare --graphs --output benchmarks/results/compare-graphs
+```
+
+Defaults: the local Qwen2.5-0.5B-Instruct checkpoint, BF16 weights/activations/KV,
+no quantization, 24 requests per concurrency, 64 output tokens, three repeats,
+and input lengths 128/256/512/1024 from the first four existing long-dataset rows.
+Inputs are tokenized once with the checkpoint tokenizer, truncated, saved, and sent
+as identical token IDs to both engines. No implicit chat template or decoded-text
+re-tokenization enters the measurement. Temperature is 0.8, top-p 0.9, top-k is
+disabled, request seed is its workload index, and EOS is ignored. Random streams
+and rounding differ between engines; equal settings do not imply equal output text.
+
+Both engines use max sequences 4, context limit 1088, token budget 512, chunked
+prefill, 16-token KV blocks, prefix caching off, and the same explicit KV capacity
+(51 MiB for the default model/workload). These are equal physical bytes, not an
+assertion of identical usable blocks: vLLM reserves a null block internally.
+Single-slot configurations add one spare block to both pools so decode can finish.
+This removes unequal automatic cache-pool
+sizing and warmup prefix hits. ajvllm's per-request and aggregate prefill caps equal
+the token budget; scheduling decisions can still differ between implementations.
+The workflow checks ajvllm's resolved sequence limit, token budget and pool size,
+and refuses to call a silently reduced capacity an equal-configuration comparison.
+The 40% memory setting has different policy semantics in the two engines; fixed
+KV bytes are the actual capacity control. It is not a strict shared allocator cap.
+CPU math threads and JIT build jobs are limited to two in each server environment.
+
+The first command disables CUDA Graphs and torch.compile for both engines while
+retaining their optimized CUDA attention/elementwise/sampling implementations.
+`--graphs` enables decode graphs on both; vLLM uses `FULL_DECODE_ONLY`, explicit
+capture sizes matching the concurrency list, and compilation mode 0. ajvllm uses
+its batch/context buckets, at most 32 graphs and a 512 MiB conservative retention
+allowance (not a preallocated pool), so earlier concurrency sweeps do not exhaust
+the small default allowance before later buckets can be captured. This compares the
+implemented execution features, not vLLM's maximally tuned default configuration.
+vLLM retains its native asynchronous scheduler and fused kernels. ajvllm step
+profiling is disabled to avoid inserting extra CUDA synchronizations.
+
+Each repeat starts fresh server processes. Engine order alternates by repeat;
+each concurrency runs an excluded warmup with at least two waves of requests.
+A closed-loop client keeps up to the requested number of requests in flight.
+Latency starts when a worker submits its HTTP request, excluding time in the
+client executor queue. Throughput covers the entire measured workload including
+the final drain. The workflow verifies exact output length and terminal status;
+vLLM usage counts are also checked against the input and streamed IDs.
+
+The output directory contains:
+
+- `report.json`: per-request timings, aggregate distributions, GPU samples summarized
+  per run, versions, launch commands, input hashes, ajvllm health, and completion status.
+- `comparison.png`: six panels with throughput, mean TTFT/TPOT, p95 end-to-end
+  latency, peak sampled device memory, and mean device utilization; error bars are
+  standard deviation across repeat-level metrics, not confidence intervals.
+- `inputs.json`, `ajvllm.toml`, and server logs: exact workload and startup evidence.
+
+TTFT is the arrival of the first token-bearing SSE event. TPOT is the interval
+between first and last token-bearing events divided by output tokens minus one.
+Several tokens may arrive in one network event; per-event intervals are not claimed
+to be exact GPU token times. P95 in the figure is the mean of per-repeat p95 values.
+Memory/utilization come from `nvidia-smi` every 250 ms and include desktop/other GPU
+processes, CUDA contexts and reserved memory. Short peaks can be missed. Warmup,
+loading, compilation and graph capture at startup are excluded; any new ajvllm
+capture during measurement remains included and visible in before/after health.
+
+Use `--prompt-lengths`, `--max-tokens`, `--requests`, `--concurrency`, `--repeats`,
+and `--token-budget` to vary the workload. For conclusions about production service,
+also measure long contexts and open-loop arrival rates; this bounded comparison
+is a local regression/optimization diagnostic, not a general engine ranking.
+
+### Local results: 2026-09-24
+
+RTX 3080 Ti (12 GiB), WSL, vLLM 0.23.0, PyTorch 2.11.0+cu130. The two commands
+above completed 864 measured requests in total (432 per mode), with zero failures
+and exactly 64 output tokens each. Warmup requests are excluded. No concurrency-8
+stress test was performed. The reported values below are means over three repeats.
+
+| Graphs | Concurrency | ajvllm tokens/s | vLLM tokens/s | vLLM / ajvllm |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 1 | 51.71 | 61.59 | 1.19x |
+| Off | 2 | 93.29 | 109.03 | 1.17x |
+| Off | 4 | 174.60 | 208.89 | 1.20x |
+| Decode only | 1 | 135.60 | 327.56 | 2.42x |
+| Decode only | 2 | 218.03 | 472.27 | 2.17x |
+| Decode only | 4 | 362.21 | 768.85 | 2.12x |
+
+| Graphs | Concurrency | Mean TTFT ms, ajvllm / vLLM | Mean TPOT ms, ajvllm / vLLM | P95 latency s, ajvllm / vLLM |
+| --- | ---: | --- | --- | --- |
+| Off | 1 | 24.36 / 38.58 | 19.26 / 15.88 | 1.408 / 1.084 |
+| Off | 2 | 55.35 / 60.27 | 20.81 / 17.60 | 1.525 / 1.286 |
+| Off | 4 | 63.35 / 64.42 | 21.84 / 18.16 | 1.551 / 1.281 |
+| Decode only | 1 | 26.52 / 25.42 | 7.07 / 2.70 | 0.509 / 0.214 |
+| Decode only | 2 | 42.25 / 36.46 | 8.61 / 3.70 | 0.650 / 0.299 |
+| Decode only | 4 | 59.34 / 51.60 | 10.10 / 4.39 | 0.771 / 0.362 |
+
+[Graph-off plot](../benchmarks/results/compare-eager/comparison.png) and
+[report](../benchmarks/results/compare-eager/report.json).
+[Decode-graph plot](../benchmarks/results/compare-graphs/comparison.png) and
+[report](../benchmarks/results/compare-graphs/report.json).
+
+The graph-off low-concurrency TTFT is ajvllm's clear local advantage: 24.36 versus
+38.58 ms at concurrency 1. At concurrency 4 the TTFT difference is small compared
+with run-to-run variation. TTFT includes admission, queueing, model work and HTTP
+transport; this does not establish a faster standalone prefill kernel. With decode
+graphs enabled, TTFT is similar at concurrency 1 and vLLM is faster at 2/4. vLLM
+wins overall throughput, TPOT and end-to-end latency in both execution modes.
+
+Both graph-off engines used approximately 2393–2396 MiB of sampled device memory;
+a few MiB difference is not meaningful. With graphs, ajvllm's mean peak samples
+were 2476/2553/2600 MiB versus vLLM's 2429/2422/2424 MiB at concurrency 1/2/4.
+Both still used the same 51 MiB KV pool. ajvllm's multiple private batch/context
+captures retain more workspace; their conservative retention counter is not the
+same quantity as measured allocated/reserved memory. Device-wide measurements
+include the desktop and cannot precisely attribute every MiB to a process.
+
+Graph-enabled mean device utilization was 42/49/46% for ajvllm versus 88/88/80%
+for vLLM. This is sampled device busy time, not achieved SM occupancy or FLOP
+utilization. It is consistent with more execution gaps in ajvllm, but does not
+prove which host operation or kernel causes them.
+
+ajvllm replayed graphs 1512 times per concurrency-1 measurement and 756–757 times
+at concurrency 2, with no new captures. At concurrency 4 each repeat captured
+one new bucket and replayed 364 times; the reported metrics include that cold
+capture cost. Normal mixed/prefill forwards account for the expected fallback
+path. The speed gap is already large in the capture-free concurrency-1/2 runs,
+so graph cache misses cannot explain the overall result. vLLM startup logs confirm
+FlashAttention 2, FlashInfer sampling, asynchronous scheduling and three full
+decode graphs; torch.compile remains disabled.
+
+### Optimization priorities from the comparison
+
+These were source-grounded candidates from the original comparison, not a
+profiler-derived attribution of the measured gap. The sampler work below implements
+the first item; subsequent changes should be measured independently.
+
+1. **General CUDA sampling (fusion/history now implemented below).** The original
+   sampler sorted all 151,936 vocabulary entries
+   stably and executed many separate tensor operations for penalties, probability
+   transforms and selection. It rebuilt histories/parameter tensors each step,
+   even for neutral penalties. vLLM logs confirm fused FlashInfer top-p/top-k
+   sampling. Implement a general fused sampling path and persistent GPU history
+   metadata, retaining penalty/mask/temperature semantics and seeded RNG guarantees.
+   This does not require a separate greedy-only shortcut.
+2. **Host/device overlap and service overhead.** ajvllm waits for a compact D2H
+   sample result before advancing its control loop; vLLM enables asynchronous
+   scheduling. Profile metadata preparation, small H2D copies, per-step memory
+   queries and synchronization on a timeline. The native SSE serializer also
+   copies the prompt/output history and decodes the entire generated prefix on
+   every event; consider delta events with a final full result. Measure HTTP and
+   engine-only paths separately before assigning the gap to GPU kernels.
+3. **Projection fusion and decode partitioning.** vLLM's Qwen2 implementation uses
+   merged QKV and gate/up projections; ajvllm issues separate GEMMs. Merge these
+   weights/projections. Tune split decode
+   against batch size, head count and context length: the current short-context
+   path launches only `batch * 14` programs, and a fixed 1024-token split threshold
+   may expose too little parallelism at low concurrency. More splits also have
+   overhead, so measure kernel latency before changing that threshold.
+4. **Graph metadata and pool reuse.** Stabilize page-table/workspace capacity so
+   graph keys can depend less on context, or safely share graph pools with explicit
+   lifetime rules. This targets capture churn and memory, not an assumed 2x speedup.
+   Capturing only the model leaves sampling and control-plane costs exposed.
+
+Without graphs, model launch overhead obscures some of these differences. After
+replay removes much of it, ajvllm's remaining per-token work becomes proportionally
+larger: its concurrency-1 TPOT falls from 19.26 to 7.07 ms, while vLLM falls from
+15.88 to 2.70 ms. This explains why both engines improve but their throughput ratio
+widens. It is a reason to profile the remaining path, not evidence that CUDA Graphs
+are ineffective in ajvllm.
+
+## CUDA sampler fusion and incremental history
+
+Implemented on 2026-09-25. The sampler uses native Triton transforms, local weight
+scans, nucleus selection and selected log probabilities, plus incremental GPU
+penalty history. All policies share this path; temperature zero is still top-k=1,
+not a separate argmax implementation. One stable full-vocabulary CUDA sort remains.
+See [sampling architecture](architecture/architecture.md#sampling) for numerical
+semantics, history ownership, bounded eviction and FP64 cutoff comparison.
+
+### Isolated sampler measurement
+
+RTX 3080 Ti, vocabulary 151,936, BF16 input logits drawn with standard deviation 3,
+1024 prompt IDs, initially 32 generated IDs, temperature 0.8, top-p 0.9 and seed 7.
+Each timed call appended its selected token to request history. Five alternating
+before/after rounds each timed 40 calls after eight warmup calls. CUDA allocator
+usage was capped at 15%; CPU math threads were limited to two. Values are mean
+wall milliseconds per complete call, including compact D2H results and host work.
+The penalty case uses repetition 1.1 and frequency 0.1.
+
+| Batch | Penalties | Before ms | After ms | Speedup |
+| --- | --- | ---: | ---: | ---: |
+| 1 | Neutral | 2.296 | 0.626 | 3.67x |
+| 2 | Neutral | 2.753 | 0.638 | 4.32x |
+| 4 | Neutral | 3.072 | 0.714 | 4.30x |
+| 1 | Enabled | 2.076 | 0.564 | 3.68x |
+| 2 | Enabled | 2.923 | 0.646 | 4.53x |
+| 4 | Enabled | 3.033 | 0.880 | 3.45x |
+
+Individual rounds varied, including host scheduling outliers; raw round times are
+in the report. Isolated CUDA-event measurements of 100 stable sorts were about
+0.10–0.25 ms per sort, including submission gaps. This supports retaining sorting
+for this iteration: the previous multi-operation pipeline and repeated history
+preparation accounted for substantial avoidable overhead. It does not establish
+that sorting is free, or rule out a later sorting-free sampler.
+
+### Real-model service comparison
+
+The old git sampler and optimized sampler were tested in **otherwise identical
+current servers**, not compared only against yesterday's results. A temporary
+baseline adapter accepted the new cache-capacity constructor argument and supplied
+a no-op release method; sampling itself was unchanged. Its git revision and source
+hash are recorded. Both servers ran serially with decode CUDA Graphs enabled,
+BF16 Qwen2.5-0.5B, quantization/prefix caching disabled, the same 51 MiB KV pool,
+token budget 512, and two CPU math threads. The memory policy was 40%, not a strict
+allocator cap. The same saved 128/256/512/1024-token inputs from the vLLM comparison
+were used, with 64 output tokens, temperature 0.8, top-p 0.9 and request-index seeds.
+
+Each concurrency measured 24 requests after excluded warmup, with three fresh
+process repeats per implementation and alternating implementation order. All 432
+measured requests succeeded. Resolved token budget and pool size stayed equal.
+
+| Concurrency | Before tokens/s | After tokens/s | Throughput gain | Before TPOT ms | After TPOT ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 131.88 | 174.04 | 32.0% | 7.32 | 5.48 |
+| 2 | 212.68 | 275.70 | 29.6% | 8.84 | 6.78 |
+| 4 | 372.87 | 448.15 | 20.2% | 9.87 | 8.11 |
+
+| Concurrency | Mean TTFT ms, before / after | P95 request latency s, before / after |
+| --- | --- | --- |
+| 1 | 24.30 / 22.88 | 0.559 / 0.393 |
+| 2 | 42.43 / 34.88 | 0.657 / 0.511 |
+| 4 | 54.14 / 51.70 | 0.736 / 0.620 |
+
+![CUDA sampler comparison](../benchmarks/results/sampler/comparison.png)
+
+The [report](../benchmarks/results/sampler/report.json) contains all requests,
+repeat-level distributions, microbenchmark rounds, source hashes, configuration
+and before/after health. The figure uses repeat-level standard deviation, not
+confidence intervals. Each concurrency-4 run captured one extra graph during
+measurement; five of the six concurrency-2 runs also captured one. Those cold
+costs are included. Concurrency-1 measurements captured no new graphs and still
+show a clear improvement. Device-memory panels include desktop usage, allocator
+reservation and graph pools; their changes should not be interpreted as a precise
+measurement of sampler workspace savings.
+
+The 3.45–4.53x isolated improvement translates to 20–32% service throughput gains,
+not a similar multiplier for the whole engine. Model execution, scheduler/HTTP
+work, metadata copies and synchronization remain. The earlier vLLM measurements
+are still faster; they were not rerun during this sampler-only experiment, so do
+not treat a cross-day ratio as a new matched vLLM comparison. Use
+`uv run ajvllm-compare --graphs --output benchmarks/results/compare-sampler`
+for a fresh comparison with the installed vLLM.
+
+Validation: 190 CUDA regression cases passed, including 44 sampler cases covering
+FP16/BF16/FP32, real vocabulary size, tile boundaries, top-k/top-p ties, tiny
+parameters, NaN/Inf/all-masked rejection, near-one draws, independent RNG streams,
+compact-only transfers and incremental history. Engine tests cover terminal
+cleanup and penalty-bearing KV preemption/recompute. Near a floating-point cutoff,
+the new unnormalized scan can differ from the old normalized FP32 scan; the
+boundary oracle uses higher precision. This is not a promise of bitwise historical
+sample sequences. Temporary baseline and experiment scripts were removed after
+recording the results; reusable datasets and the comparison workflow remain.

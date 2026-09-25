@@ -40,7 +40,7 @@ class Engine:
             raise ValueError("KV pool must fit the engine context limit")
         self.eos_token_ids = tuple(runner.eos_token_ids)
         self._scheduler = Scheduler(self.config, runner.kv_cache)
-        self._sampler = Sampler()
+        self._sampler = Sampler(max_histories=self.config.max_num_seqs)
         self._clock = clock
         self._metrics = EngineMetrics()
         self._pending_outputs: deque[RequestOutput] = deque()  # unexpected outputs
@@ -151,6 +151,7 @@ class Engine:
         request.finish_time = self._clock()
         self._scheduler.remove(request.request_id)
         self.runner.release(request.request_id)
+        self._sampler.release(request)
         return self._output(request, new_token_ids, reason, stop_token_id, logprob, error)
 
     def cancel_request(self, request_id: str) -> RequestOutput | None:

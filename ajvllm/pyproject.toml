@@ -31,6 +31,7 @@ dev = [
 ]
 
 [project.scripts]
+ajvllm-compare = "ajvllm.workflows.compare:main"
 ajvllm-benchmark = "ajvllm.workflows.benchmark:main"
 ajvllm-serve = "ajvllm.workflows.serve:main"
 ajvllm-generate = "ajvllm.workflows.generate:main"

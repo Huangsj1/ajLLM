@@ -1,5 +1,7 @@
 """Mixed execution, shared budget, fair chunking, and failure semantics on CUDA."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 from test_qwen2_cuda import pair, tiny_config
@@ -148,3 +150,25 @@ def test_unchunked_cap_must_admit_a_full_prompt(runner):
     assert len(engine.last_batch.requests) == 1 and engine.last_batch.num_scheduled_tokens == 100
     engine.step()
     assert engine.last_batch.requests[0].request_id == "b"
+
+
+@pytest.mark.parametrize("terminal", ["length", "cancel", "error", "close"])
+def test_sampler_histories_follow_engine_terminal_paths(runner, terminal):
+    engine = Engine(runner, EngineConfig(max_model_len=128, max_num_batched_tokens=8, max_num_seqs=2))
+    engine.add_request("a", [1, 2], SamplingParams(max_tokens=2, repetition_penalty=1.2, seed=3, ignore_eos=True))
+    engine.step()
+    assert len(engine._sampler.histories) == 1
+    if terminal == "length":
+        list(engine.run())
+    elif terminal == "cancel":
+        engine.cancel_request("a")
+    elif terminal == "close":
+        engine.close()
+    else:
+        with patch.object(
+            runner, "execute", return_value={"a": torch.full((runner.vocab_size,), torch.nan, device="cuda")}
+        ):
+            with pytest.raises(EngineExecutionError):
+                engine.step()
+    assert not engine._sampler.histories
+    assert runner.cache_bytes == 0

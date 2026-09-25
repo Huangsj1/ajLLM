@@ -73,15 +73,15 @@ Stage 2b implements block allocation, prefix caching, copy-on-write and preempti
 with recomputation. Stage 3 implements paged FlashAttention prefill, partitioned
 Flash Decode, and fused RMSNorm/residual, RoPE/cache writes and SwiGLU.
 Set `[compute] backend = "eager"` to retain the original numerical oracle. All sampling policies
-use one batched CUDA tensor pipeline, including penalties, masks, temperature,
-top-k/top-p and random selection. Only selected results return to the host.
+use one CUDA pipeline: fused Triton transforms/scans, stable CUDA sorting and
+incremental penalty histories. Penalties, masks, temperature and top-k/top-p stay
+on the GPU; only selected results return to the host.
 
 Public imports remain `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Configuration lives in `config/`, lifecycle types in `requests/`, tokenizer/chat
 handling in `tokenization/`, and runtime memory policy in `runtime/`. Memory algorithms live in `memory/`, native Triton kernels in `kernels/`, and
 backend metadata/selection in `attention/backends/`. Optional W8A16 conversion lives
-in `quantization/`, bounded decode CUDA Graphs in `runtime/graphs.py`; distributed
-KV handoff remains planned.
+in `quantization/`, and bounded decode CUDA Graphs in `runtime/graphs.py`.
 
 See [architecture](docs/architecture/architecture.md), [model execution](docs/model_baseline.md),
 [serving](docs/serving.md), and [benchmarking](docs/benchmarking.md)
@@ -101,3 +101,9 @@ Stage 4 options are independent: set `[graphs] enabled = true` for decode graph
 replay and `[quantization] mode = "w8a16"` for INT8 decoder projection weights with
 FP16/BF16 activations. Both default to off. See the serving guide for memory/capture
 limits and the benchmark guide for measured speed and quantization-quality tradeoffs.
+
+Compare against the installed vLLM on the same GPU with
+`uv run ajvllm-compare --graphs --output benchmarks/results/compare-graphs`.
+Both servers run serially with identical token inputs, BF16 and fixed KV capacity.
+The workflow writes a multi-metric plot and detailed JSON; see
+[comparison methodology](docs/benchmarking.md#reproducible-comparison-with-vllm).

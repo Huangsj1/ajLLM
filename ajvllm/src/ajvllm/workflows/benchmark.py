@@ -232,7 +232,7 @@ def main():
     parser.add_argument("--dataset", type=Path, default=Path("benchmarks/datasets/long.jsonl"))
     parser.add_argument("--requests", type=int, default=24)
     parser.add_argument("--concurrency", type=int, default=4)
-    parser.add_argument("--max-tokens", type=int, default=64)
+    parser.add_argument("--max-tokens", type=int, default=128)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=0)

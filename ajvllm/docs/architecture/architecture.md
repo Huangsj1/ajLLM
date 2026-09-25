@@ -15,7 +15,6 @@ Scheduling policies operate on token counts and block ownership rather than tens
 | 2b: memory (implemented) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
 | 3: compute (implemented) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
 | 4a/4b: advanced (implemented) | Bounded decode CUDA Graphs and W8A16 weight-only quantization | Graph replay parity, quantized-kernel parity, measured quality/memory/latency |
-| 4c: disaggregation (planned) | Prefill/decode workers and KV handoff | Transfer correctness, ownership/lifetime safety and workload-specific benefit |
 
 The native backend now executes each logical scheduler batch as one packed mixed model
 forward, caches RoPE factors, and serves live HTTP/SSE requests. Synthetic CPU
@@ -41,9 +40,8 @@ src/ajvllm/
   kernels/               Triton paged prefill/decode and fused elementwise operations
   runtime/               adaptive memory budget, shared execution and bounded decode graphs
   quantization/          per-channel W8A16 linear modules and conversion
-  distributed/           reserved for prefill/decode KV handoff
-  serving/               async engine service and HTTP/SSE; disaggregation remains planned
-benchmarks/              reusable datasets; service latency, throughput and memory measurements
+  serving/               async engine service and HTTP/SSE
+benchmarks/              reusable datasets; service metrics and serial vLLM comparison artifacts
 tests/                   framework tests and CUDA model acceptance tests
 ```
 
@@ -190,8 +188,45 @@ Each request lazily owns a CUDA `torch.Generator`, seeded independently. Identic
 logits/policies and draw counts produce the same request-local stream irrespective
 of batch membership/order. This replaces Python RNG: seeded outputs are not promised
 to match the old implementation, other devices, or changed floating-point model
-execution shapes. Sampling arithmetic uses FP32. Custom sampling kernels are a
-future optimization behind this interface.
+execution shapes. Sampling weights and scans use FP32; the top-p threshold product
+and comparison use FP64 to avoid rounding a near-boundary threshold back onto a
+token boundary. Selected metadata is packed into FP64 for exact token-ID transfer.
+
+The CUDA sampler now replaces the original chain of small PyTorch operations with
+three Triton stages around one stable CUDA sort:
+
+1. Fused input conversion, repetition/presence/frequency penalties, stop masking
+   and invalid-row detection.
+2. Tiled exponentiation, top-k filtering and local cumulative weight scans. No
+   full softmax, normalized probability tensor or second vocabulary-sized CDF is
+   materialized. The tile totals form the upper level of the scan.
+3. Nucleus cutoff lookup, inverse-CDF selection and selected-token log probability
+   from the retained mass. Rounded endpoint draws cannot select a zero-mass tail.
+
+Stable full-vocabulary sorting remains deliberately shared by all policies,
+including temperature zero. It preserves ascending token-ID tie breaking and
+avoids silently changing exact-k semantics to a threshold that admits every tie.
+Sorting-free rejection/radix selection is not implemented. The new unnormalized
+scan and the former normalize-then-scan path can round near-threshold distributions
+differently; historical seeded tokens are not guaranteed bitwise identical.
+Tests compare ordinary cases to a CUDA distribution oracle and cutoff boundaries
+to higher-precision arithmetic, rather than reproducing old rounding artifacts.
+
+Penalty history is allocated lazily only when needed. Each cached request uses
+three INT32 vocabulary rows for seen IDs, generated counts and stop flags; neutral
+policies without an active minimum-length mask allocate no history. Prompt IDs
+are uploaded once and generated IDs incrementally. History update length is a
+runtime kernel parameter, avoiding a new JIT variant for every prompt length.
+The sampler bounds its LRU cache by engine sequence capacity and rebuilds evicted
+entries from authoritative request token IDs after preemption. Engine terminal
+paths explicitly release history; weak ownership also releases dropped standalone
+requests. Expired stop-only history is discarded. No policy-specific sampling
+branches or history manipulation were added to the engine loop.
+
+This removes repeated history reconstruction and many launch/intermediate-buffer
+costs while keeping request-local CUDA generators and the existing 24-byte result
+packet per sampled request. Measurements and remaining limitations are recorded
+in [benchmarking](../benchmarking.md#cuda-sampler-fusion-and-incremental-history).
 
 ## Stage 2a: Qwen2.5 baseline (implemented)
 
@@ -256,7 +291,7 @@ reads and fused RoPE/cache writes; the eager adapter remains the numerical oracl
 Prefix caching uses SHA-256 chained over the parent hash and each complete block's
 token IDs. The root includes the configured namespace and request `cache_salt`.
 Each manager belongs to one immutable model instance, positional configuration and
-dtype: pages cannot cross model instances. There is no persistent or distributed
+dtype: pages cannot cross model instances. There is no persistent
 cache, adapter switching or hot weight reload. Future support for these must add
 identity/version invalidation. An application requiring tenant isolation must assign
 salts in its trusted admission layer; a client-provided salt is not authentication.
@@ -476,14 +511,6 @@ with the dequantized oracle from loss/next-token agreement with original weights
 Floating-point rounding and weight approximation can change sampled text. Bounded
 local quality, memory and latency measurements are recorded in
 [benchmarking](../benchmarking.md#stage-4-graphs-and-quantization).
-
-**Prefill/decode disaggregation:** a router selects separate workers; prefill
-produces KV plus position/model/layout metadata and a well-defined first-token
-handoff. Decode acknowledges ownership before the producer frees data. Maintain
-request epoch IDs, transfer completion, cancellation propagation, timeout/retry
-rules, and layout compatibility. Never schedule decode before all required KV
-arrives. Transfer cost and queueing may outweigh isolation benefits; measure both.
-See [vLLM disaggregated prefill](https://docs.vllm.ai/en/latest/features/disagg_prefill/).
 
 ## Validation and observability
 

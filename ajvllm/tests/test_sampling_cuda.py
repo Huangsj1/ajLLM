@@ -124,3 +124,152 @@ def test_only_compact_samples_cross_to_cpu():
     assert set(result) == {"a", "b"} and shapes == [(2, 3)]
     assert sampler.transfer_bytes == 48
     assert sampler.sample({}, []) == {}
+
+
+def reference_distribution(logits, req, eos=()):
+    """CUDA oracle matching stable top-k followed by inclusive nucleus filtering."""
+    p = req.sampling_params
+    scores = logits.float().clone()
+    seen = torch.zeros_like(scores, dtype=torch.bool)
+    seen[torch.tensor(req.token_ids, device="cuda", dtype=torch.long)] = True
+    counts = torch.bincount(
+        torch.tensor(req.output_token_ids, device="cuda", dtype=torch.long), minlength=scores.numel()
+    )
+    scores = torch.where(
+        seen, torch.where(scores > 0, scores / p.repetition_penalty, scores * p.repetition_penalty), scores
+    )
+    scores = scores - p.presence_penalty * (counts > 0) - p.frequency_penalty * counts
+    if len(req.output_token_ids) < p.min_tokens:
+        for token in p.effective_stop_ids(eos):
+            if token < scores.numel():
+                scores[token] = -torch.inf
+    values, ids = scores.sort(descending=True, stable=True)
+    limit = 1 if p.temperature == 0 else p.top_k or scores.numel()
+    temp = max(p.temperature if p.temperature else 1.0, torch.finfo(torch.float32).tiny)
+    scaled = (values - values[0]) / temp
+    scaled[limit:] = -torch.inf
+    probs = scaled.softmax(0)
+    previous = torch.cat((torch.zeros(1, device="cuda"), probs.cumsum(0)[:-1]))
+    if p.top_p < 1:
+        probs[(previous >= p.top_p) & (torch.arange(probs.numel(), device="cuda") > 0)] = 0
+    probs /= probs.sum()
+    return ids, probs
+
+
+@pytest.mark.parametrize("vocab", [31, 1023, 1024, 1025, 2053, 151936])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_tiled_sampling_against_cuda_oracle(vocab, dtype):
+    torch.manual_seed(432)
+    scores = torch.randn(4, vocab, device="cuda", dtype=dtype) * 3
+    requests = [
+        request("a", top_p=0.9, temperature=0.8, seed=1),
+        request(
+            "b",
+            top_k=17,
+            top_p=0.5,
+            temperature=1.3,
+            seed=2,
+            prompt=(1, 1, 2),
+            generated=(3, 3, 4),
+            repetition_penalty=1.2,
+            frequency_penalty=0.7,
+        ),
+        request(
+            "c",
+            top_p=1,
+            temperature=0.4,
+            seed=3,
+            generated=(0, 0, 2),
+            presence_penalty=-0.4,
+            min_tokens=4,
+            stop_token_ids=(1, 2),
+            ignore_eos=True,
+        ),
+        request("d", top_k=vocab + 1, top_p=1e-100, temperature=0.9, seed=4),
+    ]
+    draws = [0.0, 0.11, 0.65, 0.99999]
+    with patch("torch.rand", side_effect=[torch.tensor([u], device="cuda") for u in draws]):
+        result = Sampler().sample(dict(zip([r.request_id for r in requests], scores, strict=True)), requests)
+    for row, req, draw in zip(scores, requests, draws, strict=True):
+        ids, probs = reference_distribution(row, req)
+        cdf = probs.cumsum(0)
+        index = torch.searchsorted(cdf / cdf[-1], torch.tensor(draw, device="cuda"), right=True)
+        sample = result[req.request_id]
+        assert sample.token_id == ids[index].item()
+        assert sample.logprob == pytest.approx(probs[index].log().item(), abs=2e-5)
+
+
+@pytest.mark.parametrize("vocab", [1024, 1025, 2053, 151936])
+def test_nucleus_at_tile_boundaries(vocab):
+    req = request(top_p=1024 / vocab, temperature=1, seed=1)
+    with patch("torch.rand", return_value=torch.tensor([0.99999], device="cuda")):
+        result = Sampler().sample({"a": torch.zeros(vocab, device="cuda")}, [req])["a"]
+    # Compare the cutoff to high-precision arithmetic on the actual FP32 policy.
+    # The old normalize-then-scan path can round an exact boundary differently.
+    p = torch.tensor(req.sampling_params.top_p, device="cuda", dtype=torch.float32).double()
+    retained = (p * vocab).ceil().clamp(1, vocab)
+    draw = torch.tensor(0.99999, device="cuda", dtype=torch.float32).double()
+    assert result.token_id == (draw * retained).floor().item()
+    assert result.logprob == pytest.approx(-retained.log().item(), abs=2e-5)
+
+
+def test_incremental_history_eviction_rebuild_and_release():
+    sampler = Sampler(max_histories=1)
+    a = request("a", prompt=(1, 1), generated=(2, 2), repetition_penalty=1.5, frequency_penalty=0.5, seed=0)
+    b = request("b", prompt=(3,), generated=(4,), presence_penalty=0.5, seed=1)
+    logits = torch.arange(19, device="cuda", dtype=torch.float32)
+    for ready in ([a], [a], [b], [a, b], [a]):
+        with patch("torch.rand", side_effect=[torch.tensor([0.25], device="cuda") for _ in ready]):
+            result = sampler.sample({r.request_id: logits for r in ready}, ready)
+        for r in ready:
+            ids, probs = reference_distribution(logits, r)
+            cdf = probs.cumsum(0)
+            index = torch.searchsorted(cdf / cdf[-1], torch.tensor(0.25, device="cuda"), right=True)
+            assert result[r.request_id].token_id == ids[index].item()
+            r.output_token_ids.append(result[r.request_id].token_id)
+        assert len(sampler.histories) <= 1
+    sampler.release(a)
+    assert not sampler.histories
+    # Identity, rather than a reused public request ID, owns the history.
+    replacement = request("a", prompt=(0,), repetition_penalty=2, temperature=0)
+    sampler.sample({"a": logits}, [replacement])
+    assert id(replacement) in sampler.histories and id(a) not in sampler.histories
+
+
+def test_neutral_penalties_and_expired_stop_mask_do_not_retain_history():
+    sampler = Sampler()
+    req = request(min_tokens=1, stop_token_ids=(2,), seed=1)
+    logits = torch.zeros(3, device="cuda")
+    result = sampler.sample({"a": logits}, [req])["a"]
+    assert len(sampler.histories) == 1 and result.token_id != 2
+    req.output_token_ids.append(result.token_id)
+    sampler.sample({"a": logits}, [req])
+    assert not sampler.histories
+
+
+@pytest.mark.parametrize("top_p", [0.9, 1.0])
+def test_near_one_draw_never_selects_zero_mass_tail(top_p):
+    torch.manual_seed(823)
+    reqs = [request(str(i), top_k=1025, top_p=top_p, temperature=0.1) for i in range(4)]
+    logits = torch.randn(4, 151936, device="cuda")
+    logits[:, 2048:] = -torch.inf
+    draw = torch.nextafter(torch.tensor([1.0], device="cuda"), torch.tensor([0.0], device="cuda"))
+    with patch("torch.rand", return_value=draw):
+        result = Sampler().sample(dict(zip([r.request_id for r in reqs], logits, strict=True)), reqs)
+    for row, req in zip(logits, reqs, strict=True):
+        ids, probs = reference_distribution(row, req)
+        sample = result[req.request_id]
+        assert sample.token_id in ids[probs > 0].tolist()
+        assert math.isfinite(sample.logprob)
+
+
+def test_history_cleanup_when_request_is_dropped():
+    import gc
+
+    sampler = Sampler()
+    req = request(repetition_penalty=1.1)
+    sampler.sample({"a": torch.zeros(7, device="cuda")}, [req])
+    assert len(sampler.histories) == 1
+    del req
+    gc.collect()
+    assert not sampler.histories

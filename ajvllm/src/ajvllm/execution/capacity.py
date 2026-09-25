@@ -46,7 +46,7 @@ class Qwen2MemoryEstimate:
             splits = (context + 255) // 256
             attention = slots * cfg.num_attention_heads * splits * (cfg.head_dim + 1) * 4
         activations = tokens * (8 * cfg.hidden_size + 4 * cfg.intermediate_size) * size
-        # General CUDA sampling keeps FP32 scores/probabilities/CDFs, history
-        # buffers, int64 sorted IDs and sorting workspace on device.
+        # Reserve fused sampling scores/local CDF, INT32 history, sorted IDs and
+        # CUDA sort scratch, including transient history entries during LRU replacement.
         logits = slots * cfg.vocab_size * 64
         return kv + workspace_reserve + attention + activations + logits + self.graph_reserve_bytes

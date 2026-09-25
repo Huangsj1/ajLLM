@@ -103,10 +103,9 @@ all-token comparisons; there is no single-tensor path in the production model.
 Paged storage removes persistent full-history replacement copies and supports prefix
 sharing. Stage 3 adds paged FlashAttention, split decode and elementwise fusions;
 eager remains an explicit reference backend. Stage 4 adds optional decode CUDA
-Graphs and per-channel W8A16 projections; prefill/decode disaggregation remains
-future work. Batch token budget counts real
+Graphs and per-channel W8A16 projections. Batch token budget counts real
 input tokens, whereas memory policy also accounts for padded attention workspace
-and the general sampler's score, sorting, probability and history buffers.
+and the general sampler's scores, sorting workspace, cumulative weights and histories.
 The service uses conservative capacity estimates and real CUDA warmup/peak
 measurements; see [serving](serving.md).
 

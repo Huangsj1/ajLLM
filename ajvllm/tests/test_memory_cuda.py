@@ -43,7 +43,8 @@ def execute(runner, rid, tokens, start=0):
 
 @pytest.mark.parametrize("prefix", [False, True])
 @pytest.mark.parametrize("temperature", [0, 0.8])
-def test_pressure_recompute_preserves_tokens_and_rng(model, prefix, temperature):
+@pytest.mark.parametrize("penalties", [False, True])
+def test_pressure_recompute_preserves_tokens_and_rng(model, prefix, temperature, penalties):
     configs = EngineConfig(max_model_len=24, max_num_seqs=3, max_num_batched_tokens=7, max_prefill_chunk_size=3)
     outputs = []
     for paged in (False, True):
@@ -57,7 +58,16 @@ def test_pressure_recompute_preserves_tokens_and_rng(model, prefix, temperature)
         engine = Engine(runner, configs)
         for index, length in enumerate((13, 11, 15)):
             engine.add_request(
-                str(index), [index + 1] * length, SamplingParams(max_tokens=4, temperature=temperature, seed=42)
+                str(index),
+                [index + 1] * length,
+                SamplingParams(
+                    max_tokens=4,
+                    temperature=temperature,
+                    seed=42,
+                    repetition_penalty=1.2 if penalties else 1.0,
+                    presence_penalty=0.3 if penalties else 0.0,
+                    frequency_penalty=0.1 if penalties else 0.0,
+                ),
             )
         result = {}
         for step in range(150):
