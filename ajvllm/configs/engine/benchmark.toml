@@ -24,3 +24,14 @@ memory_limit_mb = 128
 
 [quantization]
 # mode = "none" # "w8a16" quantizes decoder projections; activations/KV stay FP16/BF16.
+
+# HTTP comparison workload; CLI flags override these values.
+[compare]
+concurrency = [1, 2, 4, 8, 16, 32]
+prompt_lengths = [128, 256, 512, 1024]
+requests = 64
+max_tokens = 64
+repeats = 3
+gpu_memory_utilization = 0.7
+# Omit concurrency to derive powers of two plus engine.max_num_seqs.
+# Model, dataset, output, GPU, port and timeouts can also be set here.

@@ -1,6 +1,5 @@
 """Serial single-GPU HTTP comparison against vLLM, using identical token inputs."""
 
-import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -17,6 +16,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from ajvllm.workflows.benchmark import distribution, monitor_gpu
+from ajvllm.workflows.compare_config import commands, parse_args
 
 
 def stream_request(engine, url, tokens, args, seed):
@@ -159,87 +159,6 @@ def server(command, logfile, args):
             process.wait()
 
 
-def commands(args, output):
-    cfg = json.loads((args.model / "config.json").read_text())
-    context = max(args.prompt_lengths) + args.max_tokens
-    max_seqs = max(args.concurrency)
-    # vLLM reserves a null block; a single-slot pool needs one spare page to finish decode.
-    blocks = max_seqs * ((context + 15) // 16) + int(max_seqs == 1)
-    kv_bytes = (
-        blocks
-        * 16
-        * cfg["num_hidden_layers"]
-        * 2
-        * cfg["num_key_value_heads"]
-        * (cfg["hidden_size"] // cfg["num_attention_heads"])
-        * 2
-    )
-    config = output / "ajvllm.toml"
-    config.write_text(f"""[engine]
-max_num_seqs = {max_seqs}
-max_num_batched_tokens = {args.token_budget}
-max_model_len = {context}
-enable_chunked_prefill = true
-max_prefill_chunk_size = {args.token_budget}
-max_prefill_tokens_per_step = {args.token_budget}
-[memory]
-backend = "paged"
-block_size = 16
-num_blocks = {blocks}
-enable_prefix_cache = false
-[compute]
-backend = "triton"
-[graphs]
-enabled = {str(args.graphs).lower()}
-batch_sizes = {sorted(set(args.concurrency))}
-max_graphs = 32
-memory_limit_mb = 512
-[quantization]
-mode = "none"
-""")
-    common = ["--host", "127.0.0.1", "--port", str(args.port), "--dtype", "bfloat16", "--gpu-memory-utilization", "0.4"]
-    aj = [sys.executable, "-m", "ajvllm.workflows.serve", "--model", str(args.model), "--config", str(config), *common]
-    vl = [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.openai.api_server",
-        "--model",
-        str(args.model),
-        "--served-model-name",
-        "comparison",
-        "--max-model-len",
-        str(context),
-        "--max-num-seqs",
-        str(max_seqs),
-        "--max-num-batched-tokens",
-        str(args.token_budget),
-        "--block-size",
-        "16",
-        "--kv-cache-memory-bytes",
-        str(kv_bytes),
-        "--no-enable-prefix-caching",
-        "--enable-chunked-prefill",
-        "--generation-config",
-        "vllm",
-        "--no-enable-log-requests",
-        *common,
-    ]
-    if args.graphs:
-        vl += [
-            "--compilation-config",
-            json.dumps(
-                {
-                    "mode": 0,
-                    "cudagraph_mode": "FULL_DECODE_ONLY",
-                    "cudagraph_capture_sizes": sorted(set(args.concurrency)),
-                }
-            ),
-        ]
-    else:
-        vl += ["--enforce-eager"]
-    return {"ajvllm": aj, "vllm": vl}, {"context": context, "max_seqs": max_seqs, "kv_pool_bytes": kv_bytes}
-
-
 def summarize(report):
     """Aggregate repeat-level metrics; do not pretend a short run is a confidence interval."""
     rows = []
@@ -321,7 +240,7 @@ def plot_report(report, target, engines=("ajvllm", "vllm")):
         ax.legend()
     title = report.get("title", f"Qwen2.5 single-GPU HTTP comparison | BF16 | graphs={report['config']['graphs']}")
     fig.suptitle(
-        title + "\nIdentical token inputs; prefix cache off; error bars: across-run standard deviation",
+        title + "\nIdentical token inputs; error bars: across-run standard deviation",
         fontsize=14,
     )
     fig.savefig(target, dpi=160)
@@ -329,30 +248,9 @@ def plot_report(report, target, engines=("ajvllm", "vllm")):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=Path, default=Path("model/Qwen2.5-0.5B-Instruct"))
-    parser.add_argument("--dataset", type=Path, default=Path("benchmarks/datasets/long.jsonl"))
-    parser.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
-    parser.add_argument("--prompt-lengths", type=int, nargs="+", default=[128, 256, 512, 1024])
-    parser.add_argument("--requests", type=int, default=24)
-    parser.add_argument("--max-tokens", type=int, default=64)
-    parser.add_argument("--token-budget", type=int, default=5000)
-    parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--graphs", action="store_true")
-    parser.add_argument("--gpu", default="0")
-    parser.add_argument("--port", type=int, default=8123)
-    parser.add_argument("--timeout", type=float, default=120)
-    parser.add_argument("--startup-timeout", type=float, default=600)
-    parser.add_argument("--output", type=Path, default=Path("benchmarks/results/comparison"))
-    args = parser.parse_args()
-    if (
-        min(*args.concurrency, *args.prompt_lengths, args.requests, args.token_budget, args.repeats) < 1
-        or args.max_tokens < 2
-    ):
-        parser.error("counts must be positive and max-tokens >= 2")
-    if args.requests < max(args.concurrency):
-        parser.error("requests must be >= maximum concurrency")
-    args.model = args.model.resolve()
+    args = parse_args()
+    if (args.output / "report.json").exists():
+        raise ValueError("output already contains a report; choose a new directory")
     args.output.mkdir(parents=True, exist_ok=True)
     # Use the checkpoint tokenizer directly; no model or CUDA context in the coordinator.
     from tokenizers import Tokenizer
@@ -361,18 +259,21 @@ def main():
     raw = args.dataset.read_bytes()
     source = [json.loads(line) for line in raw.splitlines() if line.strip()]
     if not source:
-        parser.error("dataset is empty")
-    dataset = []
-    for i, length in enumerate(args.prompt_lengths):
-        row = source[i % len(source)]
+        raise ValueError("dataset is empty")
+    encoded = []
+    for row in source:
         ids = row.get("token_ids")
         if ids is None:
             if "prompt" not in row:
-                parser.error("comparison dataset requires prompt or token_ids (no implicit chat templates)")
+                raise ValueError("comparison dataset requires prompt or token_ids (no implicit chat templates)")
             ids = tokenizer.encode(row["prompt"], add_special_tokens=False).ids
-        if len(ids) < length:
-            parser.error(f"dataset row {i} has only {len(ids)} tokens; requested {length}")
-        dataset.append(ids[:length])
+        encoded.append(ids)
+    dataset = []
+    for i, length in enumerate(args.prompt_lengths):
+        candidates = [ids for ids in encoded if len(ids) >= length]
+        if not candidates:
+            raise ValueError(f"dataset has no row with {length} tokens")
+        dataset.append(candidates[i % len(candidates)][:length])
     workloads = json.dumps(dataset).encode()
     (args.output / "inputs.json").write_bytes(workloads)
     cmds, capacity = commands(args, args.output)
@@ -382,6 +283,7 @@ def main():
         config={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         capacity=capacity,
         versions={k: importlib.metadata.version(k) for k in ("torch", "triton", "vllm", "transformers")},
+        source_config_sha256=hashlib.sha256(args.config.read_bytes()).hexdigest(),
         dataset_sha256=hashlib.sha256(raw).hexdigest(),
         token_inputs_sha256=hashlib.sha256(workloads).hexdigest(),
         commands=cmds,
@@ -417,7 +319,10 @@ def main():
                             if (
                                 resolved["max_num_seqs"] != capacity["max_seqs"]
                                 or before["memory"]["token_budget"] != args.token_budget
-                                or before["kv_cache"]["pool_bytes"] != capacity["kv_pool_bytes"]
+                                or (
+                                    capacity["kv_pool_bytes"] is not None
+                                    and before["kv_cache"]["pool_bytes"] != capacity["kv_pool_bytes"]
+                                )
                             ):
                                 raise RuntimeError("ajvllm adjusted shared capacity; comparison would be unequal")
                         result = measure(engine, url, dataset, c, args)

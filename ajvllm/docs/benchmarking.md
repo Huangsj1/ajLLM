@@ -488,48 +488,72 @@ results. The reusable dataset and benchmark workflow remain unchanged in purpose
 ## Reproducible comparison with vLLM
 
 `ajvllm-compare` owns both HTTP servers and starts them **serially** on one GPU.
-Stop any other inference server before running it. The workflow never terminates
-an unrelated server. Default concurrency is 1/2/4; it does not run concurrency 8.
-The installed vLLM 0.23.0 completion API is used, including streamed token IDs.
+Stop other inference servers first; it never terminates an unrelated server.
+The installed vLLM completion API supplies streamed token IDs.
 
 ```bash
-uv run ajvllm-compare --output benchmarks/results/compare-eager
-uv run ajvllm-compare --graphs --output benchmarks/results/compare-graphs
+uv run ajvllm-compare --config configs/engine/benchmark.toml \
+  --output benchmarks/results/compare-toml
+# CLI options override the corresponding TOML values.
+uv run ajvllm-compare --config configs/engine/benchmark.toml \
+  --concurrency 1 4 8 --requests 32 --no-graphs \
+  --output benchmarks/results/compare-eager
 ```
 
-Defaults: the local Qwen2.5-0.5B-Instruct checkpoint, BF16 weights/activations/KV,
-no quantization, 24 requests per concurrency, 64 output tokens, three repeats,
-and input lengths 128/256/512/1024 from the first four existing long-dataset rows.
-Inputs are tokenized once with the checkpoint tokenizer, truncated, saved, and sent
-as identical token IDs to both engines. No implicit chat template or decoded-text
-re-tokenization enters the measurement. Temperature is 0.8, top-p 0.9, top-k is
-disabled, request seed is its workload index, and EOS is ignored. Random streams
-and rounding differ between engines; equal settings do not imply equal output text.
+The engine TOML is now the source of service settings. `[engine]` supplies the
+context limit, sequence limit, total token budget and chunked-prefill switch;
+`[memory]` supplies block size, prefix caching and optional fixed block count;
+`[graphs]` supplies enablement and capture batch sizes. The workflow preserves the
+configured context and sequence limit even when testing shorter inputs or fewer
+clients. HTTP concurrency may exceed the sequence limit to test queueing.
 
-Both engines use max sequences 4, context limit 1088, token budget 512, chunked
-prefill, 16-token KV blocks, prefix caching off, and the same explicit KV capacity
-(51 MiB for the default model/workload). These are equal physical bytes, not an
-assertion of identical usable blocks: vLLM reserves a null block internally.
-Single-slot configurations add one spare block to both pools so decode can finish.
-This removes unequal automatic cache-pool
-sizing and warmup prefix hits. ajvllm's per-request and aggregate prefill caps equal
-the token budget; scheduling decisions can still differ between implementations.
-The workflow checks ajvllm's resolved sequence limit, token budget and pool size,
-and refuses to call a silently reduced capacity an equal-configuration comparison.
-The 40% memory setting has different policy semantics in the two engines; fixed
-KV bytes are the actual capacity control. It is not a strict shared allocator cap.
-CPU math threads and JIT build jobs are limited to two in each server environment.
+Add a workload section to the same file (ignored by the service):
 
-The first command disables CUDA Graphs and torch.compile for both engines while
-retaining their optimized CUDA attention/elementwise/sampling implementations.
-`--graphs` enables decode graphs on both; vLLM uses `FULL_DECODE_ONLY`, explicit
-capture sizes matching the concurrency list, and compilation mode 0. ajvllm uses
-its batch/context buckets, at most 32 graphs and a 512 MiB conservative retention
-allowance (not a preallocated pool), so earlier concurrency sweeps do not exhaust
-the small default allowance before later buckets can be captured. This compares the
-implemented execution features, not vLLM's maximally tuned default configuration.
-vLLM retains its native asynchronous scheduler and fused kernels. ajvllm step
-profiling is disabled to avoid inserting extra CUDA synchronizations.
+```toml
+[compare]
+concurrency = [1, 2, 4, 8, 16, 32]
+prompt_lengths = [128, 256, 512, 1024]
+requests = 64
+max_tokens = 64
+repeats = 3
+gpu_memory_utilization = 0.7
+# Optional: model, dataset, output, gpu, port, timeout, startup_timeout.
+```
+
+CLI overrides `[compare]`, which overrides workflow defaults. Omit `concurrency`
+to derive powers of two up to `engine.max_num_seqs`, including the exact limit;
+omit `requests` to use at least two waves or 24 requests, whichever is larger.
+`--token-budget` overrides `engine.max_num_batched_tokens`; `--graphs` and
+`--no-graphs` override `graphs.enabled`. Keep these engine options in their own
+TOML sections. Requests must cover the largest concurrency and input plus output
+must fit the configured context. Long-input selection searches for sufficiently
+long dataset rows, rather than assuming the first rows are long enough.
+
+Without `memory.num_blocks`, both engines use the configured GPU utilization
+(default 0.7), each profiling and allocating its own KV pool. Reports label this
+`same_utilization`: it is **not equal physical KV capacity**. Set `num_blocks` for
+`fixed_kv_bytes`; the workflow maps blocks × block size × BF16 per-token KV bytes
+to vLLM's `--kv-cache-memory-bytes`. vLLM reserves an internal null block, so equal
+bytes still do not imply identical usable capacity. Startup logs and ajvLLM health
+snapshots retain capacity evidence. Configurations are not silently shrunk to fit.
+
+Prefix caching follows the TOML on both sides. With it enabled, warmup and repeated
+inputs measure warm-cache behavior. Disable it in `[memory]` to isolate prefill
+compute. CUDA Graph batch sizes also follow the TOML; expanding concurrency does
+not automatically expand capture coverage. vLLM uses `FULL_DECODE_ONLY` and
+compilation mode 0, or `--enforce-eager` when graphs are disabled. ajvLLM retains
+its configured graph memory/count limits; there is no identical vLLM counterpart.
+This compares the implemented execution features, not vLLM's maximally tuned defaults.
+
+The comparison currently requires paged KV and unquantized weights. Non-default
+per-request/aggregate prefill caps are rejected because they lack equivalent
+vLLM controls. Compute backend and scheduling algorithms remain engine-specific;
+ajvLLM synchronized step profiling is disabled. Both engines use BF16, temperature
+0.8, top-p 0.9, no top-k, seed=request index, and ignore EOS. Inputs are tokenized
+once, saved and sent identically without chat templates; RNG implementations and
+rounding differ, so outputs need not be text-identical. CPU math threads and JIT
+build jobs are limited to two. The report stores resolved settings, source TOML
+checksum, generated ajvLLM TOML, and exact launch commands.
 
 Each repeat starts fresh server processes. Engine order alternates by repeat;
 each concurrency runs an excluded warmup with at least two waves of requests.
