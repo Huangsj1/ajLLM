@@ -10,14 +10,16 @@ validation target for the padded eager backend.
 uv run ajvllm-serve --config configs/engine/benchmark.toml --profile-steps
 
 # Terminal 2: general stochastic sampling, repeated small dataset.
-uv run ajvllm-benchmark --concurrency 1 --requests 24 --max-tokens 16 \
+uv run ajvllm-benchmark --concurrency 1 --requests 64 --max-tokens 16 \
   --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c1.json
-uv run ajvllm-benchmark --concurrency 2 --requests 24 --max-tokens 16 \
-  --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c2.json
-uv run ajvllm-benchmark --concurrency 4 --requests 24 --max-tokens 16 \
+uv run ajvllm-benchmark --concurrency 4 --requests 64 --max-tokens 16 \
   --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c4.json
-uv run ajvllm-benchmark --concurrency 8 --requests 24 --max-tokens 16 \
+uv run ajvllm-benchmark --concurrency 8 --requests 64 --max-tokens 16 \
   --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c8.json
+uv run ajvllm-benchmark --concurrency 16 --requests 64 --max-tokens 16 \
+  --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c16.json
+uv run ajvllm-benchmark --concurrency 32 --requests 64 --max-tokens 16 \
+  --temperature 0.8 --top-p 0.9 --seed 0 --output benchmarks/results/c32.json
 ```
 
 The CLI defaults are 24 requests, concurrency 4, 64 output tokens, one excluded
@@ -28,22 +30,147 @@ The report records the sampling settings, including the seed. The workflow fixes
 `ignore_eos=true` to request a repeatable output length; actual token counts are
 recorded because context capacity can still shorten a response.
 
+## Choosing scheduling budgets
+
+`ajvllm-benchmark-budget-config` starts and stops its own CUDA services serially.
+Do not start a separate server for this workflow. The configured `max_model_len`
+remains unchanged (16384 in `configs/engine/benchmark.toml`). Two primary knobs
+are exposed: `max_num_batched_tokens` bounds total work per step, including decode,
+and `max_num_seqs` bounds active sequences. The scheduler automatically divides
+remaining tokens among actual prefill requests and redistributes unused shares.
+A fixed chunk of `token_budget / max_num_seqs` would unnecessarily slow a lone
+prefill; the benchmark configuration therefore omits both optional prefill caps.
+Explicit caps remain supported for advanced policies and backward compatibility.
+
+```bash
+# First: long-input, two-output-token prefill sweep at fixed concurrency.
+uv run ajvllm-benchmark-budget-config --phase prefill \
+  --output benchmarks/results/budget-prefill
+
+# Then: use a token budget selected from the first report.
+uv run ajvllm-benchmark-budget-config --phase decode \
+  --output benchmarks/results/budget-decode
+
+# Or run both default sweeps with one command.
+uv run ajvllm-benchmark-budget-config --output benchmarks/results/budget
+```
+
+The default dataset is tokenized locally and truncated to exact input lengths;
+only sufficiently long rows are used, with no synthetic repetition inside prompts.
+For longer contexts, supply a JSONL dataset containing `prompt` strings. Request
+count must cover the largest concurrency; several waves and repeated runs are
+preferable to a single burst. Sampling is fixed at temperature 0.8, top-p 0.9,
+seed=request index, and ignore-EOS, matching the existing comparison workflow.
+
+Each candidate/repeat uses a fresh process, automatic KV pool sizing and the same
+GPU utilization target (default 0.7). Prefix caching is disabled so repeated inputs
+cannot bypass prefill. Warmup executes at least two concurrency waves, including
+sampling and graph capture, and is excluded from HTTP performance measurements.
+Graph capture buckets include the sweep concurrency limits and intermediate powers
+of two, consistently across candidates; the base graph memory/count limits remain
+fixed. Inspect capture/replay/fallback deltas in the report: warmup cannot guarantee
+all later shapes have been captured. The fallback counter also includes expected
+prefill/mixed forwards, not just rejected decode captures. No synchronized per-step profiling is enabled
+during measurement; startup memory profiling still runs normally.
+
+Outputs in a new directory:
+
+- `summary.md`: per-setting means and run standard deviations, including p95
+  request latency statistics (averages of per-run p95, not a pooled p95).
+- `results.csv` and `report.json`: per-repeat measurements, failed candidates,
+  original arguments/configuration, dataset checksum, startup memory accounting,
+  pre/post health snapshots, graph counters, and request-level HTTP timings.
+- `prefill.png` and `decode.png`: eight metric panels with run variability.
+- Candidate TOMLs and per-start logs for reproducing or diagnosing each point.
+  Decode candidates already combine the selected token budget and sequence limit;
+  copy a chosen file to a service config and enable prefix caching if appropriate.
+
+TTFT includes queueing, prefill, sampling and HTTP delivery. Decode scaling is an
+end-to-end short-input/long-output workload, **not** isolated decode kernel timing;
+TPOT excludes time before the first output. Prefill input throughput includes the
+two output tokens and transport overhead. GPU readings are sampled every 250 ms,
+include other device users, and are noisy for sub-second experiments; use more
+requests when necessary. KV high-water marks include warmup, whereas admission,
+preemption and graph counters are measurement-interval deltas. Actual live KV use
+is distinct from preallocated pool size. Larger budgets can reduce pool capacity
+because startup workspace reservations grow even if the workload never uses the
+entire budget. Runtime OOM is still possible for unprofiled shapes or external
+memory changes; failed points are recorded, their service is terminated, and the
+next candidate is attempted. Existing output reports are never overwritten.
+
+Choose the smallest token budget near the prefill throughput plateau, subject to
+TTFT targets; choose a sequence limit that meets TPOT/p95 latency targets at useful
+throughput. These separate sweeps are screening experiments, not a joint optimum:
+validate the chosen pair with representative mixed workloads, longer contexts and
+arrival patterns using `ajvllm-benchmark`. A short-context decode result does not
+establish KV capacity or latency at the full 16384-token service limit.
+
+### RTX 3080 Ti budget sweep (2026-09-25)
+
+Local Qwen2.5-0.5B-Instruct BF16, Triton, CUDA Graphs, 16384 maximum context,
+0.7 utilization target, automatic KV pool, prefix caching off. Each point uses
+64 measured requests and two fresh-process repeats; all 1024 measured requests
+completed without admission waits or preemption. A separate oversized-budget
+check (1000000 tokens) was rejected by `MemoryBudget.check_probe` before workspace
+allocation; the workflow recorded failure and shut down its process. The CUDA
+scheduling and workflow regression suite passed 17 tests. Raw reports and figures are in
+`benchmarks/results/budget-sweep/` (local generated artifacts, ignored by Git).
+
+Prefill: concurrency 4, 2048 input tokens, two output tokens.
+
+| Token budget | Input tokens/s | Mean TTFT (ms) | GPU utilization (%) | KV pool (MiB) |
+|---|---|---|---|---|
+| 512 | 35100 | 211.24 | 68.7 | 6921.9 |
+| 2048 | 52864 | 130.56 | 84.9 | 6843.9 |
+| 8192 | 56353 | 111.81 | 88.2 | 6531.9 |
+
+Decode: token budget 2048, 128 input and 128 output tokens.
+
+| Sequence limit | Output tokens/s | Mean TPOT (ms) | Mean TTFT (ms) | GPU utilization (%) | KV peak (MiB) |
+|---|---|---|---|---|---|
+| 1 | 271 | 3.60 | 15.32 | 57.6 | 3.0 |
+| 4 | 824 | 4.69 | 25.61 | 56.9 | 12.0 |
+| 8 | 1462 | 5.22 | 36.09 | 55.9 | 24.0 |
+| 16 | 2241 | 6.73 | 56.74 | 50.5 | 48.0 |
+| 32 | 3017 | 9.88 | 94.36 | 50.5 | 96.0 |
+
+Token budget 2048 is a useful starting point for this input distribution: raising
+it from 512 increases input throughput by about 50%, while 8192 gains another 7%
+and consumes an additional 312 MiB of workspace allowance at the expense of KV.
+The larger budget improves TTFT, so 2048 is not a universal winner. Decode has
+not reached a throughput plateau at 32 slots: doubling 16 to 32 gains about 35%
+output throughput but increases mean TPOT by about 47%. Choose 8–16 for lower
+latency or 32 for higher throughput if those measured latencies are acceptable.
+The larger batches amortize work despite device utilization not increasing;
+nvidia-smi utilization is time with GPU work, not a measure of useful tokens or
+fraction of peak arithmetic throughput.
+
+Device memory stays around 9.6 GiB because the pool is preallocated; short decode
+contexts occupy only 3–96 MiB of KV. The observed 32-slot run is therefore not a
+long-context memory stress test. Graph replays remain active at every decode
+point; the 32-slot runs each have seven normal-forward fallbacks. Prefill/mixed
+forwards are included in that counter. Cold captures can still occur during
+measurement, and two repeats are exploratory evidence rather than tight confidence
+intervals. Keep the user-selected base preset unchanged except for removing its
+redundant prefill caps; exported candidates allow an explicit choice.
+
 ## Dataset and memory
 
-`benchmarks/datasets/long.jsonl` contains twelve English operational-report prompts:
-four near each of 1024, 2048 and 3072 tokens with the local Qwen tokenizer. Requests
+`benchmarks/datasets/long.jsonl` contains sixteen English operational-report prompts:
+four near each of 1024, 2048, 4096 and 8192 tokens with the local Qwen tokenizer. Requests
 reuse rows cyclically. `benchmarks/build_dataset.py` reproducibly rebuilds the file
 using only the local tokenizer. It does not load a model.
 
 `--dataset` accepts JSONL rows containing exactly one of `prompt`, `messages`, or
 `token_ids`, plus an optional `id`. A custom shorter dataset and fewer requests
-are useful for smoke tests. The longest default input plus 64 output tokens fits
-the benchmark configuration's 4096-token context; an older 2048-context server
-cannot run all rows. HTTP concurrency is not a guaranteed GPU batch size: actual
+are useful for smoke tests. The largest input is 8192 tokens; with 128 output
+tokens it fits the benchmark preset's 16384-token context limit. Prompt tokens
+plus requested output tokens must fit `max_model_len`.
+HTTP concurrency is not a guaranteed GPU batch size: actual
 admission, chunk size, sequence capacity and token budget come from the scheduler.
 Inspect `/health` for `resolved_engine` and the current budget. The server derives
-its initial budget from TOML `max_num_batched_tokens`; memory estimation and
-warmup can reduce it before serving requests.
+its fixed token budget from TOML `max_num_batched_tokens`; startup profiling
+sizes the KV pool and rejects configurations that cannot fit.
 
 For BF16 Qwen2.5-0.5B, persistent KV uses 12 KiB per token. Four resident 2048-token
 inputs need about 96 MiB just for KV. The fixed paged pool reserves physical capacity at startup; eager gathers and padded

@@ -10,11 +10,14 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained("model/Qwen2.5-0.5B-Instruct", local_files_only=True)
     rows = []
     topics = ["community library", "urban garden", "regional railway", "public museum"]
-    for target in (1024, 2048, 3072):
+    for target in (1024, 2048, 4096, 8192):
         for index, topic in enumerate(topics):
             introduction = f"Read the following operational reports about a {topic}.\n\n"
             sections = []
-            for week in range(1, 100):
+            prefix = tokenizer.encode(introduction, add_special_tokens=False)
+            week = 0
+            while len(prefix) < target:
+                week += 1
                 sections.append(
                     f"Week {week}: The {topic} recorded {120 + week * (index + 3)} visitors. "
                     f"The team had {4 + week % 5} volunteers and a budget of {300 + week * 7} dollars. "
@@ -27,15 +30,15 @@ def main():
                     "making a decision. The next report should compare outcomes with the previous "
                     "week and identify unresolved risks.\n\n"
                 )
+                prefix = tokenizer.encode(introduction + "".join(sections), add_special_tokens=False)
             ending = (
                 "\n\nSummarize the recurring problems and propose three practical improvements, "
                 "explaining the tradeoffs."
             )
-            prefix = tokenizer.encode(introduction + "".join(sections), add_special_tokens=False)
             suffix = tokenizer.encode(ending, add_special_tokens=False)
             prompt = tokenizer.decode(prefix[: target - len(suffix)]) + ending
             count = len(tokenizer.encode(prompt, add_special_tokens=False))
-            assert abs(count - target) <= 2 and count + 64 <= 4096
+            assert abs(count - target) <= 2
             rows.append({"id": f"{topic.replace(' ', '-')}-{target}", "prompt": prompt, "prompt_tokens": count})
     output = Path("benchmarks/datasets/long.jsonl")
     output.write_text("".join(json.dumps(row) + "\n" for row in rows))

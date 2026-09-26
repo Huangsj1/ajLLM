@@ -31,6 +31,7 @@ dev = [
 ]
 
 [project.scripts]
+ajvllm-benchmark-budget-config = "ajvllm.workflows.benchmark_budget_config:main"
 ajvllm-compare = "ajvllm.workflows.compare:main"
 ajvllm-benchmark = "ajvllm.workflows.benchmark:main"
 ajvllm-serve = "ajvllm.workflows.serve:main"

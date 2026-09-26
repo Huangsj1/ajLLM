@@ -172,3 +172,13 @@ def test_sampler_histories_follow_engine_terminal_paths(runner, terminal):
                 engine.step()
     assert not engine._sampler.histories
     assert runner.cache_bytes == 0
+
+
+@pytest.mark.parametrize("active", [1, 2])
+def test_automatic_chunks_follow_actual_demand_not_slot_limit(runner, active):
+    engine = Engine(runner, EngineConfig(max_model_len=128, max_num_seqs=8, max_num_batched_tokens=12))
+    for index in range(active):
+        engine.add_request(str(index), [2] * 40, SamplingParams(temperature=0, max_tokens=1))
+    engine.step()
+    assert [item.num_tokens for item in engine.last_batch.requests] == [12 // active] * active
+    engine.run()

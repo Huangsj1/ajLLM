@@ -125,7 +125,16 @@ physical slot mappings are reserved for the paged-memory stage.
 
 Configuration: `max_num_seqs`, `max_num_batched_tokens`, `max_model_len`,
 `enable_chunked_prefill`, optional `max_prefill_chunk_size` per request, and
-`max_prefill_tokens_per_step` for aggregate prefill work.
+`max_prefill_tokens_per_step` for aggregate prefill work. These last two are
+optional advanced overrides, omitted in the benchmark configuration. With no
+overrides, decode consumes its required tokens first and `fair_chunks` divides
+the residual budget among actual prefill demands, redistributing unused shares.
+This avoids a static `budget / max_num_seqs` cap that underutilizes low-occupancy
+batches. Keep total token budget as the primary work bound: a prefill-only bound
+would not constrain mixed/decode batches. The budget sweep workflow evaluates
+long-input prefill and short-input decode scaling separately, exports candidate
+configurations, and leaves the latency/throughput tradeoff to the user; see
+[benchmarking](../benchmarking.md#choosing-scheduling-budgets).
 
 1. Start with the current per-step token budget (bounded by the configured ceiling).
 2. Visit running decodes in rotating order, allocating one token each.

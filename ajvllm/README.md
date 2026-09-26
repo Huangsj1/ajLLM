@@ -94,6 +94,11 @@ In another terminal run `uv run ajvllm-benchmark --concurrency 4 --requests 24`.
 The default dataset has 12 long prompts (about 1024/2048/3072 tokens), with 64
 output tokens per request. Reports include TTFT, decode duration, TPOT, throughput
 and GPU utilization, saved under `benchmarks/results/`.
+To sweep token budgets and decode sequence limits with automatic service startup, run
+`uv run ajvllm-benchmark-budget-config --output benchmarks/results/budget`.
+It writes tables, plots, and candidate TOMLs; see
+[budget selection](docs/benchmarking.md#choosing-scheduling-budgets).
+
 See [benchmarking](docs/benchmarking.md) for memory expectations, comparison settings,
 and sampling controls.
 
