@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from ajvllm.execution.batch import KVCache, ModelBatch
 from ajvllm.modeling.qwen2.config import Qwen2Config
@@ -31,6 +32,7 @@ class Qwen2ForCausalLM(nn.Module):
         self.model = Decoder(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.tie_weights()
+        self.register_buffer("first_layer_qkv", None, persistent=False)
         # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
         self.register_buffer("rope_cos", torch.empty(0), persistent=False)
         # shape = (max_model_len, head_dim), repeated for the two halves of the head dimension
@@ -68,7 +70,13 @@ class Qwen2ForCausalLM(nn.Module):
         factors = self.rope_cos[batch.positions], self.rope_sin[batch.positions]
         layers = []
         for index, layer in enumerate(self.model.layers):
-            x, present = layer(x, factors, batch, index)
+            qkv = (
+                F.embedding(batch.token_ids, self.first_layer_qkv)
+                if index == 0 and self.first_layer_qkv is not None
+                else None
+            )
+            x, present = layer(x, factors, batch, index, precomputed_qkv=qkv)
+            del qkv
             layers.append(present)
         logits = None
         if batch.sample_indices.numel():

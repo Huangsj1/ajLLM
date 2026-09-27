@@ -55,13 +55,17 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(
-        self, x: torch.Tensor, factors: tuple[torch.Tensor, torch.Tensor], batch: ModelBatch, layer_index: int
+        self, x: torch.Tensor, factors: tuple[torch.Tensor, torch.Tensor], batch: ModelBatch, layer_index: int,
+        *, precomputed_qkv: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[LayerKV, ...]]:
         config = self.config
         # x.shape = (sum(lengths), hidden_size)
         count = x.shape[0]
         # Projections and RoPE operate on ALL packed tokens in one operation.
-        if hasattr(self, "qkv_proj"):
+        if precomputed_qkv is not None:
+            kv_width = config.num_key_value_heads * config.head_dim
+            q, k, v = precomputed_qkv.split((config.hidden_size, kv_width, kv_width), dim=-1)
+        elif hasattr(self, "qkv_proj"):
             kv_width = config.num_key_value_heads * config.head_dim
             q, k, v = self.qkv_proj(x).split((config.hidden_size, kv_width, kv_width), dim=-1)
         else:
@@ -128,10 +132,14 @@ class DecoderLayer(nn.Module):
         self.mlp = MLP(config)
 
     def forward(
-        self, x: torch.Tensor, factors: tuple[torch.Tensor, torch.Tensor], batch: ModelBatch, layer_index: int
+        self, x: torch.Tensor, factors: tuple[torch.Tensor, torch.Tensor], batch: ModelBatch, layer_index: int,
+        *, precomputed_qkv: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[LayerKV, ...]]:
         optimized = batch.attention_metadata is not None
-        attention, present = self.self_attn(self.input_layernorm(x, optimized=optimized), factors, batch, layer_index)
+        normalized = self.input_layernorm(x, optimized=optimized) if precomputed_qkv is None else x
+        attention, present = self.self_attn(
+            normalized, factors, batch, layer_index, precomputed_qkv=precomputed_qkv
+        )
         if optimized:
             # calculate residual and norm in one kernel to avoid extra memory allocation and copyS
             norm, residual = rms_norm(

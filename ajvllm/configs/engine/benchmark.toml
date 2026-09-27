@@ -35,3 +35,8 @@ repeats = 3
 gpu_memory_utilization = 0.7
 # Omit concurrency to derive powers of two plus engine.max_num_seqs.
 # Model, dataset, output, GPU, port and timeouts can also be set here.
+
+# Build the matching checkpoint/dtype/backend artifact before enabling.
+[first_layer_cache]
+enabled = false
+directory = "cache/first_layer_qkv"

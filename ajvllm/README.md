@@ -286,3 +286,30 @@ Public imports: `from ajvllm import Engine, EngineConfig, SamplingParams`.
 Detailed guides: [architecture and roadmap](docs/architecture/architecture.md),
 [model baseline](docs/model_baseline.md), [serving](docs/serving.md), and
 [benchmarking and measured results](docs/benchmarking.md).
+
+### Optional first-layer QKV lookup
+
+Precompute the token-local first RMSNorm and QKV projection before RoPE:
+
+```bash
+uv run ajvllm-build-first-layer-cache --model model/Qwen2.5-0.5B-Instruct
+# For the other model, use --model model/Qwen2.5-1.5B-Instruct.
+```
+
+Set `[first_layer_cache].enabled = true` in your engine TOML to load the matching
+artifact at startup. The normal presets default to false. The cache preserves the
+embedding residual and adds about 334/594 MiB for the BF16 0.5B/1.5B checkpoints;
+this memory is deducted from available KV capacity. It requires unquantized weights
+and matching dtype/norm backend. BF16 output identity is not guaranteed across GEMM
+batch shapes. See [setup and usage](docs/serving.md#first-layer-qkv-cache).
+
+The independent microbenchmark loads only the required weights, compares both
+models, and writes CSV/JSON/Markdown plus a figure:
+
+```bash
+uv run ajvllm-benchmark-first-layer-cache \
+  --config configs/engine/benchmark.toml \
+  --output benchmarks/results/first-layer-cache-new
+```
+
+See [measurements and limitations](docs/benchmarking.md#first-layer-qkv-cache-microbenchmark).

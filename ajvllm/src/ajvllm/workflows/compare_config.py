@@ -8,6 +8,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from ajvllm.config import ComputeConfig, EngineConfig, GraphConfig, MemoryConfig, QuantizationConfig
+from ajvllm.config.first_layer_cache import FirstLayerCacheConfig
 
 
 def parse_args(argv=None):
@@ -74,6 +75,7 @@ def parse_args(argv=None):
         graphs=asdict(GraphConfig(**settings.get("graphs", {}))),
         compute=asdict(ComputeConfig(**settings.get("compute", {}))),
         quantization=asdict(quantization),
+        first_layer_cache=asdict(FirstLayerCacheConfig(**settings.get("first_layer_cache", {}))),
     )
     # Optional None values must be omitted from TOML, which has no null literal.
     args.engine_settings = {

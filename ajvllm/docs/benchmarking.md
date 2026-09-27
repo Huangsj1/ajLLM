@@ -1131,3 +1131,89 @@ provides a relevant scheduling reference. For a larger architectural change,
 compatible trained components and are not drop-in flags for the current 0.5B
 checkpoint. Their published speedups should not be extrapolated to this GPU/model
 pair without a new controlled comparison.
+
+
+## First-layer QKV cache microbenchmark
+
+```bash
+uv run ajvllm-benchmark-first-layer-cache \
+  --config configs/engine/benchmark.toml \
+  --output benchmarks/results/first-layer-cache-new
+```
+
+This loads only token embedding, first input RMSNorm and QKV weights. It constructs
+or reuses full-vocabulary BF16/Triton artifacts, then compares:
+
+- Direct: embedding -> Triton RMSNorm -> packed biased QKV GEMM.
+- Cached: embedding residual lookup plus precomputed QKV lookup.
+
+No engine, attention, KV pool, LM head or remaining model weights participate.
+Disk loading, cache construction and token generation are outside timed forward.
+The original embedding remains present in both paths, so the comparison measures
+the actual replacement boundary rather than hiding the residual's cost.
+
+By default, N takes powers of two from 1 through
+`engine.max_num_seqs * engine.max_model_len` (32 * 16,384 = 524,288 here).
+This upper endpoint is an isolated tensor stress test: ordinary engine forwards
+are still capped by `max_num_batched_tokens` (8,192 in this preset), not by the
+product of maximum sequence count and context length. `--tokens` selects explicit
+sizes; `--models`, `--patterns` and `--trials` customize the sweep.
+
+Each size uses random vocabulary IDs (`uniform`) and a separate case repeating a
+128-ID dictionary (`repeated`). IDs stay fixed within timing trials, which measures
+steady-state reuse. Small inputs through N=8,192 use 64 forwards unrolled inside
+one CUDA Graph, amortizing Python replay submissions; larger inputs use direct
+CUDA Event timing. Medians and min/max across five trials are recorded. Warmup,
+allocation prechecks, sequential model execution and incremental report writes
+bound resource use; skipped/OOM cases are explicitly recorded. Use
+`--graph-max-tokens 0` to inspect ordinary host-submitted execution instead.
+
+The completed 3080 Ti run covered all 80 model/pattern/size combinations without
+skips or OOM. Peak PyTorch allocation was 6,188.26 MiB (about 6.04 GiB), not the
+entire device's usage. Selected uniform-ID results:
+
+| Packed N | 0.5B direct (ms) | 0.5B lookup (ms) | Speedup | 1.5B direct (ms) | 1.5B lookup (ms) | Speedup |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.00905 | 0.00342 | 2.64x | 0.01405 | 0.00331 | 4.25x |
+| 16 | 0.01483 | 0.01614 | 0.92x | 0.02803 | 0.01636 | 1.71x |
+| 32 | 0.01371 | 0.00276 | 4.97x | 0.02069 | 0.00268 | 7.71x |
+| 1,024 | 0.07499 | 0.01349 | 5.56x | 0.12504 | 0.02215 | 5.65x |
+| 8,192 | 0.34951 | 0.09009 | 3.88x | 0.91146 | 0.15451 | 5.90x |
+| 65,536 | 2.75726 | 0.69398 | 3.97x | 6.90784 | 1.21352 | 5.69x |
+| 524,288 | 22.01361 | 5.48987 | 4.01x | 54.60582 | 9.60239 | 5.69x |
+
+The gain is local to this first-layer boundary. At the actual 8,192-token scheduler
+budget, the saved forward time was about 0.259 ms for 0.5B and 0.757 ms for 1.5B.
+These are not whole-model TTFT/throughput speedups. At N=16, 0.5B lookup was about
+8.8% slower in time; the repeated-ID control shows the same small-shape behavior.
+The timing is not monotonic across kernel shape choices, and no automatic runtime
+threshold is selected from this single run.
+
+At N=524,288, repeated IDs reduced lookup to 2.690 ms (0.5B) and 4.775 ms (1.5B),
+versus 5.490/9.602 ms for uniform IDs. A 128-ID working set fits in cache, removing
+much of the DRAM source-read traffic, while output writes remain. Real prompts
+have a different token distribution, and whole-model execution can evict the
+lookup and projection working sets between steps. Treat these as two locality
+scenarios rather than universal bounds on real workloads.
+
+The analytical comparison uses 912 GB/s and 68.2 dense BF16/FP32-accumulation
+TFLOP/s, with CLI overrides `--bandwidth-gbps` and `--dense-tflops`. For N=524,288,
+GEMM arithmetic alone has nominal minima of 15.870/48.366 ms; full lookup cold
+read/write traffic has ideal times of 4.709/8.241 ms. Both are consistent with the
+measured ordering, but exclude launches, occupancy limits and other overhead.
+See [architecture](architecture/architecture.md#bandwidth-versus-computation) for
+the derivation and hardware sources.
+
+`benchmarks/results/first-layer-cache/` contains `comparison.png`, `summary.md`,
+`summary.csv` and `report.json`; the JSON preserves numerical checks, artifact
+fingerprints, rate assumptions and timing ranges. The artifacts remain in
+`cache/first_layer_qkv/` for subsequent service startup. Initial measurement
+experiments were removed; no temporary service is required for this workflow.
+
+The complete default suite passed 224 tests. Five new CUDA regressions cover
+persistence/invalidation, eager and Triton math,
+chunked/packed model integration, residual sharing and graph replay. Two additional
+local-checkpoint tests check real cache-enabled startup, memory accounting and
+logits against a direct/padded BF16 control. BF16 shape-dependent differences can
+propagate through later layers; these tests do not claim bitwise output or text
+quality equivalence. Full details are in the architecture's numerical section.

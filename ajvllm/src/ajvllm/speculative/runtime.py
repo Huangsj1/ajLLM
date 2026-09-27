@@ -58,6 +58,8 @@ def create_runtime(
     planner = MemoryBudget(model, config, graph_reserve_bytes=2 * graphs.reserve_bytes, **budget_options)
     stats = planner.stats
     stats.draft_model_bytes = sum(t.numel() * t.element_size() for t in (*draft.parameters(), *draft.buffers()))
+    if draft.first_layer_qkv is not None:
+        stats.first_layer_cache_bytes += draft.first_layer_qkv.numel() * draft.first_layer_qkv.element_size()
     stats.model_bytes += stats.draft_model_bytes
     stats.weight_bytes += sum(t.numel() * t.element_size() for t in draft.parameters())
     stats.buffer_bytes += sum(t.numel() * t.element_size() for t in draft.buffers())
@@ -109,12 +111,21 @@ def create_runtime(
     return runtime_cls(Engine(target, config, decoder=decoder), planner)
 
 
-def from_directory(runtime_cls, directory, config, speculative, *, device, dtype, **options):
+def from_directory(
+    runtime_cls, directory, config, speculative, *, device, dtype, first_layer_cache_config=None, **options,
+):
     from ajvllm.execution.qwen2 import read_eos_token_ids
 
     check_tokenizers(directory, speculative.draft_model)
     model = load_qwen2(directory, device=device, dtype=dtype)
     draft = load_qwen2(speculative.draft_model, device=device, dtype=dtype)
+    from ajvllm.modeling.qwen2.first_layer_cache import configure_first_layer_cache
+
+    for loaded, checkpoint in ((model, directory), (draft, speculative.draft_model)):
+        configure_first_layer_cache(
+            loaded, checkpoint, first_layer_cache_config,
+            **{key: options.get(key) for key in ("compute_config", "memory_config", "quantization_config")},
+        )
     return create_runtime(
         runtime_cls,
         model,

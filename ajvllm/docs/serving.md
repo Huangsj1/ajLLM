@@ -320,3 +320,39 @@ refers to target storage and `/health.speculative.draft_kv_cache` to draft stora
 Acceptance rates and forward counters are available under `/health.speculative`.
 With `--profile-steps`, draft model/prepare/sampling stage timings are also recorded;
 use these diagnostic runs separately from performance comparisons.
+
+## First-layer QKV cache
+
+Build an artifact once for the model, inference dtype and RMSNorm backend:
+
+```bash
+uv run ajvllm-build-first-layer-cache --model model/Qwen2.5-0.5B-Instruct
+uv run ajvllm-build-first-layer-cache --model model/Qwen2.5-1.5B-Instruct
+```
+
+The builder loads only the first-layer inputs/projections, defaults to BF16/Triton,
+and computes the vocabulary in chunks of 4,096 tokens. Change `--chunk-tokens` to
+bound its workspace; use `--dtype` and `--backend` to match other engine settings.
+Artifacts live in `cache/first_layer_qkv/`, are git-ignored, and can be reused.
+
+Edit the existing section in your engine TOML:
+
+```toml
+[first_layer_cache]
+enabled = true
+directory = "cache/first_layer_qkv"
+```
+
+Then start `ajvllm-serve` or `ajvllm-generate` normally with the same model. The
+regular presets leave this feature disabled; leave `[speculative].enabled` false
+(or omit that section) to use it without SD. Startup only loads a matching cache,
+and gives a build command if none exists. Weight-only quantization is currently
+incompatible. Rebuild after changing checkpoint weights, dtype or norm backend.
+
+`/health.first_layer_cache` reports activation and table bytes; startup memory
+statistics include `first_layer_cache_bytes` and its human-readable display.
+These bytes are already included in model buffers, and reduce the profiled KV
+pool. At BF16 they add 333.84 MiB for 0.5B or 593.50 MiB for 1.5B. Generation can
+differ near BF16 numerical decision boundaries; this is not a bitwise-equivalence
+mode. See [architecture](architecture/architecture.md#first-layer-vocabulary-qkv-cache)
+and [benchmarking](benchmarking.md#first-layer-qkv-cache-microbenchmark).

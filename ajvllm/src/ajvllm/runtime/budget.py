@@ -31,6 +31,7 @@ class BudgetStats:
     speculative_workspace_bytes: int = 0
     target_pool_bytes: int = 0
     draft_pool_bytes: int = 0
+    first_layer_cache_bytes: int = 0
 
 
 class MemoryBudget:
@@ -47,6 +48,8 @@ class MemoryBudget:
         self.available_bytes = baseline + free
         self.initial_free = free
         self.initial_reserved = torch.cuda.memory_reserved(self.device)
+        cache = getattr(model, "first_layer_qkv", None)
+        cache_bytes = cache.numel() * cache.element_size() if cache is not None else 0
         model_bytes = sum(t.numel() * t.element_size() for t in (*model.parameters(), *model.buffers()))
         self.stats = BudgetStats(
             total,
@@ -56,6 +59,7 @@ class MemoryBudget:
             safety_bytes,
             graph_reserve_bytes,
             target_model_bytes=model_bytes,
+            first_layer_cache_bytes=cache_bytes,
             weight_bytes=sum(t.numel() * t.element_size() for t in model.parameters()),
             buffer_bytes=sum(t.numel() * t.element_size() for t in model.buffers()),
             token_budget=config.max_num_batched_tokens,

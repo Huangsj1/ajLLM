@@ -24,3 +24,8 @@ memory_limit_mb = 128
 
 [quantization]
 mode = "none" # "w8a16" quantizes decoder projections; activations/KV stay FP16/BF16.
+
+# Build the matching checkpoint/dtype/backend artifact before enabling.
+[first_layer_cache]
+enabled = false
+directory = "cache/first_layer_qkv"

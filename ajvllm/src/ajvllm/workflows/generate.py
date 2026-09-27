@@ -11,6 +11,7 @@ import torch
 from ajvllm import EngineConfig, SamplingParams
 from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
+from ajvllm.config.first_layer_cache import FirstLayerCacheConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.config.speculative import SpeculativeConfig
 from ajvllm.runtime.inference import InferenceRuntime
@@ -45,6 +46,7 @@ def main() -> None:
         device=args.device,
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
+        first_layer_cache_config=FirstLayerCacheConfig(**settings.get("first_layer_cache", {})),
         speculative_config=SpeculativeConfig(**settings.get("speculative", {})),
         compute_config=ComputeConfig(**settings.get("compute", {})),
         graph_config=GraphConfig(**settings.get("graphs", {})),

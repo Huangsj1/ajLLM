@@ -9,3 +9,5 @@ output/
 /model/
 
 /benchmarks/results/
+
+/cache/

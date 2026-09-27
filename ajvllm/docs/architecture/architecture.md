@@ -764,3 +764,104 @@ acceptance rate. See the benchmark guide for actual tradeoffs.
    parallel drafter heads; [DFlash](https://arxiv.org/abs/2602.06036) uses a block
    diffusion drafter. These require new model/training support. Their reported
    hardware/model speedups do not predict gains for this 3080 Ti checkpoint pair.
+
+## First-layer vocabulary QKV cache
+
+The first decoder layer's embedding, input RMSNorm and QKV projection depend only
+on token identity. For frozen weights, precompute
+`T[token] = QKV(RMSNorm(E[token]))`, including projection biases, **before RoPE**.
+Runtime gathers `E[token]` for the residual and `T[token]` for attention. Position
+rotation, KV writes, attention, output projection and the entire remaining model
+stay live. Later layers cannot use this table because their inputs depend on
+context. This feature is independent of speculative decoding and is disabled by
+default in the regular engine presets.
+
+Let `H = hidden_size`, `Dkv = num_key_value_heads * head_dim` and
+`W = H + 2 * Dkv`. GQA requires only `V * W` additional elements, not `V * 3H`.
+For vocabulary size 151,936 and BF16:
+
+| Model | H | Dkv | QKV width W | Additional table | Existing embedding |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5-0.5B | 896 | 128 | 1,152 | 333.84 MiB | 259.66 MiB |
+| Qwen2.5-1.5B | 1,536 | 256 | 2,048 | 593.50 MiB | 445.12 MiB |
+
+The table is a separate non-persistent model buffer. Keeping the embedding intact
+preserves embedding/LM-head weight tying and avoids duplication of the residual
+lookup table. `modeling/qwen2/first_layer_cache.py` loads only embedding, first norm
+and QKV weights for offline construction. It writes chunked computations into an
+atomic safetensors artifact; filenames hash the source tensors, model config,
+dtype, normalization backend and cache format version. Startup checks the manifest,
+shape and dtype, and reports a build command if the matching artifact is absent.
+No cache generation occurs inside forward or service startup. Original model
+weights remain available, and the artifact is not part of the model state dict.
+
+The cache must be attached before profiling and graph capture. Its bytes already
+belong to `model_bytes`/`buffer_bytes` and are separately identified by
+`first_layer_cache_bytes`; do not add this informational field again to totals.
+The automatic KV pool consequently becomes smaller, rather than allocating this
+table on top of the resolved pool. A stable GPU address allows the normal decode
+CUDA Graph path to use the same lookup. Artifacts require matching execution dtype
+and eager/Triton RMSNorm semantics; the current implementation rejects weight-only
+quantization with this option. Do not mutate the frozen weights or dtype after
+attaching a table. Speculative startup, if separately enabled, loads a matching
+table for each model and budgets both; the cache benchmark never enables SD.
+
+### Bandwidth versus computation
+
+For `N` packed tokens and `s` bytes per element, the proposed QKV-read term becomes
+`N * W * s / B`, where `B` is GPU memory bandwidth. The table is GPU-resident:
+this is not PCIe traffic. A materialized gather also writes `N * W * s` bytes;
+both paths additionally read and write the residual embedding. With cold source
+reads and no L2 reuse, the complete lookup's ideal traffic time is approximately
+`2 * N * (H + W) * s / B`. Repeated or small working sets can hit L2, so this DRAM
+traffic model is not a universal lower bound for warm-cache measurements.
+
+Packed QKV projection performs approximately `2 * N * H * W` FLOPs (FMA = two
+FLOPs). RMSNorm adds roughly `4 * N * H` arithmetic operations plus one inverse
+square root per row, and reads/writes approximately `2 * N * H * s` activation
+bytes. A useful projection roofline is the larger of `2NHW / F` and
+`(NH + NW + HW) * s / B`, before launch, bias and library overhead. The weight term
+matters at small N; weight/input reuse makes large GEMMs much more efficient.
+Embedding is common to both measured paths and is included in both timings.
+
+For the RTX 3080 Ti, use nominal 912 GB/s DRAM bandwidth (19 Gbit/s over 384 bits)
+and about **68.2 TFLOP/s dense BF16 with FP32 accumulation** at 1.665 GHz.
+The latter is inferred by scaling the GeForce GA10x rates in NVIDIA's
+[Ampere whitepaper, Table 2](https://www.nvidia.com/content/PDF/nvidia-ampere-ga-102-gpu-architecture-whitepaper-v2.1.pdf)
+to the 3080 Ti's 80 SMs. The product's core count and interface are documented in
+[NVIDIA's specifications](https://www.nvidia.com/en-gb/geforce/graphics-cards/30-series/rtx-3080-3080ti/).
+Do not substitute the FP16-accumulation or sparse Tensor Core rate for this BF16
+GEMM. These are nominal peaks, not measured sustained rates; clocks and memory
+access locality affect actual results. The benchmark exposes both rate assumptions.
+
+At N=8,192, illustrative ideal times are:
+
+| Model | QKV reads alone | Complete lookup read + write | QKV GEMM compute alone |
+|---|---:|---:|---:|
+| 0.5B | 0.0207 ms | 0.0736 ms | 0.2480 ms |
+| 1.5B | 0.0368 ms | 0.1288 ms | 0.7557 ms |
+
+For large N, both costs scale approximately linearly; increasing N does not by
+itself imply a bandwidth/compute crossover. The small-N region is instead governed
+by launches, kernel selection, occupancy and cache residency. Full-model gains
+are limited to this first-layer boundary: if it occupies fraction `f` of forward
+time and improves by `r`, the ideal overall speedup is `1 / (1 - f + f/r)`.
+Extra table residency may reduce serving concurrency through smaller KV capacity.
+
+### Numerical behavior and validation
+
+The transform is mathematically token-local, but GEMM kernels depend on batch
+shape. Vocabulary-chunk precomputation can round BF16 accumulations differently
+from a small runtime projection. Thus cache lookup does not promise identical
+logits or seeded generated text. The two checkpoint partial-transform tests had
+maximum sampled QKV differences of 0.0078125 and relative RMS differences below
+4.4e-6. CUDA regression tests cover artifact invalidation, residual/weight tying,
+full/chunked inference, paged attention and graph replay with changing IDs.
+
+In an additional 1.5B control with 11 packed tokens, only 10 first-layer QKV values
+differed, by at most 0.0009765625; final logits differed by up to 0.2265625. Changing
+the uncached batch to 64 packed tokens produced a comparable maximum difference
+of 0.23828125. Using FP32 reduced the cached/direct maximum difference to 4.82e-5.
+This isolates ordinary BF16 shape sensitivity; it does not establish a text-quality
+or perplexity guarantee. See the [local benchmark](../benchmarking.md#first-layer-qkv-cache-microbenchmark)
+for measured speedups and reproduction commands.

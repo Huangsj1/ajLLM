@@ -74,9 +74,14 @@ class EngineService:
         self.failure: str | None = None
         self.step_timing = {kind: {"steps": 0, "total_s": 0.0} for kind in ("prefill", "decode", "mixed")}
         model = engine.runner.model
+        first_qkv = getattr(model, "first_layer_qkv", None)
         self.metadata = {
             "resolved_engine": asdict(engine.config),
             "compute_backend": engine.runner.compute_backend,
+            "first_layer_cache": {
+                "enabled": first_qkv is not None,
+                "table_bytes": first_qkv.numel() * first_qkv.element_size() if first_qkv is not None else 0,
+            },
             "speculative": engine.decoder.snapshot(),
             "quantization": engine.runner.quantization,
             "kv_cache": engine.runner.memory_stats(),
