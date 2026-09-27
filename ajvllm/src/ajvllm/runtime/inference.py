@@ -66,7 +66,11 @@ class InferenceRuntime:
         return cls(Engine(runner, config), budget)
 
     @classmethod
-    def from_directory(cls, directory, config, *, device="cuda", dtype=None, **options):
+    def from_directory(cls, directory, config, *, device="cuda", dtype=None, speculative_config=None, **options):
+        if speculative_config is not None and speculative_config.enabled:
+            from ajvllm.speculative.runtime import from_directory
+
+            return from_directory(cls, directory, config, speculative_config, device=device, dtype=dtype, **options)
         model = load_qwen2(directory, device=device, dtype=dtype)
         return cls.from_model(
             model, config, eos_token_ids=read_eos_token_ids(directory, model.config.vocab_size), **options

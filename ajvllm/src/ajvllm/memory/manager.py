@@ -1,5 +1,6 @@
 """Request block tables, full-prefix reuse, copy-on-write and transactional reservations."""
 
+import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -32,6 +33,7 @@ class KVCacheManager:
         self.storage = storage = PagedKVStorage(
             layers, num_blocks, config.block_size, kv_heads, head_dim, device=device, dtype=dtype
         )
+        self._storages = [storage]
         self.block_size = storage.block_size
         self.blocks = BlockManager(storage.tensor.shape[2])
         # all requests/sequences kv state
@@ -48,6 +50,34 @@ class KVCacheManager:
         self.admission_waits = 0
         self.written_tokens = 0
         self.peak_used_blocks = 0
+
+    def create_peer(self, *, layers, kv_heads, head_dim):
+        """Share logical ownership, with distinct model-specific KV tensors.
+
+        Only the target commits tokens. Prefixes become visible after both models
+        have written their accepted KV. COW must copy every model's physical page.
+        """
+        peer = copy.copy(self)
+        peer._owner = self
+        peer.storage = PagedKVStorage(
+            layers,
+            len(self.blocks.ref_counts),
+            self.block_size,
+            kv_heads,
+            head_dim,
+            device=self.storage.tensor.device,
+            dtype=self.storage.tensor.dtype,
+        )
+        self._storages.append(peer.storage)
+        return peer
+
+    def trim(self, request_id):
+        """Release unpublished lookahead pages after a speculative transaction."""
+        state = self.states[request_id]
+        keep = (len(state.tokens) + self.block_size - 1) // self.block_size
+        for block in reversed(state.blocks[keep:]):
+            self.blocks.release(block)
+        del state.blocks[keep:]
 
     @property
     def capacity_tokens(self):
@@ -84,6 +114,8 @@ class KVCacheManager:
         return len(state.tokens)
 
     def reserve(self, request_id, end_pos) -> bool:
+        if hasattr(self, "_owner"):
+            return self._owner.reserve(request_id, end_pos)
         state = self.states[request_id]
         # needed new blocks num
         needed = (end_pos + self.block_size - 1) // self.block_size - len(state.blocks)
@@ -103,7 +135,8 @@ class KVCacheManager:
             old = state.blocks[tail]
             new = allocated[0]
             try:
-                self.storage.copy_block(old, new)
+                for storage in self._storages:
+                    storage.copy_block(old, new)
             except Exception:
                 for block in allocated:
                     self.blocks.release(block)
@@ -189,6 +222,7 @@ class KVCacheManager:
         return PagedBatch(self.storage, tables, slots, read_slots, valid)
 
     def snapshot(self):
+        counters = getattr(self, "_owner", self)
         used = len(self.blocks.ref_counts) - len(self.blocks.free)
         block_bytes = self.storage.nbytes // len(self.blocks.ref_counts)
         return {
@@ -201,16 +235,16 @@ class KVCacheManager:
             "shared_blocks": self.blocks.shared_blocks,
             "pool_bytes": self.storage.nbytes,
             "used_bytes": used * block_bytes,
-            "peak_used_bytes": self.peak_used_blocks * block_bytes,
-            "prefix_hits": self.hits,
-            "prefix_hit_tokens": self.hit_tokens,
+            "peak_used_bytes": counters.peak_used_blocks * block_bytes,
+            "prefix_hits": counters.hits,
+            "prefix_hit_tokens": counters.hit_tokens,
             "evictions": self.blocks.evictions,
-            "cow_copies": self.cow_copies,
-            "preemptions": self.preemptions,
-            "policy_preemptions": self.policy_preemptions,
-            "pressure_preemptions": self.pressure_preemptions,
-            "admission_waits": self.admission_waits,
-            "written_tokens": self.written_tokens,
-            "kv_write_bytes": self.written_tokens * block_bytes // self.block_size,
-            "cow_copy_bytes": self.cow_copies * block_bytes,
+            "cow_copies": counters.cow_copies,
+            "preemptions": counters.preemptions,
+            "policy_preemptions": counters.policy_preemptions,
+            "pressure_preemptions": counters.pressure_preemptions,
+            "admission_waits": counters.admission_waits,
+            "written_tokens": counters.written_tokens,
+            "kv_write_bytes": counters.written_tokens * block_bytes // self.block_size,
+            "cow_copy_bytes": counters.cow_copies * block_bytes,
         }

@@ -16,6 +16,8 @@ def parse_args(argv=None):
     config_arg, _ = config_parser.parse_known_args(argv)
     parser = argparse.ArgumentParser(description=__doc__, parents=[config_parser])
     settings = tomllib.loads(config_arg.config.read_text())
+    if settings.get("speculative", {}).get("enabled", False):
+        parser.error("use the speculative benchmark workflow for target-only versus draft-assisted comparison")
     engine = EngineConfig(**settings["engine"])
     graphs = GraphConfig(**settings.get("graphs", {}))
     sizes = sorted({1 << i for i in range(engine.max_num_seqs.bit_length())} | {engine.max_num_seqs})

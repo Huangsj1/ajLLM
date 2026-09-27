@@ -13,6 +13,7 @@ from ajvllm.config.advanced import GraphConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
 from ajvllm.execution.batch import KVCache, ModelBatch
+from ajvllm.execution.transfer import upload
 from ajvllm.memory.manager import KVCacheManager
 from ajvllm.modeling.qwen2.model import Qwen2ForCausalLM
 from ajvllm.modeling.qwen2.projections import pack_projections
@@ -48,6 +49,7 @@ class Qwen2Runner:
         compute_config: ComputeConfig | None = None,
         graph_config: GraphConfig | None = None,
         engine_config: EngineConfig | None = None,
+        kv_cache=None,
     ):
         if model.device.type != "cuda":
             raise ValueError("Qwen2Runner requires a CUDA model")
@@ -58,12 +60,12 @@ class Qwen2Runner:
         self.eos_token_ids = tuple(eos_token_ids)
         self.context_limit = engine_config.max_model_len if engine_config else self.max_model_len
         self._caches: dict[str, KVCache] = {}  # original contiguous KV caches
-        self.kv_cache: KVCacheManager | None = None  # KV cache manager for paged memory
+        self.kv_cache: KVCacheManager | None = kv_cache  # KV cache manager for paged memory
         memory_config = memory_config or MemoryConfig(backend="contiguous")
         self.compute_backend = resolve_backend(compute_config or ComputeConfig(backend="eager"), model, memory_config)
         if self.compute_backend == "triton":
             pack_projections(model)
-        if memory_config.backend == "paged":
+        if memory_config.backend == "paged" and kv_cache is None:
             if engine_config is None:
                 raise ValueError("paged runner requires a resolved engine_config")
             cfg = model.config
@@ -148,11 +150,11 @@ class Qwen2Runner:
         return 0 if cache is None else cache[0][0].shape[1]
 
     @torch.inference_mode()
-    def execute(self, batch: SchedulerOutput) -> dict[str, torch.Tensor]:
+    def execute(self, batch: SchedulerOutput, *, commit=True, sample_all=frozenset()) -> dict[str, torch.Tensor]:
         # Admission validates tokens and the scheduler constructs valid slices. The
         # runner checks only the cache-continuity contract across this boundary.
         for item in batch.requests:
-            if item.start_pos != self.cached_tokens(item.request_id):
+            if commit and item.start_pos != self.cached_tokens(item.request_id):
                 raise ValueError(f"noncontiguous input for {item.request_id}")
         if not batch.requests:
             return {}
@@ -174,6 +176,17 @@ class Qwen2Runner:
                 starts=[item.start_pos for item in batch.requests],
                 optimized=self.compute_backend == "triton",
             )
+            if sample_all:
+                indices, offset = [], 0
+                for item in batch.requests:
+                    if item.do_sample:
+                        indices.extend(
+                            range(offset, offset + item.num_tokens)
+                            if item.request_id in sample_all
+                            else [offset + item.num_tokens - 1]
+                        )
+                    offset += item.num_tokens
+                inputs.sample_indices = upload(indices, device=self.model.device, dtype=torch.long)
             if self.kv_cache is not None:
                 inputs.paged = self.kv_cache.batch(
                     [item.request_id for item in batch.requests],
@@ -193,12 +206,23 @@ class Qwen2Runner:
             self._caches.update(
                 (item.request_id, cache) for item, cache in zip(batch.requests, output.caches, strict=True)
             )
-        else:
+        elif commit:
             for item in batch.requests:
                 self.kv_cache.commit(item.request_id, item.token_ids)
         if output.logits is None:
             return {}
-        return {batch.requests[index].request_id: row for index, row in zip(sampling_rows, output.logits, strict=True)}
+        if not sample_all:
+            return {
+                batch.requests[index].request_id: row for index, row in zip(sampling_rows, output.logits, strict=True)
+            }
+        result, offset = {}, 0
+        for index in sampling_rows:
+            item = batch.requests[index]
+            count = item.num_tokens if item.request_id in sample_all else 1
+            rows = output.logits[offset : offset + count]
+            result[item.request_id] = rows if item.request_id in sample_all else rows[0]
+            offset += count
+        return result
 
     @torch.inference_mode()
     def probe(self, sequences, sample=None):

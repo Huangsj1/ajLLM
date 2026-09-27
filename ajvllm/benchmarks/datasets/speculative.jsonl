@@ -1,0 +1,8 @@
+{"id":"gqa", "prompt":"Explain grouped-query attention to a programmer. Describe how query heads share keys and values and why this reduces inference memory."}
+{"id":"python", "prompt":"Write a Python function that returns the first non-repeating character in a string, or None when none exists. Briefly explain its complexity."}
+{"id":"summary", "prompt":"Summarize this report in three bullet points: A library extended opening hours by two hours. Evening visits increased by 30 percent, while daytime visits were unchanged. Volunteer overtime rose and the monthly budget was exceeded by 200 dollars. The manager proposes rotating shifts before hiring more staff."}
+{"id":"arithmetic", "prompt":"A shop sells notebooks for 7 dollars each. A student buys 6 notebooks and pays with a 50 dollar note. Explain how much change the student receives."}
+{"id":"cache", "prompt":"Compare a CPU cache and a transformer KV cache. Explain what each stores and when the stored data can be reused."}
+{"id":"rewrite", "prompt":"Rewrite this email in a polite, concise professional tone: You still have not sent the updated numbers. I need them today or I cannot finish the report. Please fix this."}
+{"id":"json", "prompt":"Return a JSON object with keys city, country, and landmarks for Paris. Include three landmarks in a list. Do not include any other text."}
+{"id":"debugging", "prompt":"A Python loop removes items from a list while iterating over that same list and unexpectedly skips some items. Explain why this happens and show a safer alternative."}

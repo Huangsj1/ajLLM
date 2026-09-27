@@ -4,8 +4,9 @@
 
 ajvLLM is an educational inference engine implemented independently of vLLM.
 The implemented model target is Qwen2.5 dense decoder-only text generation,
-including grouped-query attention (GQA). MoE, multimodal models, speculative
-decoding, beam search, and production HTTP compatibility are outside this plan.
+including grouped-query attention (GQA) and standard draft-model speculative
+decoding. MoE, multimodal models, beam search, and production HTTP compatibility
+are outside this plan.
 Scheduling policies operate on token counts and block ownership rather than tensor layouts or model weights.
 
 | Stage | Deliverables | Exit criteria |
@@ -14,6 +15,7 @@ Scheduling policies operate on token counts and block ownership rather than tens
 | 2a: model baseline (implemented) | Native Qwen2.5 weight loader, tokenizer adapter, eager dense/GQA forward, simple contiguous per-request KV storage | Full vs incremental and chunked logits agree with a trusted Qwen2 implementation on tiny and real checkpoints |
 | 2b: memory (implemented) | KV cache manager, block allocator, paged storage, prefix sharing, eviction and recompute preemption | Same tokens as baseline; no leaks, double frees, invalid sharing, or budget oversubscription |
 | 3: compute (implemented) | FlashAttention prefill, PagedAttention, Flash Decode, fused elementwise kernels | Numerical equivalence plus measured GPU latency and memory improvements |
+| Speculative decoding (implemented) | Batched draft rollout, exact rejection sampling, paired KV ownership, joint memory profiling | CUDA distribution tests, rollback/lifecycle tests, checkpoint numerical validation, measured target-only comparison |
 | 4a/4b: advanced (implemented) | Bounded decode CUDA Graphs and W8A16 weight-only quantization | Graph replay parity, quantized-kernel parity, measured quality/memory/latency |
 
 The native backend now executes each logical scheduler batch as one packed mixed model
@@ -31,6 +33,7 @@ src/ajvllm/
   engine/                admission, execution, sampling, stop checks, cleanup
   scheduling/            token-budget policy and immutable execution plans
   sampling/              parameter validation and batched CUDA sampling
+  speculative/           draft rollout, target verification, and paired-model startup
   execution/             runner protocol, packed batch metadata, and CUDA Qwen runner
   tokenization/          token/text protocol and local Qwen chat tokenizer
   workflows/             CUDA text generation and persistent server entry points
@@ -671,3 +674,93 @@ accounting and policy thresholds; benchmarking records the bounded real-model
 validation. The underlying waiting/running distinction and residual-memory sizing
 were checked against the installed vLLM 0.23.0 scheduler and worker, as well as
 [vLLM memory guidance](https://docs.vllm.ai/en/latest/configuration/optimization/).
+
+## Standard speculative decoding
+
+The optional `[speculative]` configuration pairs a local Qwen2.5 target with a
+smaller draft model sharing the same token-ID vocabulary. The initial checkpoint
+pair is 1.5B-Instruct plus 0.5B-Instruct. `Engine` delegates each scheduled batch to
+an autoregressive or speculative decoding strategy; both return committed token
+counts and sampled token lists. Request admission, streaming, stopping, cancellation,
+and failure cleanup stay in the common engine.
+
+For each decode request, the scheduler reserves one ordinary decode token, then
+fairly allocates up to `num_draft_tokens` lookahead tokens within the same total
+step budget. Lookahead is clipped by remaining output/context capacity. If extra
+pages cannot be reserved, that request falls back to an ordinary decode step
+instead of evicting another request just to speculate. Prefill uses the remaining
+budget. Chunked prefill and verification still share one packed **target** forward;
+draft rollout uses batched sequential draft forwards, never per-request model calls.
+
+A round consumes the last uncached target token and proposes K draft tokens.
+The target computes all K+1 next-token logits in one causal verification forward.
+For processed target distribution p and draft distribution q, accept proposal y
+when a uniform draw is below min(1, p(y)/q(y)). At the first rejection, sample from
+normalized max(p-q, 0), discard subsequent proposals, and finish the round. If all
+proposals are accepted, sample one bonus token from the final target distribution.
+This is the [standard rejection algorithm](https://arxiv.org/abs/2211.17192).
+
+Both distributions use the production CUDA sampler's stable sorting, penalties,
+minimum-length stop masks, temperature, top-k, and top-p cutoff kernels. Hypothetical
+request histories are private to each round, so rejected tokens never enter a
+live request's penalty history. Rejection and correction operate on CUDA tensors;
+only selected IDs, logprobs, acceptance lengths, and validity reach the host.
+A zero-temperature request is the same algorithm with point-mass distributions.
+Exactness concerns the target sampling distribution, not identical random streams
+or bitwise-identical floating-point forwards across different batch shapes.
+
+### Paired KV ownership and memory
+
+The models have separate KV tensors but share one block allocator, logical block
+table, request state, and prefix index. A physical page ID names a corresponding
+page in each tensor, not the same KV values. The manager creates the second storage
+view and copies **both** tensors on COW. Shared ownership makes admission and
+preemption atomic for the pair; one release frees both models' logical capacity.
+
+Draft and target forwards write tentative KV without committing or publishing
+prefix hashes. After rejection sampling, only the accepted input prefix is
+committed; unused lookahead pages are returned to the allocator. Unused slots in
+a retained tail page remain outside the committed context and are overwritten on
+future growth. An all-accepted round computes the last proposal's draft KV before
+publication, reusing a one-token draft graph when available. Stop tokens inside an
+accepted chunk truncate the output and committed prefix; the last emitted token
+remains uncached, as in ordinary autoregressive decoding.
+
+Startup loads both models before profiling them sequentially with disposable pools.
+The planner accounts for both weights, the larger profiled/conservative workspace,
+an additional bound for verification logits/p/q/history buffers, both graph
+allowances, non-Torch growth, and safety headroom. Final capacity is the remaining
+bytes divided by **target block bytes + draft block bytes**. Both pools therefore
+have equal token capacity, with byte sizes proportional to their model geometry.
+For BF16 1.5B/0.5B, this is 28/12 KiB per token, a 70%/30% KV-byte split. Explicit
+`memory.num_blocks` applies to both pools. At least one full configured context
+must fit in the paired capacity. Startup memory statistics distinguish target/draft
+weights and pool bytes; `/health.speculative` reports acceptance, tokens/round,
+forward counts, and draft graph/KV statistics.
+
+The measured startup probes cover normal forwards and sampling; conservative extra
+workspace covers the additional speculative tensors. This is not an exhaustive
+profile of every verification shape. Verification currently uses the paged prefill
+kernel and ordinary launches; the existing graphs cover one-token target/draft
+calls. Short or high-concurrency workloads can lose performance despite a high
+acceptance rate. See the benchmark guide for actual tradeoffs.
+
+### Subsequent optimization directions
+
+1. Capture verification graphs keyed by batch, context and proposal length; reuse
+   static p/q and rejection buffers and reduce host synchronization between draft
+   steps. The present target graph cache only handles one-token queries.
+2. Adapt draft length to acceptance, measured draft/verify cost, and active batch
+   size, including bypassing SD when it cannot pay back its overhead. The estimator
+   should minimize time per emitted token, not maximize acceptance alone. vLLM's
+   [dynamic speculative decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/dynamic_speculative_decoding/)
+   offers a useful batch-size-dependent configuration reference.
+3. A smaller target-conditioned drafter can improve the acceptance/cost tradeoff.
+   [EAGLE-3](https://arxiv.org/abs/2503.01840) uses multi-layer target features and a
+   specially trained draft model. It requires a compatible trained checkpoint and
+   feature plumbing, not simply swapping the existing 0.5B model into that method.
+4. Parallel drafting attacks the serial K-forward draft cost directly.
+   [P-EAGLE](https://vllm-project.github.io/2026/03/13/p-eagle.html) uses trained
+   parallel drafter heads; [DFlash](https://arxiv.org/abs/2602.06036) uses a block
+   diffusion drafter. These require new model/training support. Their reported
+   hardware/model speedups do not predict gains for this 3080 Ti checkpoint pair.

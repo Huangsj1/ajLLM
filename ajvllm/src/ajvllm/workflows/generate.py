@@ -12,6 +12,7 @@ from ajvllm import EngineConfig, SamplingParams
 from ajvllm.config.advanced import GraphConfig, QuantizationConfig
 from ajvllm.config.compute import ComputeConfig
 from ajvllm.config.memory import MemoryConfig
+from ajvllm.config.speculative import SpeculativeConfig
 from ajvllm.runtime.inference import InferenceRuntime
 from ajvllm.tokenization.qwen2 import Qwen2Tokenizer
 
@@ -44,6 +45,7 @@ def main() -> None:
         device=args.device,
         dtype=getattr(torch, args.dtype),
         memory_config=memory_config,
+        speculative_config=SpeculativeConfig(**settings.get("speculative", {})),
         compute_config=ComputeConfig(**settings.get("compute", {})),
         graph_config=GraphConfig(**settings.get("graphs", {})),
         quantization_config=QuantizationConfig(**settings.get("quantization", {})),

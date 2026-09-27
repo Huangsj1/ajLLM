@@ -977,3 +977,157 @@ FIFO prefix ownership without speculative pinning, and optional short-request
 preemption with long-request completion and preserved sampling state. Temporary
 profiling servers, baseline adapters and experiment scripts are removed after
 validation; the existing datasets and reusable workflows remain.
+
+## Speculative decoding comparison
+
+The new workflow compares **the same 1.5B target** with SD disabled and enabled;
+it does not compare the old standalone 0.5B engine against the 1.5B model. Both
+variants retain the configured scheduler/context/graph settings and the same GPU
+utilization target. Prefix caching is disabled. Extra draft weights, graph reserve
+and sampling buffers reduce the remaining KV pool, which is part of the SD cost.
+
+```bash
+# Raw continuation screening (fixed-length truncations of the long dataset).
+uv run ajvllm-benchmark-speculative --draft-tokens 1 2 4 \
+  --concurrency 1 2 4 --requests 16 --max-tokens 64 --repeats 3 \
+  --output benchmarks/results/speculative-raw
+
+# Complete instructions, preserving the target chat template and task ending.
+uv run ajvllm-benchmark-speculative \
+  --dataset benchmarks/datasets/speculative.jsonl --chat --prompt-tokens 0 \
+  --draft-tokens 4 8 --concurrency 1 2 4 --requests 16 --max-tokens 64 --repeats 3 \
+  --output benchmarks/results/speculative-chat
+```
+
+The small instruction dataset includes explanation, coding, summarization,
+arithmetic, rewriting and structured-output tasks. `--prompt-tokens 0` keeps
+complete prompts; `--chat` applies the target's template. Without chat mode,
+positive `--prompt-tokens` truncates sufficiently long source rows exactly as a
+raw completion workload. The default 256-token truncation removes the end-of-report
+instruction and can be unusually easy to speculate; do not generalize its
+acceptance rate to chat generation.
+
+Each repeat starts fresh processes and reverses variant order on alternate repeats.
+Each concurrency has an excluded warmup. Sampling uses temperature 0.8, top-p 0.9,
+seed=request index and ignore-EOS for fixed output counts. No synchronized step
+profiling is enabled by default. `--profile-steps` is a separate diagnostic mode;
+its timing overhead makes those runs unsuitable as throughput evidence.
+
+Outputs include `comparison.png`, `summary.md`, `summary.csv`, raw `report.json`,
+input token IDs, candidate TOMLs, and logs. Acceptance and tokens/round are deltas
+between health snapshots surrounding measured requests; GPU memory is device-wide
+and includes other GPU users. Planner `pool_bytes` sums target and draft pools.
+HTTP TPOT is first-to-last-token time divided by token intervals, even when one SSE
+event emits several tokens. It is an average cadence, not a guarantee of smooth
+per-token delivery. Do not compare event intervals against an autoregressive
+per-token latency metric without accounting for burst sizes.
+
+The implementation's CUDA tests check the rejection distribution statistically,
+all-accepted bonus and forced-rejection cases, mixed arrivals, tiny token budgets,
+stop inside an accepted chunk, context limits, prefix reuse, paired COW and cleanup.
+Opt-in `tests/test_speculative_local_model.py` validates the downloaded target/draft
+pair. FP32 greedy outputs match for three 32-token chat completions. BF16 tests
+check the first divergent decision at an identical prefix: different GEMM/attention
+batch shapes can reorder near-tied logits, so bitwise output identity is not the
+correct universal invariant. In the observed run, the first divergences were at
+output positions 32 and 30, with top-logit gaps of 0 or 0.125. The original
+statistical rejection rule remains unchanged; cached positions and hypothetical
+penalty histories are tested independently.
+
+### RTX 3080 Ti measurements
+
+The completed screening used BF16, Triton attention, CUDA Graphs, a 16,384-token
+context limit, an 8,192-token scheduler budget, 32 sequence slots and 0.70 GPU
+memory utilization. Each configuration measured eight requests of 64 output tokens
+after warmup, with two repeats at concurrency 1/2/4. The raw continuation sweep
+covered K=0/1/2/4; complete chat covered K=0/4/8. All 336 measured requests succeeded.
+These are short exploratory runs on one GPU, not confidence intervals or a broad
+quality evaluation. The final default regression suite passed 219 tests; the two
+additional local-checkpoint FP32/BF16 cases also passed separately.
+
+Complete chat results (means across repeats):
+
+| Concurrency | Target tokens/s | K=4 tokens/s | Throughput change | Target TPOT (ms) | K=4 TPOT (ms) | Target TTFT (ms) | K=4 TTFT (ms) |
+|---|---|---|---|---|---|---|---|
+| 1 | 143.76 | 104.65 | -27.2% | 6.80 | 9.24 | 16.49 | 29.69 |
+| 2 | 245.66 | 170.04 | -30.8% | 7.69 | 10.15 | 36.30 | 66.08 |
+| 4 | 409.20 | 239.25 | -41.5% | 9.39 | 14.28 | 31.73 | 84.95 |
+
+K=4 accepted 60.5–62.1% of proposed tokens and emitted 3.37–3.44 tokens per
+speculative round. K=8 raised that output to 4.31–4.70 tokens/round but lowered
+acceptance to 44.0–48.7%; throughput was only 95.91/155.26/207.61 tokens/s.
+The extra serial drafting cost exceeded the benefit. K=4 is the better of those
+two tested chat settings, but **target-only is faster at every tested concurrency**.
+At concurrency four, K=4 throughput varied by 26.09 tokens/s (population standard
+deviation across two repeats), so small differences should not be overinterpreted.
+
+The raw continuation workload was much easier: K=4 acceptance was about 90–91%.
+At concurrency one it improved throughput from 132.89 to 138.92 tokens/s (+4.5%)
+and TPOT from 7.33 to 6.81 ms. At concurrency two/four, throughput instead fell
+5.4%/9.5%. K=1 and K=2 were slower throughout that sweep. This small single-request
+win is workload-dependent and does not establish a general chat speedup.
+
+Reports and six-panel figures are in the local, git-ignored directories
+`benchmarks/results/speculative-chat/` and `benchmarks/results/speculative-sweep/`.
+They include TTFT, TPOT, throughput, sampled device memory/utilization and acceptance.
+For chat, mean sampled GPU utilization was 74.9/72.5/63.1% for target-only versus
+51.5/56.5/48.0% for K=4. Lower utilization here accompanies extra serial work and
+host gaps; it is not evidence of improved GPU efficiency.
+
+### Where the time and memory went
+
+A separate synchronized diagnostic (`speculative-profile`, four chat requests,
+concurrency one, K=4) measured these deltas after warmup:
+
+| Component | Target only | Speculative K=4 |
+|---|---:|---:|
+| Target forward calls | 256 | 75 |
+| Draft forward calls | 0 | 319 |
+| Target model wall time | 1.368 s | 1.137 s |
+| Draft model wall time | 0 | 0.709 s |
+| Target sampling wall time | 0.140 s | 0.178 s |
+| Draft sampling wall time | 0 | 0.150 s |
+| Target + draft input preparation | 0.114 s | 0.186 s |
+| Target graph replays | 252 | 1 |
+| Draft graph replays | 0 | 315 |
+
+The 70 speculative rounds emitted 251 tokens, with the remaining five outputs
+coming from ordinary steps. Target verification processes multiple query positions
+and returns multiple logits rows, so it currently falls back from the single-token
+decode graph. Thus 71% fewer target forwards saved only 17% of target model time;
+serial draft work and extra sampling more than consumed that saving. All-accepted
+rounds additionally flush the last proposal through the draft to publish consistent
+paired KV. Synchronization, rejection sampling and Python orchestration are not
+fully attributed by the stage counters; these are diagnostic wall times, not an
+exhaustive CUDA kernel trace. Do not substitute this synchronized run's throughput
+for the unsynchronized comparison above.
+
+With the same 0.70 memory target, target-only allocated 3,923.06 MiB of KV pool.
+K=4 allocated 2,244.38 MiB combined: 1,571.06 MiB target plus 673.31 MiB draft.
+The draft added 950.29 MiB of model storage; the planner reserved 593.50 MiB of
+additional speculative workspace and doubled the graph allowance to 256 MiB.
+K=8 reduced the combined pool further to 1,947.50 MiB. These pool sizes are
+capacity, not live token usage. Device-wide memory can be lower with SD because
+its conservative workspace allowance reduces the preallocated pool; that does
+not mean SD intrinsically saves memory. Short prompts did not stress this capacity.
+
+### Recommended next optimizations
+
+Keep SD opt-in for this model pair. Prioritize verification CUDA Graphs with stable
+buffers for batch/context/K shapes, then reduce per-depth full-vocabulary sorting,
+probability materialization and host synchronization. Acceptance only needs proposal
+probabilities; residual-distribution construction can be deferred until rejection,
+provided the exact transformed sampling distributions are preserved. A lazy draft
+catch-up path could remove the all-accepted flush, but requires independent draft
+progress tracking and safe prefix publication.
+
+Next, select K dynamically using measured cost per emitted token and current batch
+size; reduce or disable speculation when acceptance or amortization is poor.
+[vLLM's dynamic speculative decoding](https://docs.vllm.ai/en/latest/features/speculative_decoding/dynamic_speculative_decoding/)
+provides a relevant scheduling reference. For a larger architectural change,
+[EAGLE-3](https://arxiv.org/abs/2503.01840) uses a trained target-conditioned drafter;
+[P-EAGLE](https://vllm-project.github.io/2026/03/13/p-eagle.html) and
+[DFlash](https://arxiv.org/abs/2602.06036) explore parallel drafting. They require
+compatible trained components and are not drop-in flags for the current 0.5B
+checkpoint. Their published speedups should not be extrapolated to this GPU/model
+pair without a new controlled comparison.

@@ -17,6 +17,8 @@ class ScheduledRequest:
     phase: Phase
     do_sample: bool  # true if token_ids is the last chunk of the request's input sequence
 
+    num_draft_tokens: int = 0   # only used in DECODE phase
+
     @property
     def num_tokens(self) -> int:
         return len(self.token_ids)
@@ -32,4 +34,4 @@ class SchedulerOutput:
 
     @property
     def num_scheduled_tokens(self) -> int:
-        return sum(item.num_tokens for item in self.requests)
+        return sum(item.num_tokens + item.num_draft_tokens for item in self.requests)

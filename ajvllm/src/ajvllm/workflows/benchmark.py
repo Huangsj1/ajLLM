@@ -220,6 +220,7 @@ def run_benchmark(
             "utilization_percent": distribution(row["utilization_percent"] for row in samples),
             "memory_used_mib": distribution(row["memory_used_mib"] for row in samples),
         },
+        "speculative": after.get("speculative", {"enabled": False}),
         "health_before": before,
         "health_after": after,
         "requests": rows,
@@ -282,6 +283,7 @@ def main():
     if not report["server_steps"]:
         print("Step timings unavailable; start the server with --profile-steps to enable them.")
     print("KV cache:", json.dumps(report["kv_cache"]))
+    print("Speculative decoding:", json.dumps(report["speculative"]))
     print("CUDA graphs:", json.dumps(report["graphs"]))
     print("Quantization:", json.dumps(report["quantization"]))
     print("Stage totals (s):", json.dumps(report["stage_seconds"]))

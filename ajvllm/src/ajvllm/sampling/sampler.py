@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from ajvllm.execution.transfer import upload
-from ajvllm.kernels.sampling import sample_sorted, update_history
+from ajvllm.kernels.sampling import distribution_sorted, sample_sorted, update_history
 from ajvllm.requests import Request
 
 
@@ -94,6 +94,20 @@ class Sampler:
             # metadata, shape (batch, 3), including: history buffer pointer, min_tokens flag, top_k
             upload(metadata, device=device, dtype=torch.int64),
         )
+
+    @torch.inference_mode()
+    def distributions(self, logits, requests, eos_token_ids=()):
+        """Normalized CUDA probabilities for draft/target rejection sampling."""
+        if self.profile_enabled:
+            torch.cuda.synchronize()
+        started = time.perf_counter()
+        scores = torch.stack([logits[r.request_id] for r in requests])
+        params, metadata = self._metadata(requests, scores.shape[1], scores.device, tuple(eos_token_ids))
+        probabilities = distribution_sorted(scores, params, metadata)
+        if self.profile_enabled:
+            torch.cuda.synchronize(scores.device)
+            self.stage_seconds["sampling"] += time.perf_counter() - started
+        return probabilities
 
     @torch.inference_mode()
     def sample(

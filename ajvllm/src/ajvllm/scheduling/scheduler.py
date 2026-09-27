@@ -1,6 +1,7 @@
 """Shared-budget scheduling: reserve decode tokens, then fairly chunk prefills."""
 
 from collections import deque
+from dataclasses import replace
 from itertools import islice
 
 from ajvllm.config import EngineConfig
@@ -39,7 +40,8 @@ def rotate_after(ids: list[str], last: str | None) -> list[str]:
 
 
 class Scheduler:
-    def __init__(self, config: EngineConfig, kv_cache=None):
+    def __init__(self, config: EngineConfig, kv_cache=None, num_draft_tokens=0):
+        self.num_draft_tokens = num_draft_tokens
         self.kv_cache = kv_cache
         self.config = config
         self.requests: dict[str, Request] = {}
@@ -50,7 +52,8 @@ class Scheduler:
         self.token_budget = config.max_num_batched_tokens
         self.steps = 0
         self.waiting_since = {}
-        self.short_preempted = set()    # requests preempted by short-request switching, to avoid re-adding them to the schedule
+        # Avoid immediately rescheduling requests displaced by short-request switching.
+        self.short_preempted = set()
         self.last_short_preemption = -32
 
     def add(self, request: Request) -> None:
@@ -132,7 +135,7 @@ class Scheduler:
 
     def schedule(self) -> SchedulerOutput:
         self.steps += 1
-        # if a short request is waiting for a long time because of the lack of available blocks, preempt a running request to free up space for it
+        # Consider switching a long-running request for a waiting short request.
         self._short_request_switch()
         budget = self.token_budget
         items = []
@@ -199,6 +202,14 @@ class Scheduler:
             if append(rid, 1, Phase.DECODE):
                 self._last_decode_id = rid
         budget -= len(items)
+        if self.num_draft_tokens and items:
+            demands = [min(self.num_draft_tokens, max(0, self._remaining(self.requests[i.request_id]) - 1))
+                       for i in items]
+            for index, count in enumerate(fair_chunks(demands, budget)):
+                item = items[index]
+                if count and self.kv_cache.reserve(item.request_id, item.end_pos + count):
+                    items[index] = replace(item, num_draft_tokens=count)
+                    budget -= count
         prefill_budget = min(budget, self.config.max_prefill_tokens_per_step or budget)
         if not prefill_budget:
             return SchedulerOutput(tuple(items))

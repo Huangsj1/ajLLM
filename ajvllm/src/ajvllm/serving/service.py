@@ -77,6 +77,7 @@ class EngineService:
         self.metadata = {
             "resolved_engine": asdict(engine.config),
             "compute_backend": engine.runner.compute_backend,
+            "speculative": engine.decoder.snapshot(),
             "quantization": engine.runner.quantization,
             "kv_cache": engine.runner.memory_stats(),
             "model_config": asdict(model.config),
@@ -223,6 +224,7 @@ class EngineService:
                         **self.metadata,
                         "engine": asdict(self.engine.metrics),
                         "kv_cache": self.engine.runner.memory_stats(),
+                        "speculative": self.engine.decoder.snapshot(),
                         "stage_seconds": dict(self.engine.runner.stage_seconds)
                         | dict(self.engine._sampler.stage_seconds),
                         "transfer_bytes": self.engine._sampler.transfer_bytes,

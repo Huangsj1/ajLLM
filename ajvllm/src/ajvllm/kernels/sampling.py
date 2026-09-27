@@ -117,7 +117,7 @@ def update_history(addresses):
         _update_history[(triton.cdiv(addresses.numel(), 256),)](addresses, addresses.numel(), 256)
 
 
-def sample_sorted(logits, params, metadata, draws):
+def _prepare_sorted(logits, params, metadata):
     batch, vocab = logits.shape
     tiles = triton.cdiv(vocab, TILE)
     scores = torch.empty((batch, vocab), device=logits.device, dtype=torch.float32)
@@ -130,6 +130,13 @@ def sample_sorted(logits, params, metadata, draws):
     sums = torch.empty((batch, tiles), device=logits.device, dtype=torch.float32)
     # 3.temperature, top-k, tiled CDF
     _cdf_tiles[(batch, tiles)](values, params, metadata, cdf, sums, vocab, tiles, TILE, enable_fp_fusion=False)
+    return values, ids, cdf, sums, invalid
+
+
+def sample_sorted(logits, params, metadata, draws):
+    values, ids, cdf, sums, invalid = _prepare_sorted(logits, params, metadata)
+    batch, vocab = logits.shape
+    tiles = triton.cdiv(vocab, TILE)
     result = torch.empty((batch, 3), device=logits.device, dtype=torch.float64)
     # 4.sample
     _select[(batch,)](
@@ -148,3 +155,61 @@ def sample_sorted(logits, params, metadata, draws):
         enable_fp_fusion=False,
     )
     return result
+
+
+@triton.jit
+def _distribution_limits(
+    Params, CDF, Sums, Invalid, Limits, V: tl.constexpr, TILES: tl.constexpr, BLOCK: tl.constexpr, BT: tl.constexpr
+):
+    row = tl.program_id(0)
+    t = tl.arange(0, BT)
+    prefixes = tl.cumsum(tl.load(Sums + row * TILES + t, t < TILES, 0), 0)
+    total = tl.sum(tl.where(t == TILES - 1, prefixes, 0.0), 0)
+    p = tl.load(Params + row * 5 + 4)
+    cutoff, mass = V - 1, total
+    if p < 1.0:
+        threshold = p.to(tl.float64) * total.to(tl.float64)
+        tile = tl.min(tl.where((t < TILES) & (prefixes >= threshold), t, TILES - 1), 0)
+        before = tl.sum(tl.where(t == tile - 1, prefixes, 0.0), 0)
+        indices = tile * BLOCK + tl.arange(0, BLOCK)
+        prefix = tl.load(CDF + row * V + indices, indices < V, float("inf")) + before
+        end = tl.minimum((tile + 1) * BLOCK, V) - 1
+        cutoff = tl.min(tl.where((indices < V) & (prefix >= threshold), indices, end), 0)
+        mass = tl.sum(tl.where(indices == cutoff, prefix, 0.0), 0)
+    bad = tl.max(tl.load(Invalid + row * TILES + t, t < TILES, 0), 0) != 0
+    tl.store(Limits + row * 2, cutoff.to(tl.float32))
+    tl.store(Limits + row * 2 + 1, tl.where(bad, float("nan"), mass))
+
+
+@triton.jit
+def _materialize_distribution(
+    Values, IDs, Params, Metadata, Limits, Probabilities, V: tl.constexpr, BLOCK: tl.constexpr
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    i = tile * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(Values + row * V + i, i < V, float("-inf"))
+    maximum = tl.load(Values + row * V)
+    temperature = tl.maximum(tl.load(Params + row * 5 + 3), 1.1754943508222875e-38)
+    cutoff = tl.load(Limits + row * 2).to(tl.int32)
+    top_k = tl.load(Metadata + row * 3 + 2)
+    mass = tl.load(Limits + row * 2 + 1)
+    weight = tl.exp((x - maximum) / temperature)
+    probability = tl.where((i <= cutoff) & (i < top_k) & (x != float("-inf")), weight, 0) / mass
+    ids = tl.load(IDs + row * V + i, i < V, 0)
+    tl.store(Probabilities + row * V + ids, probability, i < V)
+
+
+def distribution_sorted(logits, params, metadata):
+    """Materialize normalized probabilities using the production sampler's exact cutoff policy."""
+    values, ids, cdf, sums, invalid = _prepare_sorted(logits, params, metadata)
+    batch, vocab = logits.shape
+    tiles = triton.cdiv(vocab, TILE)
+    limits = torch.empty((batch, 2), device=logits.device)
+    probabilities = torch.empty((batch, vocab), device=logits.device)
+    _distribution_limits[(batch,)](
+        params, cdf, sums, invalid, limits, vocab, tiles, TILE, triton.next_power_of_2(tiles), enable_fp_fusion=False
+    )
+    _materialize_distribution[(batch, tiles)](
+        values, ids, params, metadata, limits, probabilities, vocab, TILE, enable_fp_fusion=False
+    )
+    return probabilities

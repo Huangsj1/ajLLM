@@ -3,7 +3,8 @@
 An educational single-GPU inference engine for Qwen2.5 dense/GQA models, built
 from model execution through scheduling, memory management, and CUDA kernels.
 It supports continuous batching, chunked prefill, paged KV caching, prefix reuse,
-CUDA sampling, decode CUDA Graphs, and optional W8A16 quantization.
+CUDA sampling, decode CUDA Graphs, optional W8A16 quantization, and standard
+draft-model speculative decoding.
 
 Model execution does not delegate to vLLM or Transformers. Transformers supplies
 tokenization and the independent model test oracle; vLLM is installed for reference
@@ -208,6 +209,36 @@ utilization target on both sides; set `memory.num_blocks` for equal KV bytes.
 It writes a multi-metric plot, resolved configuration, and detailed JSON;
 see the [comparison methodology](docs/benchmarking.md#reproducible-comparison-with-vllm).
 Generated benchmark results are ignored by Git.
+
+## Speculative decoding
+
+Use Qwen2.5-1.5B-Instruct as the target and the existing 0.5B checkpoint as draft:
+
+```bash
+uv run hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir model/Qwen2.5-1.5B-Instruct
+uv run ajvllm-serve --model model/Qwen2.5-1.5B-Instruct \
+  --config configs/engine/qwen2-speculative.toml --gpu-memory-utilization 0.7
+```
+
+`[speculative]` controls `enabled`, `draft_model` and `num_draft_tokens`. Startup
+budgets both models and their paired KV pools together. The generation API remains
+the same; streamed events may contain several tokens. Standard rejection sampling
+preserves the target distribution, subject to ordinary floating-point differences;
+a larger draft length does not guarantee better latency or throughput.
+
+Compare the same target with SD disabled and enabled, using complete chat prompts:
+
+```bash
+uv run ajvllm-benchmark-speculative \
+  --dataset benchmarks/datasets/speculative.jsonl --chat --prompt-tokens 0 \
+  --draft-tokens 2 4 8 --concurrency 1 2 4 --requests 16 --repeats 3 \
+  --output benchmarks/results/speculative-chat
+```
+
+This workflow owns its servers, disables prefix caching, excludes warmup, and
+writes tables, plots, raw HTTP timings, acceptance statistics and memory snapshots.
+See [serving](docs/serving.md#speculative-decoding) and
+[architecture](docs/architecture/architecture.md#standard-speculative-decoding).
 
 ## Development and tests
 

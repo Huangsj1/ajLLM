@@ -276,3 +276,47 @@ budget; this is distinct from exact allocated or reserved bytes. `/health.quanti
 reports converted layers, weight/scale/activation/KV dtypes and model storage bytes
 (including static buffers, excluding KV/graphs/workspaces). The benchmark report
 records graph counter deltas and quantization metadata alongside existing metrics.
+
+## Speculative decoding
+
+Download both local checkpoints and start the target explicitly:
+
+```bash
+uv run hf download Qwen/Qwen2.5-1.5B-Instruct --local-dir model/Qwen2.5-1.5B-Instruct
+uv run hf download Qwen/Qwen2.5-0.5B-Instruct --local-dir model/Qwen2.5-0.5B-Instruct
+uv run ajvllm-serve --model model/Qwen2.5-1.5B-Instruct \
+  --config configs/engine/qwen2-speculative.toml --gpu-memory-utilization 0.7
+```
+
+The additional TOML section is:
+
+```toml
+[speculative]
+enabled = true
+draft_model = "model/Qwen2.5-0.5B-Instruct"
+num_draft_tokens = 4
+```
+
+The target remains the model selected by `--model`. Set `enabled = false` to return
+to target-only execution. The feature requires paged KV, equal vocabulary semantics,
+and a context limit supported by both models. Both model weights, workspaces and
+KV pools share the same utilization budget; do not independently launch a draft
+service or allocate it another full-memory pool. `memory.num_blocks`, if supplied,
+is the logical page count for each model's storage.
+
+The `/generate` request format and sampling parameters are unchanged. An SSE event
+can now contain **multiple** `new_token_ids`; display cumulative `text` or process
+all IDs in the event. The scalar `logprob` describes the last token emitted in that
+event under the processed target distribution. Chunk emission makes event-to-event
+latency different from average per-token latency. HTTP TPOT remains elapsed time
+from first to last token divided by generated token count minus one. Seeds are
+repeatable within a decoding strategy; enabling SD consumes a different RNG stream
+and does not promise identical sampled text for the same seed.
+
+Startup memory fields include `target_model_bytes`, `draft_model_bytes`,
+`target_pool_bytes`, `draft_pool_bytes` and `speculative_workspace_bytes`.
+`pool_bytes` in the memory planner is the sum of both pools, while `/health.kv_cache`
+refers to target storage and `/health.speculative.draft_kv_cache` to draft storage.
+Acceptance rates and forward counters are available under `/health.speculative`.
+With `--profile-steps`, draft model/prepare/sampling stage timings are also recorded;
+use these diagnostic runs separately from performance comparisons.

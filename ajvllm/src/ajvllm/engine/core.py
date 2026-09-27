@@ -8,6 +8,7 @@ from dataclasses import replace
 from ajvllm.config import EngineConfig, require_int
 from ajvllm.engine.metrics import EngineMetrics
 from ajvllm.execution.protocol import ModelRunner
+from ajvllm.execution.step import AutoregressiveDecoder
 from ajvllm.requests import FinishReason, Request, RequestOutput, RequestStatus
 from ajvllm.sampling.params import SamplingParams
 from ajvllm.sampling.sampler import Sampler
@@ -30,6 +31,7 @@ class Engine:
         config: EngineConfig | None = None,
         *,
         clock: Callable[[], float] = time.monotonic,
+        decoder=None,
     ):
         self.runner = runner
         self.config = config or EngineConfig()
@@ -39,7 +41,8 @@ class Engine:
         if runner.kv_cache is not None and self.config.max_model_len > runner.kv_cache.capacity_tokens:
             raise ValueError("KV pool must fit the engine context limit")
         self.eos_token_ids = tuple(runner.eos_token_ids)
-        self._scheduler = Scheduler(self.config, runner.kv_cache)
+        self.decoder = decoder or AutoregressiveDecoder(runner)
+        self._scheduler = Scheduler(self.config, runner.kv_cache, self.decoder.num_draft_tokens)
         self._sampler = Sampler(max_histories=self.config.max_num_seqs)
         self._clock = clock
         self._metrics = EngineMetrics()
@@ -169,17 +172,11 @@ class Engine:
             return outputs
         self._metrics.num_steps += 1
         self._metrics.scheduled_prefill_tokens += sum(i.num_tokens for i in batch.requests if i.phase == Phase.PREFILL)
-        self._metrics.scheduled_decode_tokens += sum(i.num_tokens for i in batch.requests if i.phase == Phase.DECODE)
+        self._metrics.scheduled_decode_tokens += sum(
+            i.num_tokens + i.num_draft_tokens for i in batch.requests if i.phase == Phase.DECODE
+        )
         try:
-            # 2. execute the model
-            logits = self.runner.execute(batch)
-            ready = [self._scheduler.requests[item.request_id] for item in batch.requests if item.do_sample]
-            if set(logits) != {request.request_id for request in ready}:
-                raise ValueError("runner logits keys do not match sampling-ready request IDs")
-            if any(row.shape != (self.runner.vocab_size,) for row in logits.values()):
-                raise ValueError("runner logits width does not match vocabulary")
-            # 3. sample the next token for each request that is ready to decode
-            samples = self._sampler.sample(logits, ready, self.eos_token_ids)
+            result = self.decoder.execute(batch, self._scheduler.requests, self._sampler, self.eos_token_ids)
         except Exception as exc:
             errors = tuple(
                 self._finish(self._scheduler.requests[item.request_id], FinishReason.ERROR, error=str(exc))
@@ -190,29 +187,31 @@ class Engine:
         self._pending_outputs.clear()
         for item in batch.requests:
             request = self._scheduler.requests[item.request_id]
-            request.num_computed_tokens += item.num_tokens
+            request.num_computed_tokens += result.computed[item.request_id]
             # if in prefill phase and not yet finished the whole input, continue
             if not item.do_sample:
                 continue
-            sample = samples[item.request_id]
-            request.output_token_ids.append(sample.token_id)
-            self._metrics.generated_tokens += 1
-            if request.first_token_time is None:
-                request.first_token_time = self._clock()
-            reason = None
-            stop_token = None
-            if sample.token_id in request.sampling_params.effective_stop_ids(self.eos_token_ids):
-                reason, stop_token = FinishReason.STOP, sample.token_id
-            elif (
-                len(request.output_token_ids) >= request.sampling_params.max_tokens
-                or request.num_tokens >= self.config.max_model_len
-            ):
-                reason = FinishReason.LENGTH
+            emitted = []
+            reason = stop_token = None
+            for sample in result.samples[item.request_id]:
+                request.output_token_ids.append(sample.token_id)
+                emitted.append(sample.token_id)
+                self._metrics.generated_tokens += 1
+                if request.first_token_time is None:
+                    request.first_token_time = self._clock()
+                if sample.token_id in request.sampling_params.effective_stop_ids(self.eos_token_ids):
+                    reason, stop_token = FinishReason.STOP, sample.token_id
+                elif (
+                    len(request.output_token_ids) >= request.sampling_params.max_tokens
+                    or request.num_tokens >= self.config.max_model_len
+                ):
+                    reason = FinishReason.LENGTH
+                if reason is not None:
+                    break
             if reason is not None:
-                # finish the request and release its resources
-                outputs.append(self._finish(request, reason, (sample.token_id,), stop_token, sample.logprob))
+                outputs.append(self._finish(request, reason, tuple(emitted), stop_token, sample.logprob))
             else:
-                outputs.append(self._output(request, (sample.token_id,), logprob=sample.logprob))
+                outputs.append(self._output(request, tuple(emitted), logprob=sample.logprob))
         return outputs
 
     def run(self) -> Iterator[RequestOutput]:

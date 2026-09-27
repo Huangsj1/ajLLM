@@ -40,7 +40,7 @@ def profile_memory(model, config, memory_config, compute_config, planner):
     # Also exercise the largest sampling/decode row count independently of the prefill cap.
     shapes = [balanced, concentrated, [1] * slots]
     probe_context = min(config.max_model_len, max(max(s) for s in shapes) + 1)
-    # Compute the number of blocks needed to cover the largest shape, and ensure at least one block for the probe context.
+    # Cover the largest probe shape and its context.
     blocks = max(sum((n + 1 + memory_config.block_size - 1) // memory_config.block_size for n in s) for s in shapes)
     blocks = max(blocks, (probe_context + memory_config.block_size - 1) // memory_config.block_size)
     scratch = replace(memory_config, num_blocks=blocks, enable_prefix_cache=False)

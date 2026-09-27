@@ -26,6 +26,11 @@ class BudgetStats:
     num_blocks: int = 0
     token_budget: int = 0
     max_num_seqs: int = 0
+    target_model_bytes: int = 0
+    draft_model_bytes: int = 0
+    speculative_workspace_bytes: int = 0
+    target_pool_bytes: int = 0
+    draft_pool_bytes: int = 0
 
 
 class MemoryBudget:
@@ -50,6 +55,7 @@ class MemoryBudget:
             model_bytes,
             safety_bytes,
             graph_reserve_bytes,
+            target_model_bytes=model_bytes,
             weight_bytes=sum(t.numel() * t.element_size() for t in model.parameters()),
             buffer_bytes=sum(t.numel() * t.element_size() for t in model.buffers()),
             token_budget=config.max_num_batched_tokens,
@@ -110,6 +116,7 @@ class MemoryBudget:
             )
         s.num_blocks = blocks
         s.pool_bytes = blocks * block_bytes
+        s.target_pool_bytes = s.pool_bytes
         return blocks
 
     def snapshot(self):
